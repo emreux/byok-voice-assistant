@@ -1,0 +1,34 @@
+# Turkish (design.md 3.12). One of the two locales phase 1 ships complete.
+#
+# Comments here are English because they are notes to whoever edits the file;
+# the values are Turkish because they are what the user reads and hears.
+# `_template.toml` explains what each key is for.
+
+code = "tr"
+name = "Türkçe"
+
+[stt]
+language = "tr"
+
+[tts.voice]
+# Tolga is the voice Windows itself ships for Turkish. It lives in the
+# Speech_OneCore registry hive, which `tts/sapi.py` reads on purpose.
+sapi = "Tolga"
+
+[ui]
+welcome = "Asistan, senin API anahtarınla, seçtiğin yapay zekâ sağlayıcısına bağlanır."
+provider = "Hangi sağlayıcıyı kullanmak istiyorsun?"
+only_provider = "Sağlayıcı: {name} — bu sürümün konuşabildiği tek sağlayıcı."
+no_provider = "Bu sürüm, listedeki sağlayıcıların hiçbirini kuramıyor."
+locale = "Asistan hangi dili konuşsun?"
+key_url = "Anahtarı buradan oluşturabilirsin: {url}"
+api_key = "API anahtarını yapıştır (yazarken ekranda görünmez)"
+api_key_keep = "API anahtarını yapıştır, ya da kayıtlı olanı korumak için Enter'a bas"
+key_needed = "Bu sağlayıcı, cevap vermeden önce bir anahtar istiyor."
+checking_key = "Anahtar kontrol ediliyor..."
+bad_key = "Bu anahtar çalışmadı — yanlış yazılmış, iptal edilmiş ya da kredisi bitmiş olabilir."
+loading_models = "Anahtarın erişebildiği modeller soruluyor..."
+no_models = "Anahtar çalışıyor ama hiçbir modele erişemiyor. Sağlayıcının konsolunu kontrol et."
+model = "Hangi model cevap versin?"
+saved = "Hazır. Ayarlar: {path} — anahtarın kendisi Windows Kimlik Bilgisi Yöneticisi'nde."
+cancelled = "Kurulum iptal edildi. Hiçbir şey değiştirilmedi."

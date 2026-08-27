@@ -1,0 +1,57 @@
+# Add your language.
+#
+# Copy this file to <code>.toml - `de.toml`, `es.toml`, `ja.toml` - translate
+# the values, and open a pull request. That is the whole procedure: nothing
+# else in the project has to change for a new language to work, and this file
+# is not offered as a language itself because its name starts with `_`.
+#
+# You do not have to translate everything. A key you leave out is answered in
+# English, so a half-finished pack is usable rather than broken. What you must
+# not change are the key names on the left and the {placeholders} inside the
+# sentences - both are filled in by the code, and a renamed one becomes an
+# error in front of the user.
+
+# Your language's ISO 639-1 code. It has to match the file name: `de.toml`
+# says `code = "de"`.
+code = "xx"
+
+# Your language's name, written in your language. It is shown in the setup
+# wizard's menu, where somebody who does not read English has to find it.
+name = "Your language"
+
+[stt]
+# What the speech recogniser is told to expect. Usually the same as `code`,
+# and separate from it on purpose: this is the language people *speak* to the
+# assistant, not the one it shows them.
+language = "xx"
+
+[tts.voice]
+# The preferred voice per speech engine, matched against the voices actually
+# installed on the machine. It is a preference, not an identifier: when it is
+# missing, any other voice for your language is used instead. Leave it out if
+# Windows ships no voice for your language - the assistant will read in
+# whatever voice it can find.
+#
+# `assistant setup` lists what is installed, and phase 3 adds more engines
+# here (azure, elevenlabs) with their own identifiers.
+sapi = "Name as Windows lists it"
+
+[ui]
+# The sentences the setup wizard says. Everything below is the English the
+# assistant falls back to - translate the right-hand side only.
+welcome = "The assistant answers through an AI provider, using your own API key."
+provider = "Which provider do you want to use?"
+only_provider = "Provider: {name} - the only one this version can talk to."
+no_provider = "This version cannot build any provider in the catalogue."
+locale = "Which language should the assistant speak?"
+key_url = "You can create a key at {url}"
+api_key = "Paste your API key (nothing is shown as you type)"
+api_key_keep = "Paste your API key, or press Enter to keep the one already stored"
+key_needed = "This provider needs a key before it will answer."
+checking_key = "Checking the key..."
+bad_key = "That key did not work - mistyped, revoked, or out of credit."
+loading_models = "Asking which models the key can reach..."
+no_models = "The key works, but it reaches no model. Check the provider's console."
+model = "Which model should answer?"
+saved = "Ready. Settings: {path} - the key itself is in the Windows Credential Manager."
+cancelled = "Setup cancelled. Nothing was changed."

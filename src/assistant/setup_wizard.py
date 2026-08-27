@@ -13,11 +13,11 @@ the last step. A run that was abandoned, or a key that turned out to be
 revoked, leaves the machine exactly as it was found.
 
 **No user-facing sentence lives in this module.** The wizard asks for a
-question by key; the `Prompter` turns that key into words. Today the words come
-from `TEXT` below - English, which section 3.12 names as the end of the
-fallback chain - and item 1.8 puts `locales/<code>.toml` in front of it without
-touching a line of the logic. That is also why the tests can script a wizard
-run without repeating a single sentence.
+question by key; the `Prompter` turns that key into words, taking them from the
+locale pack and falling back to `TEXT` below - English, which section 3.12
+names as the end of the chain. That is also why the tests can script a wizard
+run without repeating a single sentence, and why adding a language changes no
+line of this file.
 
 Phase 2 adds what the catalogue already has room for: a provider that needs no
 key at all (Ollama) and one that needs a `base_url`. Both are questions about
@@ -33,18 +33,21 @@ from typing import Protocol
 import questionary
 from rich.console import Console
 
+from assistant import locales
 from assistant.config import (
     LLMSettings,
     LocaleSettings,
     Settings,
+    config_path,
     load_api_key,
+    load_settings,
     save_settings,
     store_api_key,
 )
 from assistant.llm.base import LLMProvider, ModelInfo
 from assistant.llm.registry import ADAPTERS, ProviderEntry, create_provider, load_catalog
 
-__all__ = ["TEXT", "Option", "Prompter", "TerminalPrompter", "run_setup"]
+__all__ = ["TEXT", "Option", "Prompter", "TerminalPrompter", "run_setup", "wording"]
 
 _OK = 0
 _GAVE_UP = 1
@@ -82,8 +85,9 @@ class Prompter(Protocol):
 
 
 # The last link of the fallback chain of section 3.12: what the wizard says
-# when no locale file offers a translation. Item 1.8 adds `locales/tr.toml` and
-# the loader that prefers it.
+# when no locale pack offers a translation. English lives here, beside the code
+# that says it, rather than in `locales/en.toml` - one copy cannot drift from
+# the other.
 TEXT: dict[str, str] = {
     "welcome": "The assistant answers through an AI provider, using your own API key.",
     "provider": "Which provider do you want to use?",
@@ -103,10 +107,29 @@ TEXT: dict[str, str] = {
     "cancelled": "Setup cancelled. Nothing was changed.",
 }
 
-# The languages offered in phase 1, each written in itself. Item 1.8 replaces
-# this with what `locales/` actually contains, which is how a fourth language
-# becomes one TOML file and no code change (section 3.12).
-LOCALES: tuple[Option, ...] = (Option("tr", "Türkçe"), Option("en", "English"))
+
+def wording() -> dict[str, str]:
+    """What the wizard says, in the language the user is likeliest to read.
+
+    The language question decides what the *assistant* speaks from then on,
+    which is no help in wording the question: the wizard has to ask before it
+    has an answer. So it uses the answer from last time when setup has run
+    before - changing the model should not mean reading English again - and
+    Windows' own language on the very first run. When neither names a language
+    anybody has translated, this is `TEXT` unchanged.
+    """
+    pack = locales.load(_chosen_before() or locales.system_code())
+    return {key: pack.say(key, default) for key, default in TEXT.items()}
+
+
+def _chosen_before() -> str | None:
+    """The language chosen the last time setup ran, if it ever ran."""
+    return load_settings().locale.code if config_path().is_file() else None
+
+
+def _languages() -> list[Option]:
+    """Every locale pack there is, each named in its own language."""
+    return [Option(pack.code, pack.name) for pack in locales.available()]
 
 
 class _WalkedAwayError(Exception):
@@ -139,7 +162,7 @@ async def _ask(prompter: Prompter, catalog: Mapping[str, ProviderEntry] | None) 
 
     prompter.say("welcome")
     provider_id, entry = _pick_provider(prompter, buildable)
-    locale = _answered(prompter.choose("locale", LOCALES))
+    locale = _answered(prompter.choose("locale", _languages()))
 
     if entry.key_url is not None:
         prompter.say("key_url", url=entry.key_url)
@@ -228,7 +251,7 @@ class TerminalPrompter:
     """The real terminal: `rich` for what is said, `questionary` for answers."""
 
     def __init__(self, *, text: Mapping[str, str] | None = None) -> None:
-        self._text = TEXT if text is None else text
+        self._text = wording() if text is None else text
         self._console = Console()
 
     def say(self, key: str, **fields: object) -> None:

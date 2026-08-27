@@ -20,9 +20,11 @@ from typing import ClassVar
 import pytest
 import questionary
 
+from assistant import locales
 from assistant.config import (
     KEYRING_SERVICE,
     LLMSettings,
+    LocaleSettings,
     Settings,
     config_path,
     load_settings,
@@ -31,7 +33,7 @@ from assistant.config import (
 )
 from assistant.llm.base import Delta, Message, ModelInfo, ToolSpec
 from assistant.llm.registry import ADAPTERS, ProviderEntry
-from assistant.setup_wizard import TEXT, Option, TerminalPrompter, run_setup
+from assistant.setup_wizard import TEXT, Option, TerminalPrompter, run_setup, wording
 from tests.conftest import MemoryKeyring
 
 GOOD_KEY = "good-key"
@@ -300,13 +302,47 @@ async def test_the_models_offered_are_the_ones_the_key_can_reach(
     assert prompter.offered["model"] == ["fast", "smart"]
 
 
-async def test_both_languages_are_offered(config_home: Path, vault: MemoryKeyring) -> None:
+async def test_every_locale_pack_in_the_package_is_offered(
+    config_home: Path, vault: MemoryKeyring
+) -> None:
+    """The menu is the contents of `locales/`, which is what makes a new
+    language one TOML file and no code change (section 3.12)."""
     prompter = complete_run(locale="en")
 
     await run_setup(prompter, catalog=fake_catalog())
 
-    assert prompter.offered["locale"] == ["tr", "en"]
+    assert prompter.offered["locale"] == [pack.code for pack in locales.available()]
+    assert set(prompter.offered["locale"]) == {"en", "tr"}
     assert load_settings().locale.code == "en"
+
+
+def test_the_wizard_speaks_the_language_it_was_told_to_last_time(
+    config_home: Path, vault: MemoryKeyring
+) -> None:
+    """Coming back to change the model should not mean reading English again."""
+    save_settings(Settings(locale=LocaleSettings(code="tr")))
+
+    assert wording()["model"] == locales.load("tr").say("model", TEXT["model"])
+    assert wording()["model"] != TEXT["model"]
+
+
+def test_the_first_run_speaks_whatever_language_windows_speaks(
+    config_home: Path, vault: MemoryKeyring, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Nothing has been chosen yet, so the machine's own language is the only
+    thing there is to go on."""
+    monkeypatch.setattr(locales, "system_code", lambda: "tr")
+
+    assert wording()["model"] == locales.load("tr").say("model", TEXT["model"])
+
+
+def test_every_question_has_words_whatever_language_the_wizard_starts_in(
+    config_home: Path, vault: MemoryKeyring
+) -> None:
+    """With no answer from last time it is Windows' own language, and that may
+    be one nobody has translated - which is what `TEXT` is for."""
+    assert set(wording()) == set(TEXT)
+    assert all(sentence.strip() for sentence in wording().values())
 
 
 # --------------------------------------------------------------------------
@@ -366,13 +402,16 @@ class FakeQuestion:
         return self._answer
 
 
-def test_the_terminal_says_what_the_text_table_says(capsys: pytest.CaptureFixture[str]) -> None:
+def test_the_terminal_says_the_sentence_with_its_fields_filled_in(
+    config_home: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
     TerminalPrompter().say("key_url", url="https://example.test/apikey")
 
     assert "https://example.test/apikey" in capsys.readouterr().out
 
 
 def test_the_terminal_stores_the_value_and_shows_the_label(
+    config_home: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Swap these two and the wizard writes "Fast" into config.toml."""
@@ -391,10 +430,12 @@ def test_the_terminal_stores_the_value_and_shows_the_label(
     assert answer == "fast"
     assert seen["values"] == ["fast", "smart"]
     assert seen["titles"] == ["Fast", "Smart"]
-    assert seen["message"] == TEXT["model"]
+    assert seen["message"] == wording()["model"]
 
 
-def test_the_terminal_reads_a_key_without_echoing_it(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_the_terminal_reads_a_key_without_echoing_it(
+    config_home: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     """`password` is what hides the typing; `text` would put the key on screen."""
     monkeypatch.setattr(questionary, "password", lambda message: FakeQuestion("typed-key"))
     monkeypatch.setattr(
@@ -404,7 +445,9 @@ def test_the_terminal_reads_a_key_without_echoing_it(monkeypatch: pytest.MonkeyP
     assert TerminalPrompter().secret("api_key") == "typed-key"
 
 
-def test_an_interrupted_question_is_not_an_answer(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_an_interrupted_question_is_not_an_answer(
+    config_home: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     """Ctrl+C makes `questionary` return None, which the wizard reads as walking away."""
     monkeypatch.setattr(questionary, "password", lambda message: FakeQuestion(None))
 
