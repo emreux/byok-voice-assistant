@@ -1,18 +1,18 @@
 """Command line entry point.
 
-Phase 0 scaffolding: the parser and the command names are final, the commands
-themselves are not implemented yet. `setup` and `run` are filled in during
-phase 1 (design.md section 8, items 1.4 and 1.11); `doctor` and `cost` arrive
-in phase 3 and phase 2 respectively.
+The parser and the command names are final. `setup` runs the wizard of item
+1.4; `run` is item 1.11 and still says so rather than pretending. `doctor` and
+`cost` arrive in phase 3 and phase 2 respectively (design.md section 8).
 """
 
 from __future__ import annotations
 
 import argparse
+import asyncio
 import sys
 from collections.abc import Sequence
 
-from assistant import __version__
+from assistant import __version__, setup_wizard
 
 _NOT_IMPLEMENTED_EXIT_CODE = 2
 
@@ -40,6 +40,11 @@ def main(argv: Sequence[str] | None = None) -> int:
     if args.command is None:
         parser.print_help()
         return 0
+
+    if args.command == "setup":
+        # Looked up on the module rather than imported by name so the tests can
+        # stand in for it; the wizard itself opens a prompt and would hang.
+        return asyncio.run(setup_wizard.run_setup(setup_wizard.TerminalPrompter()))
 
     print(
         f"'{args.command}' is not implemented yet - this is phase 0 scaffolding. "

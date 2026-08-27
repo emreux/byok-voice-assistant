@@ -6,22 +6,17 @@ with arguments, and the wrong ones silently produce a different, plausible
 looking path. The second is that the API key never reaches the settings file;
 that is the whole reason `keyring` is a dependency.
 
-The keyring tests run against a backend held in memory. The library is real,
-so the calls are the calls production makes; only the vault is fake, because a
-test suite has no business writing to the user's Credential Manager.
+The `vault` and `config_home` fixtures come from `conftest.py`, which keeps
+this suite off the developer's own Credential Manager and settings directory.
 """
 
 from __future__ import annotations
 
 import os
 import tomllib
-from collections.abc import Iterator
 from pathlib import Path
 
-import keyring
 import pytest
-from keyring.backend import KeyringBackend
-from keyring.errors import PasswordDeleteError
 
 from assistant.config import (
     KEYRING_SERVICE,
@@ -39,48 +34,9 @@ from assistant.config import (
     save_settings,
     store_api_key,
 )
+from tests.conftest import MemoryKeyring
 
 WINDOWS_ONLY = pytest.mark.skipif(os.name != "nt", reason="the product ships on Windows")
-
-
-class MemoryKeyring(KeyringBackend):
-    """A real keyring backend that forgets everything when the test ends."""
-
-    priority = 1.0
-
-    def __init__(self) -> None:
-        # `keyring` is typed but this constructor is not; calling it anyway
-        # keeps the fake on the same code path as a real backend.
-        super().__init__()  # type: ignore[no-untyped-call]
-        self.vault: dict[tuple[str, str], str] = {}
-
-    def set_password(self, service: str, username: str, password: str) -> None:
-        self.vault[(service, username)] = password
-
-    def get_password(self, service: str, username: str) -> str | None:
-        return self.vault.get((service, username))
-
-    def delete_password(self, service: str, username: str) -> None:
-        if (service, username) not in self.vault:
-            raise PasswordDeleteError(f"nothing stored for {username}")
-        del self.vault[(service, username)]
-
-
-@pytest.fixture
-def vault() -> Iterator[MemoryKeyring]:
-    previous = keyring.get_keyring()
-    fake = MemoryKeyring()
-    keyring.set_keyring(fake)
-    try:
-        yield fake
-    finally:
-        keyring.set_keyring(previous)
-
-
-@pytest.fixture
-def config_home(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
-    monkeypatch.setenv("ASSISTANT_CONFIG_DIR", str(tmp_path))
-    return tmp_path
 
 
 # --------------------------------------------------------------------------

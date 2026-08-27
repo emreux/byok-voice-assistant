@@ -9,10 +9,8 @@ setup" tells them exactly what to do next.
 
 from __future__ import annotations
 
-from collections.abc import Iterator
 from pathlib import Path
 
-import keyring
 import pytest
 
 from assistant.config import store_api_key
@@ -27,18 +25,7 @@ from assistant.llm.registry import (
     create_provider,
     load_catalog,
 )
-from tests.test_config import MemoryKeyring
-
-
-@pytest.fixture
-def vault() -> Iterator[MemoryKeyring]:
-    previous = keyring.get_keyring()
-    fake = MemoryKeyring()
-    keyring.set_keyring(fake)
-    try:
-        yield fake
-    finally:
-        keyring.set_keyring(previous)
+from tests.conftest import MemoryKeyring
 
 
 @pytest.fixture
