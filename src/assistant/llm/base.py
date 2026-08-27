@@ -1,0 +1,190 @@
+"""The contract every LLM provider is reduced to (design.md section 3.2).
+
+Providers disagree about almost everything: Anthropic sends content blocks,
+OpenAI sends a string plus `tool_calls`, Gemini sends `parts`. Tool definitions,
+tool results and streaming events differ again. Let those differences reach the
+rest of the application and the project is nailed to one vendor.
+
+So the application sees only this module: five value types and one protocol.
+An adapter translates its vendor's shapes into these on the way in and out, and
+that is the only place vendor knowledge is allowed to live.
+
+Phase 1 ships a single adapter and calls `stream` with `tools=[]`. The tool
+types are defined here from the start anyway - the phase 2 permission gate and
+the agent loop are written against them, and retrofitting a type this central
+breaks every call site (design.md section 8).
+"""
+
+from __future__ import annotations
+
+from collections.abc import AsyncIterator, Mapping
+from dataclasses import dataclass, field
+from typing import Any, Literal, Protocol, runtime_checkable
+
+__all__ = [
+    "Delta",
+    "LLMProvider",
+    "Message",
+    "ModelInfo",
+    "Role",
+    "ToolCall",
+    "ToolSpec",
+    "Usage",
+]
+
+Role = Literal["system", "user", "assistant", "tool"]
+
+
+@dataclass(frozen=True, slots=True)
+class ToolSpec:
+    """A tool offered to the model, described in the one language all three speak.
+
+    `parameters` is a JSON Schema object. Anthropic calls it `input_schema`,
+    OpenAI wraps it in a function object, Gemini calls it a function
+    declaration - all three are that same schema in a different envelope.
+    """
+
+    name: str
+    description: str
+    parameters: Mapping[str, Any]
+
+
+@dataclass(frozen=True, slots=True)
+class ToolCall:
+    """A complete request from the model to run one tool.
+
+    Every provider streams the arguments as partial JSON. An adapter buffers
+    those fragments and emits this object only once the arguments parse, so a
+    `ToolCall` is never half-built. The permission gate of section 3.9 depends
+    on that: it cannot judge an action it can only see the beginning of.
+    """
+
+    id: str
+    name: str
+    arguments: Mapping[str, Any]
+
+
+@dataclass(frozen=True, slots=True)
+class Usage:
+    """Token counts for one request, in the shape the `usage_log` table stores.
+
+    `cached_tokens` is a subset of `input_tokens`, not an addition to it. Only
+    some providers report it; the rest leave it at zero, which reads correctly
+    as "no cache hit" (design.md section 6).
+    """
+
+    input_tokens: int = 0
+    output_tokens: int = 0
+    cached_tokens: int = 0
+
+
+@dataclass(frozen=True, slots=True)
+class ModelInfo:
+    """One entry of a provider's model list, as the setup command shows it.
+
+    The optional fields are genuinely unknown for some providers rather than
+    merely absent. `supports_tools=None` means "nobody has tested this model
+    yet" - the phase 2 probe replaces it with a measured answer instead of
+    letting the assistant fail silently at two in the morning (section 3.2).
+    """
+
+    id: str
+    display_name: str
+    context_window: int | None = None
+    supports_tools: bool | None = None
+    input_price_per_mtok: float | None = None
+    output_price_per_mtok: float | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class Message:
+    """One turn of the conversation, independent of any provider's wire format.
+
+    Frozen because the agent loop keeps a window of past turns and hands the
+    same objects to the adapter on every request; a message that could be
+    edited in place would rewrite history nobody meant to change.
+    """
+
+    role: Role
+    content: str = ""
+    tool_calls: tuple[ToolCall, ...] = field(default_factory=tuple)
+    tool_call_id: str | None = None
+
+    def __post_init__(self) -> None:
+        if self.role == "tool" and self.tool_call_id is None:
+            raise ValueError("a tool result needs the tool_call_id it answers")
+        if self.tool_calls and self.role != "assistant":
+            raise ValueError(f"only an assistant message carries tool calls, not {self.role!r}")
+
+    @classmethod
+    def system(cls, content: str) -> Message:
+        return cls(role="system", content=content)
+
+    @classmethod
+    def user(cls, content: str) -> Message:
+        return cls(role="user", content=content)
+
+    @classmethod
+    def assistant(cls, content: str = "", tool_calls: tuple[ToolCall, ...] = ()) -> Message:
+        return cls(role="assistant", content=content, tool_calls=tool_calls)
+
+    @classmethod
+    def tool_result(cls, tool_call_id: str, content: str) -> Message:
+        return cls(role="tool", content=content, tool_call_id=tool_call_id)
+
+
+@dataclass(frozen=True, slots=True)
+class Delta:
+    """One piece of a streaming response.
+
+    A chunk carries whichever of these the provider just produced: a piece of
+    text, one finished tool call, the reason generation stopped, or the token
+    counts that usually arrive last. An empty `Delta` is legal - providers do
+    send chunks that only advance their own state.
+    """
+
+    text: str | None = None
+    tool_call: ToolCall | None = None
+    finish_reason: str | None = None
+    usage: Usage | None = None
+
+
+@runtime_checkable
+class LLMProvider(Protocol):
+    """What an adapter has to offer. Nothing here mentions a vendor.
+
+    Vendor-only features - Anthropic prompt caching, OpenAI `reasoning_effort` -
+    stay inside their adapter and are announced through a `capabilities`
+    attribute the adapter defines for itself. Adding them here would drag every
+    other adapter down to the common denominator (design.md section 3.2).
+    """
+
+    id: str
+
+    async def validate_credentials(self) -> bool:
+        """Reports whether the stored key actually works, before it is saved."""
+        ...
+
+    async def list_models(self) -> list[ModelInfo]:
+        """Lists the models this key can reach, for the setup command to offer."""
+        ...
+
+    def stream(
+        self,
+        messages: list[Message],
+        tools: list[ToolSpec],
+        *,
+        model: str,
+        temperature: float | None = None,
+        max_tokens: int = 4096,
+    ) -> AsyncIterator[Delta]:
+        """Sends a request and yields the response as it arrives.
+
+        Declared `def`, not `async def`, and this is deliberate. Adapters write
+        it as `async def ... yield`, an async generator: calling it returns an
+        `AsyncIterator` immediately, with no `await`. Declaring `async def` here
+        would type it as a coroutine that returns an iterator, callers would
+        have to await it first, and no adapter would satisfy the protocol.
+        `test_llm_adapters.py` guards this.
+        """
+        ...

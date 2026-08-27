@@ -1,0 +1,89 @@
+[project]
+name = "assistant"
+version = "0.0.0"                       # v0.1.0 is tagged at the end of phase 1 (design.md section 2)
+description = "A Windows desktop voice assistant that runs on your own API key, model and language."
+readme = "README.md"
+license = { file = "LICENSE" }
+authors = [{ name = "emreux", email = "feneremree553@gmail.com" }]
+requires-python = ">=3.13"
+dependencies = [
+    "faster-whisper>=1.2.1",
+    "google-genai>=2.20.0",
+    "keyring>=25.7.0",
+    "loguru>=0.7.3",
+    "numpy>=2.5.2",
+    "platformdirs>=4.11.4",
+    "pydantic-settings>=2.15.0",
+    "pynput>=1.8.2",
+    "pywin32>=312",
+    "questionary>=2.1.1",
+    "rich>=15.0.0",
+    "sounddevice>=0.5.6",
+    "soundfile>=0.14.0",
+    "tenacity>=9.1.4",
+]
+
+[project.scripts]
+assistant = "assistant.__main__:main"
+
+[build-system]
+requires = ["uv_build>=0.12.6,<0.13.0"]
+build-backend = "uv_build"
+
+[dependency-groups]
+dev = [
+    "mypy>=2.3.1",
+    "pytest>=9.1.1",
+    "pytest-asyncio>=1.4.0",
+    "ruff>=0.16.4",
+]
+
+# --------------------------------------------------------------------------
+# Lint, format, type check, test.
+# --------------------------------------------------------------------------
+
+[tool.ruff]
+line-length = 100
+target-version = "py313"
+src = ["src", "tests"]
+# Ruff also formats Python blocks embedded in Markdown. The design documents are
+# Turkish prose whose snippets are illustrative, not compiled code - keep it out.
+extend-exclude = ["*.md"]
+
+[tool.ruff.lint]
+select = [
+    "E",      # pycodestyle errors
+    "W",      # pycodestyle warnings
+    "F",      # pyflakes
+    "I",      # isort
+    "N",      # pep8-naming
+    "UP",     # pyupgrade
+    "B",      # flake8-bugbear
+    "ASYNC",  # flake8-async - the 50 ms rule of section 3.1 starts here
+    "S",      # flake8-bandit
+    "C4",     # flake8-comprehensions
+    "SIM",    # flake8-simplify
+    "PTH",    # flake8-use-pathlib
+    "RUF",    # ruff-specific
+]
+# RUF001-003 flag letters that merely look like ASCII. Turkish text is expected
+# in this project, so they would fire on ordinary strings and comments.
+ignore = ["RUF001", "RUF002", "RUF003"]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/*" = ["S101"]   # assert is the point of a test
+
+[tool.ruff.format]
+docstring-code-format = true
+
+[tool.mypy]
+strict = true
+python_version = "3.13"
+files = ["src", "tests"]
+warn_unreachable = true
+enable_error_code = ["redundant-expr", "truthy-bool", "ignore-without-code"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"
+addopts = "-q --strict-markers --strict-config"
