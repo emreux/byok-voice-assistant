@@ -37,8 +37,9 @@ language = "xx"
 sapi = "Name as Windows lists it"
 
 [ui]
-# The sentences the setup wizard says. Everything below is the English the
-# assistant falls back to - translate the right-hand side only.
+# Everything the assistant says in words rather than in speech: the setup
+# wizard, and the three things that can go wrong in a turn. Below is the
+# English it falls back to - translate the right-hand side only.
 welcome = "The assistant answers through an AI provider, using your own API key."
 provider = "Which provider do you want to use?"
 only_provider = "Provider: {name} - the only one this version can talk to."
@@ -55,3 +56,8 @@ no_models = "The key works, but it reaches no model. Check the provider's consol
 model = "Which model should answer?"
 saved = "Ready. Settings: {path} - the key itself is in the Windows Credential Manager."
 cancelled = "Setup cancelled. Nothing was changed."
+
+# Spoken out loud, so keep them short and easy to hear (item 1.10).
+unreachable = "I could not reach the provider. Will you try again?"
+key_invalid = "Your API key is not being accepted any more. You need to renew it."
+took_too_long = "That took too long. Will you try again?"

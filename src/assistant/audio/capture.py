@@ -123,9 +123,17 @@ class PushToTalk:
         *,
         hotkey: Hotkey | None = None,
         microphone: Microphone | None = None,
+        on_listening: OnEvent | None = None,
     ) -> None:
         self._hotkey = hotkey if hotkey is not None else SystemHotkey()
         self._microphone = microphone if microphone is not None else SystemMicrophone()
+
+        # Called on the event loop the moment recording starts, before there is
+        # anything to transcribe. The state machine stops the speaker from it
+        # (item 1.10): an assistant that waited for the finished utterance
+        # would talk over the user, into the microphone that is recording them.
+        # Public because whoever builds this is rarely whoever listens to it.
+        self.on_listening = on_listening
 
         # Read by the audio callback on PortAudio's thread, written by the
         # keyboard listener on its own. A plain event, deliberately: going
@@ -194,6 +202,8 @@ class PushToTalk:
 
     def _begin(self) -> None:
         self._take = []
+        if self.on_listening is not None:
+            self.on_listening()
 
     def _keep(self, chunk: Audio) -> None:
         # `None` means the recording already ended: the audio thread saw the

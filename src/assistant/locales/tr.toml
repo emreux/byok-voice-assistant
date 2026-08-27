@@ -32,3 +32,8 @@ no_models = "Anahtar çalışıyor ama hiçbir modele erişemiyor. Sağlayıcın
 model = "Hangi model cevap versin?"
 saved = "Hazır. Ayarlar: {path} — anahtarın kendisi Windows Kimlik Bilgisi Yöneticisi'nde."
 cancelled = "Kurulum iptal edildi. Hiçbir şey değiştirilmedi."
+
+# Spoken out loud rather than shown, so they are short (item 1.10).
+unreachable = "Sağlayıcıya bağlanamadım, tekrar dener misin?"
+key_invalid = "API anahtarın geçersiz görünüyor, yenilemen gerekiyor."
+took_too_long = "Bu iş uzadı, tekrar dener misin?"

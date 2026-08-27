@@ -468,3 +468,50 @@ def test_the_default_combination_is_three_keys_the_system_knows() -> None:
 def test_a_combination_that_makes_no_sense_is_refused_at_once() -> None:
     with pytest.raises(ValueError, match="hotkey"):
         SystemHotkey("<ctrl>+<nonsense>")
+
+
+# --------------------------------------------------------------------------
+# Telling the state machine that the key went down
+# --------------------------------------------------------------------------
+
+
+async def test_the_moment_recording_starts_is_announced() -> None:
+    """`app.py` stops speaking on this. Waiting for the finished utterance
+    instead would mean the assistant talks over the user until they let go of
+    the key - and that the microphone records its own voice doing it."""
+    hotkey, microphone = FakeHotkey(), FakeMicrophone()
+    started: list[str] = []
+
+    with PushToTalk(hotkey=hotkey, microphone=microphone) as talk:
+        talk.on_listening = lambda: started.append("now")
+        hotkey.press()
+        await asyncio.sleep(0)
+
+    assert started == ["now"]
+
+
+async def test_the_announcement_arrives_where_asyncio_can_be_touched() -> None:
+    """It is posted from the keyboard's thread and runs on the event loop,
+    which is what makes it safe for the listener to stop the speaker."""
+    hotkey, microphone = FakeHotkey(), FakeMicrophone()
+    loops: list[object] = []
+
+    with PushToTalk(hotkey=hotkey, microphone=microphone) as talk:
+        talk.on_listening = lambda: loops.append(asyncio.get_running_loop())
+        hotkey.press()
+        await asyncio.sleep(0)
+
+    assert loops == [asyncio.get_running_loop()]
+
+
+async def test_recording_works_whether_or_not_anybody_listens_for_the_press() -> None:
+    hotkey, microphone = FakeHotkey(), FakeMicrophone()
+
+    with PushToTalk(hotkey=hotkey, microphone=microphone) as talk:
+        hotkey.press()
+        microphone.hear(tone(0.1))
+        hotkey.release()
+
+        pcm = await talk.utterance()
+
+    assert np.array_equal(pcm, tone(0.1))

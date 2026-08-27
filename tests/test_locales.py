@@ -21,11 +21,15 @@ import tomllib
 from pathlib import Path
 from typing import Any
 
-from assistant import locales
+from assistant import app, locales, setup_wizard
 from assistant.locales import FALLBACK_CODE, available, iso_code, load, system_code
-from assistant.setup_wizard import TEXT
 
 PACKAGED = Path(locales.__file__).parent
+
+# A pack has one `[ui]` table, and more than one module says things: the setup
+# wizard asks the questions, `app.py` says what went wrong in a turn. What a
+# pack may translate is the two of them together.
+SENTENCES = {**setup_wizard.TEXT, **app.TEXT}
 
 
 def shipped() -> list[Path]:
@@ -88,7 +92,15 @@ def test_english_is_not_written_down_twice() -> None:
 def test_the_template_offers_every_sentence_a_translator_has_to_write() -> None:
     """A key the template forgets is a sentence nobody ever translates, and the
     product answers it in English for good without anyone noticing."""
-    assert set(read(PACKAGED / "_template.toml")["ui"]) == set(TEXT)
+    assert set(read(PACKAGED / "_template.toml")["ui"]) == set(SENTENCES)
+
+
+def test_no_two_modules_claim_the_same_sentence() -> None:
+    """One table, one key, one sentence. Two modules using the same key for two
+    different sentences means the translation of one becomes the other."""
+    shared = set(setup_wizard.TEXT) & set(app.TEXT)
+
+    assert not shared, f"both modules define {shared}"
 
 
 def test_a_pack_translates_only_sentences_the_product_actually_says() -> None:
@@ -96,13 +108,13 @@ def test_a_pack_translates_only_sentences_the_product_actually_says() -> None:
     finished work."""
     for path in shipped():
         offered = set(read(path).get("ui", {}))
-        assert offered <= set(TEXT), f"{path.name} translates {offered - set(TEXT)}"
+        assert offered <= set(SENTENCES), f"{path.name} translates {offered - set(SENTENCES)}"
 
 
 def test_turkish_is_complete_because_it_is_one_of_the_two_that_is_promised() -> None:
     """The fallback chain would hide a gap, and an English sentence in the
     middle of a Turkish wizard is a defect, not a graceful degradation."""
-    assert set(read(PACKAGED / "tr.toml")["ui"]) == set(TEXT)
+    assert set(read(PACKAGED / "tr.toml")["ui"]) == set(SENTENCES)
 
 
 def test_a_translation_asks_for_the_same_fields_as_the_sentence_it_replaces() -> None:
@@ -110,7 +122,7 @@ def test_a_translation_asks_for_the_same_fields_as_the_sentence_it_replaces() ->
     placeholder is a `KeyError` in front of the user, halfway through setup."""
     for path in shipped():
         for key, sentence in read(path).get("ui", {}).items():
-            assert fields(sentence) == fields(TEXT[key]), f"{path.name}: {key}"
+            assert fields(sentence) == fields(SENTENCES[key]), f"{path.name}: {key}"
 
 
 # --------------------------------------------------------------------------

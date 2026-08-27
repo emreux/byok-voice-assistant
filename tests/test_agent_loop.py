@@ -28,7 +28,7 @@ from __future__ import annotations
 import ast
 import asyncio
 import inspect
-from collections.abc import AsyncIterator, Sequence
+from collections.abc import AsyncIterator, Callable, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -56,17 +56,22 @@ class Request:
         return self.messages[1:]
 
 
+Step = Delta | BaseException | Callable[[], None] | float
+
+
 class ScriptedProvider:
     """A provider that answers from a script and remembers what it was asked.
 
-    One entry per turn, each a sequence of deltas to yield. An exception in a
-    sequence is raised when the stream reaches it, which is how a connection
-    that dies halfway through an answer is written down.
+    One entry per turn, each a sequence of steps the stream takes in order: a
+    `Delta` to yield, an exception to raise where it stands - which is how a
+    connection that dies halfway through an answer is written down - a number
+    of seconds to spend not answering, or something to do while the model is
+    supposedly writing.
     """
 
     id = "scripted"
 
-    def __init__(self, *turns: Sequence[Delta | BaseException]) -> None:
+    def __init__(self, *turns: Sequence[Step]) -> None:
         self._turns = list(turns)
         self.calls: list[Request] = []
 
@@ -91,7 +96,12 @@ class ScriptedProvider:
         for item in turn:
             if isinstance(item, BaseException):
                 raise item
-            yield item
+            if isinstance(item, int | float):
+                await asyncio.sleep(item)
+            elif callable(item):
+                item()
+            else:
+                yield item
 
 
 def answers(count: int) -> list[list[Delta]]:
