@@ -21,7 +21,9 @@ DEFAULT_TEXT = "The assistant is listening and the model is loaded."
 DEFAULT_LANGUAGE = "en"
 MODEL_SIZE = "small"
 
-SAPI_AUDIO_FORMAT = 22  # 16 kHz, 16 bit, mono - what the model wants
+# SPSF_16kHz16BitMono. The enumeration counts in pairs, so 22 is *22 kHz*
+# 16 bit mono - a plausible looking number that writes the wrong file.
+SAPI_AUDIO_FORMAT = 18
 FILE_MODE_WRITE = 3
 
 
