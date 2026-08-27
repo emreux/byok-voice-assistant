@@ -24,11 +24,20 @@ from assistant.llm.base import Delta, LLMProvider, Message, ToolSpec
 from assistant.llm.gemini_adapter import GeminiAdapter
 
 
-def text_chunk(text: str) -> types.GenerateContentResponse:
+def text_chunk(
+    text: str, *, prompt: int | None = None, output: int | None = None
+) -> types.GenerateContentResponse:
+    """A chunk of the answer. Gemini attaches a running token total to each one."""
+    running = None
+    if prompt is not None:
+        running = types.GenerateContentResponseUsageMetadata(
+            prompt_token_count=prompt, candidates_token_count=output, cached_content_token_count=0
+        )
     return types.GenerateContentResponse(
         candidates=[
             types.Candidate(content=types.Content(role="model", parts=[types.Part(text=text)]))
-        ]
+        ],
+        usage_metadata=running,
     )
 
 
@@ -144,6 +153,34 @@ async def test_the_closing_chunk_carries_the_token_counts() -> None:
 
     assert len(usage) == 1
     assert (usage[0].input_tokens, usage[0].output_tokens) == (12, 5)
+
+
+async def test_the_token_counts_are_reported_once_not_per_chunk() -> None:
+    """Every Gemini chunk repeats a running total, so a consumer that added
+    them up would report - and charge for - several times the real usage."""
+    adapter = adapter_for(
+        FakeModels(
+            [
+                text_chunk("One,", prompt=7, output=2),
+                text_chunk(" two, three", prompt=7, output=20),
+                final_chunk(prompt=7, output=40),
+            ]
+        )
+    )
+
+    usage = [d.usage for d in await collect(adapter) if d.usage is not None]
+
+    assert len(usage) == 1
+    assert (usage[0].input_tokens, usage[0].output_tokens) == (7, 40)
+
+
+async def test_the_totals_survive_a_stream_that_stops_reporting_them() -> None:
+    """The last chunk carrying counts is the authority, not the last chunk."""
+    adapter = adapter_for(FakeModels([text_chunk("hi", prompt=7, output=40), text_chunk("!")]))
+
+    usage = [d.usage for d in await collect(adapter) if d.usage is not None]
+
+    assert [(u.input_tokens, u.output_tokens) for u in usage] == [(7, 40)]
 
 
 async def test_the_reason_generation_stopped_is_reported() -> None:

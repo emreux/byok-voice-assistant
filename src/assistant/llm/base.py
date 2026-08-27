@@ -139,8 +139,15 @@ class Delta:
 
     A chunk carries whichever of these the provider just produced: a piece of
     text, one finished tool call, the reason generation stopped, or the token
-    counts that usually arrive last. An empty `Delta` is legal - providers do
-    send chunks that only advance their own state.
+    counts that arrive last. An empty `Delta` is legal - providers do send
+    chunks that only advance their own state.
+
+    `usage` appears on **at most one** `Delta` per stream and carries the
+    totals for the whole request. Providers disagree about this - Gemini
+    repeats a running total on every chunk - so each adapter holds the counts
+    back and reports them once. Without that rule the obvious way to read them,
+    adding up every `Delta.usage`, would overstate a request several times over
+    and the cost report of section 6 would be quietly wrong.
     """
 
     text: str | None = None

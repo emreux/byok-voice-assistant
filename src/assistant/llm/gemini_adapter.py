@@ -101,9 +101,26 @@ class GeminiAdapter:
             model=model, contents=contents, config=config
         )
 
+        # Gemini repeats a running token total on every chunk and the count
+        # only grows, so the last one seen is the total for the request. They
+        # are held back and emitted once: a consumer that added up every
+        # `Delta.usage` would report - and bill - several times the real usage.
+        finish_reason: str | None = None
+        usage: Usage | None = None
+
         async for chunk in chunks:
             for delta in _translate(chunk):
                 yield delta
+
+            candidates = chunk.candidates or []
+            if candidates and candidates[0].finish_reason is not None:
+                finish_reason = candidates[0].finish_reason.value
+            running_total = _usage(chunk.usage_metadata)
+            if running_total is not None:
+                usage = running_total
+
+        if finish_reason is not None or usage is not None:
+            yield Delta(finish_reason=finish_reason, usage=usage)
 
 
 def _split_system_prompt(messages: list[Message]) -> tuple[str | None, list[types.Content]]:
@@ -151,7 +168,11 @@ def _declare(tool: ToolSpec) -> types.FunctionDeclaration:
 
 
 def _translate(chunk: types.GenerateContentResponse) -> list[Delta]:
-    """Turns one provider chunk into zero or more protocol chunks."""
+    """Turns one provider chunk into the protocol chunks it carries.
+
+    Text and tool calls only. The finish reason and the token counts are
+    summarised once at the end of the stream, in `stream` itself.
+    """
     deltas: list[Delta] = []
 
     if chunk.text:
@@ -167,18 +188,6 @@ def _translate(chunk: types.GenerateContentResponse) -> list[Delta]:
                 tool_call=ToolCall(
                     id=call.id or "", name=call.name or "", arguments=call.args or {}
                 )
-            )
-        )
-
-    candidates = chunk.candidates or []
-    finish_reason = candidates[0].finish_reason if candidates else None
-    usage = _usage(chunk.usage_metadata)
-
-    if finish_reason is not None or usage is not None:
-        deltas.append(
-            Delta(
-                finish_reason=finish_reason.value if finish_reason is not None else None,
-                usage=usage,
             )
         )
 

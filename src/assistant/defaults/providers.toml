@@ -1,0 +1,25 @@
+# Provider catalogue (design.md section 3.2).
+#
+# The point of this file is that adding a provider is an edit here, not a code
+# change: `adapter` names one of the adapters in `llm/`, and everything else is
+# data the setup command shows or the adapter needs.
+#
+# Phase 1 ships one adapter, so this lists one provider. Phase 2.7 adds
+# `openai_compat` and with it OpenAI, OpenRouter, Groq, DeepSeek, Ollama and
+# every other OpenAI-compatible endpoint; phase 4.5 adds Anthropic. An entry
+# whose `adapter` does not exist yet would be offered to the user and then fail
+# after they typed their key in, so entries arrive with their adapter.
+#
+# Fields:
+#   adapter          which adapter class builds it            (required)
+#   display_name     what the setup command shows             (required)
+#   key_url          where the user gets a key
+#   key_prefix       expected start of the key, for a typo check
+#   base_url         the endpoint, for OpenAI-compatible providers
+#   requires_key     false for a local endpoint (default true)
+#   has_live_pricing the model list returns prices too (default false)
+
+[gemini]
+adapter      = "gemini"
+display_name = "Google Gemini"
+key_url      = "https://aistudio.google.com/apikey"
