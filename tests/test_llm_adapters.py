@@ -22,10 +22,12 @@ from pathlib import Path
 import pytest
 
 from assistant.llm.base import (
+    AuthenticationError,
     Delta,
     LLMProvider,
     Message,
     ModelInfo,
+    ProviderError,
     ToolCall,
     ToolSpec,
     Usage,
@@ -135,3 +137,12 @@ def test_the_protocol_module_imports_no_provider_sdk() -> None:
             imported.add(node.module.split(".")[0])
 
     assert not imported & PROVIDER_SDKS
+
+
+def test_a_refused_key_is_a_refusal_of_its_own_kind() -> None:
+    """`app.py` says two different things and catches them in this order: a key
+    has to be renewed by hand, a connection that dropped is probably back next
+    turn (section 3.2). One being a subclass of the other is what lets the
+    narrow case be answered first."""
+    assert issubclass(AuthenticationError, ProviderError)
+    assert issubclass(ProviderError, Exception)

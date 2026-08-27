@@ -18,9 +18,16 @@ from collections.abc import AsyncIterator
 from typing import Any
 
 import pytest
-from google.genai import types
+from google.genai import errors, types
 
-from assistant.llm.base import Delta, LLMProvider, Message, ToolSpec
+from assistant.llm.base import (
+    AuthenticationError,
+    Delta,
+    LLMProvider,
+    Message,
+    ProviderError,
+    ToolSpec,
+)
 from assistant.llm.gemini_adapter import GeminiAdapter
 
 
@@ -77,22 +84,30 @@ class FakeModels:
         chunks: list[types.GenerateContentResponse] | None = None,
         models: list[types.Model] | None = None,
         error: Exception | None = None,
+        error_after: int = 0,
     ) -> None:
         self.chunks = chunks or []
         self.models = models or []
         self.error = error
+        # How many chunks arrive before the error does. Zero is the request
+        # being refused outright; anything else is a stream that dies part way.
+        self.error_after = error_after
         self.sent: dict[str, Any] = {}
 
     async def generate_content_stream(
         self, *, model: str, contents: Any, config: Any
     ) -> AsyncIterator[types.GenerateContentResponse]:
         self.sent = {"model": model, "contents": contents, "config": config}
-        if self.error is not None:
+        if self.error is not None and not self.error_after:
             raise self.error
 
         async def chunks() -> AsyncIterator[types.GenerateContentResponse]:
-            for chunk in self.chunks:
+            for number, chunk in enumerate(self.chunks):
+                if self.error is not None and number == self.error_after:
+                    raise self.error
                 yield chunk
+            if self.error is not None:
+                raise self.error
 
         return chunks()
 
@@ -336,3 +351,77 @@ async def test_every_message_reaches_the_provider(role: str) -> None:
     await collect(adapter, messages=[message])
 
     assert len(models.sent["contents"]) == 1
+
+
+# --------------------------------------------------------------------------
+# What a refusal is turned into
+# --------------------------------------------------------------------------
+
+
+def refusal(code: int, message: str, status: str) -> errors.APIError:
+    """A real SDK error, built the way the SDK builds one from a response."""
+    kind = errors.ClientError if code < 500 else errors.ServerError
+    return kind(code, {"error": {"code": code, "message": message, "status": status}})
+
+
+async def test_a_refused_key_is_named_as_one_rather_than_left_to_the_caller() -> None:
+    """Section 3.2: the turn is cancelled and the user is told to renew the
+    key. Nothing above this layer may import an SDK to find that out."""
+    adapter = adapter_for(FakeModels(error=refusal(403, "Permission denied", "PERMISSION_DENIED")))
+
+    with pytest.raises(AuthenticationError):
+        await collect(adapter)
+
+
+async def test_the_shape_gemini_actually_refuses_a_bad_key_in_is_recognised() -> None:
+    """Gemini answers a mistyped or revoked key with 400 INVALID_ARGUMENT and
+    not with 401 - exactly the sort of vendor detail an adapter exists for."""
+    bad_key = refusal(400, "API key not valid. Please pass a valid API key.", "INVALID_ARGUMENT")
+    adapter = adapter_for(FakeModels(error=bad_key))
+
+    with pytest.raises(AuthenticationError):
+        await collect(adapter)
+
+
+async def test_a_provider_merely_having_a_bad_day_is_not_a_key_problem() -> None:
+    """Telling the user to renew a working key over a 503 sends them to the
+    provider's console to fix something that is not broken."""
+    adapter = adapter_for(FakeModels(error=refusal(503, "The model is overloaded", "UNAVAILABLE")))
+
+    with pytest.raises(ProviderError) as raised:
+        await collect(adapter)
+
+    assert not isinstance(raised.value, AuthenticationError)
+
+
+async def test_a_refusal_carries_what_the_provider_said_about_it() -> None:
+    """The sentence the user hears is ours and says nothing useful to whoever
+    has to diagnose this; the exception is where the provider's words go."""
+    adapter = adapter_for(FakeModels(error=refusal(429, "Quota exceeded", "RESOURCE_EXHAUSTED")))
+
+    with pytest.raises(ProviderError, match="Quota exceeded"):
+        await collect(adapter)
+
+
+async def test_a_key_refused_while_listing_models_is_the_same_refusal() -> None:
+    """Every way out of this adapter reports failure in the same currency."""
+    adapter = adapter_for(FakeModels(error=refusal(401, "Unauthenticated", "UNAUTHENTICATED")))
+
+    with pytest.raises(AuthenticationError):
+        await adapter.list_models()
+
+
+async def test_a_stream_that_dies_part_way_through_is_a_refusal_too() -> None:
+    """The common shape of a network that dropped: the request was accepted and
+    the answer stopped arriving. Nothing above this layer can read an SDK
+    exception, so it must not escape as one."""
+    adapter = adapter_for(
+        FakeModels(
+            [text_chunk("Türkiye'nin"), text_chunk(" başkenti")],
+            error=refusal(500, "Internal error", "INTERNAL"),
+            error_after=1,
+        )
+    )
+
+    with pytest.raises(ProviderError, match="Internal error"):
+        await collect(adapter)

@@ -22,10 +22,12 @@ from dataclasses import dataclass, field
 from typing import Any, Literal, Protocol, runtime_checkable
 
 __all__ = [
+    "AuthenticationError",
     "Delta",
     "LLMProvider",
     "Message",
     "ModelInfo",
+    "ProviderError",
     "Role",
     "ToolCall",
     "ToolSpec",
@@ -33,6 +35,27 @@ __all__ = [
 ]
 
 Role = Literal["system", "user", "assistant", "tool"]
+
+
+class ProviderError(Exception):
+    """Something the provider refused to do, in words the application knows.
+
+    An adapter never lets its vendor's own exception out. `app.py` has to
+    decide what the assistant says out loud, and it cannot import three SDKs to
+    find out which of them just failed - that would put vendor knowledge in the
+    one place section 3.2 keeps it out of.
+    """
+
+
+class AuthenticationError(ProviderError):
+    """The key was refused: mistyped, revoked, or out of credit.
+
+    Kept apart from every other refusal because the answer is different
+    (section 3.2). A connection that dropped will probably work next turn, so
+    it is retried; a key that was refused will not, so it is never retried and
+    never quietly failed over to another model the user is then billed for.
+    The three ways a key can be refused all end in the same sentence: renew it.
+    """
 
 
 @dataclass(frozen=True, slots=True)

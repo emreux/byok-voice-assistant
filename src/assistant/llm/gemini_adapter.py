@@ -23,11 +23,26 @@ from collections.abc import AsyncIterator
 from typing import Any
 
 from google import genai
-from google.genai import types
+from google.genai import errors, types
 
-from assistant.llm.base import Delta, Message, ModelInfo, ToolCall, ToolSpec, Usage
+from assistant.llm.base import (
+    AuthenticationError,
+    Delta,
+    Message,
+    ModelInfo,
+    ProviderError,
+    ToolCall,
+    ToolSpec,
+    Usage,
+)
 
 _TEXT_ACTION = "generateContent"
+
+# What Gemini refuses a key with. 401 and 403 are the obvious two; the one that
+# actually happens is a 400 whose message says so, which is why the message is
+# read at all. Absorbing that here is the adapter earning its keep.
+_KEY_REFUSED = frozenset({401, 403})
+_KEY_REFUSED_IN_WORDS = "api key not valid"
 
 
 class GeminiAdapter:
@@ -55,7 +70,11 @@ class GeminiAdapter:
         return True
 
     async def list_models(self) -> list[ModelInfo]:
-        pager = await self._client.aio.models.list()
+        try:
+            pager = await self._client.aio.models.list()
+        except errors.APIError as refusal:
+            raise _refused(refusal) from refusal
+
         models: list[ModelInfo] = []
 
         async for model in pager:
@@ -97,9 +116,12 @@ class GeminiAdapter:
 
         # `generate_content_stream` is a coroutine that returns the iterator, so
         # it is awaited once and iterated after - not awaited per chunk.
-        chunks = await self._client.aio.models.generate_content_stream(
-            model=model, contents=contents, config=config
-        )
+        try:
+            chunks = await self._client.aio.models.generate_content_stream(
+                model=model, contents=contents, config=config
+            )
+        except errors.APIError as refusal:
+            raise _refused(refusal) from refusal
 
         # Gemini repeats a running token total on every chunk and the count
         # only grows, so the last one seen is the total for the request. They
@@ -108,19 +130,39 @@ class GeminiAdapter:
         finish_reason: str | None = None
         usage: Usage | None = None
 
-        async for chunk in chunks:
-            for delta in _translate(chunk):
-                yield delta
+        try:
+            async for chunk in chunks:
+                for delta in _translate(chunk):
+                    yield delta
 
-            candidates = chunk.candidates or []
-            if candidates and candidates[0].finish_reason is not None:
-                finish_reason = candidates[0].finish_reason.value
-            running_total = _usage(chunk.usage_metadata)
-            if running_total is not None:
-                usage = running_total
+                candidates = chunk.candidates or []
+                if candidates and candidates[0].finish_reason is not None:
+                    finish_reason = candidates[0].finish_reason.value
+                running_total = _usage(chunk.usage_metadata)
+                if running_total is not None:
+                    usage = running_total
+        except errors.APIError as refusal:
+            # Half an answer had already been yielded. The turn is abandoned
+            # either way, and `agent/core.py` throws the half away with it.
+            raise _refused(refusal) from refusal
 
         if finish_reason is not None or usage is not None:
             yield Delta(finish_reason=finish_reason, usage=usage)
+
+
+def _refused(error: errors.APIError) -> ProviderError:
+    """Turns one of Gemini's refusals into one of the two the application knows.
+
+    Only the distinction survives - which of the two sentences the user hears -
+    plus the provider's own words, which are the only thing that makes a report
+    of this diagnosable afterwards.
+    """
+    said = str(getattr(error, "message", "") or error)
+    where = f"gemini refused the request ({error.code}): {said}"
+
+    if error.code in _KEY_REFUSED or _KEY_REFUSED_IN_WORDS in said.casefold():
+        return AuthenticationError(where)
+    return ProviderError(where)
 
 
 def _split_system_prompt(messages: list[Message]) -> tuple[str | None, list[types.Content]]:
