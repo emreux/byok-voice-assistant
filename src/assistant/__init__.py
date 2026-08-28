@@ -1,10 +1,14 @@
 """A provider-agnostic, language-agnostic Windows desktop voice assistant.
 
-The package is deliberately thin at this point: phase 0 only proves that the
-project skeleton, the entry point and the tool chain work (design.md section 8).
-The real modules arrive in phase 1.
+`v0.1.0` is the voice loop and nothing else: hold the hotkey, speak, and hear
+the model answer out loud. Speech is transcribed locally, one adapter talks to
+one provider through a protocol that names none, and every sentence the product
+says comes from a locale pack. Tools and the permission gate that guards them
+arrive together in v0.2.0 (design.md section 8).
 """
 
 __all__ = ["__version__"]
 
-__version__ = "0.0.0"
+# Kept in step with `[project] version` in pyproject.toml by hand: two places,
+# both read by a person, and neither worth a build plugin to reconcile.
+__version__ = "0.1.0"
