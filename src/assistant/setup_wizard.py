@@ -75,11 +75,11 @@ class Prompter(Protocol):
 
     def say(self, key: str, **fields: object) -> None: ...
 
-    def choose(self, key: str, options: Sequence[Option]) -> str | None:
+    async def choose(self, key: str, options: Sequence[Option]) -> str | None:
         """Returns the chosen value, or `None` if the user walked away."""
         ...
 
-    def secret(self, key: str) -> str | None:
+    async def secret(self, key: str) -> str | None:
         """Reads a line without echoing it, or `None` if the user walked away."""
         ...
 
@@ -161,8 +161,8 @@ async def _ask(prompter: Prompter, catalog: Mapping[str, ProviderEntry] | None) 
         return _GAVE_UP
 
     prompter.say("welcome")
-    provider_id, entry = _pick_provider(prompter, buildable)
-    locale = _answered(prompter.choose("locale", _languages()))
+    provider_id, entry = await _pick_provider(prompter, buildable)
+    locale = _answered(await prompter.choose("locale", _languages()))
 
     if entry.key_url is not None:
         prompter.say("key_url", url=entry.key_url)
@@ -173,7 +173,7 @@ async def _ask(prompter: Prompter, catalog: Mapping[str, ProviderEntry] | None) 
     if not models:
         prompter.say("no_models")
         return _GAVE_UP
-    model = _answered(prompter.choose("model", [_offer(m) for m in models]))
+    model = _answered(await prompter.choose("model", [_offer(m) for m in models]))
 
     # Everything above could still be abandoned; from here it is written down.
     store_api_key(provider_id, api_key)
@@ -187,7 +187,7 @@ async def _ask(prompter: Prompter, catalog: Mapping[str, ProviderEntry] | None) 
     return _OK
 
 
-def _pick_provider(
+async def _pick_provider(
     prompter: Prompter, buildable: Mapping[str, ProviderEntry]
 ) -> tuple[str, ProviderEntry]:
     """Asks which provider - unless there is only one, which is no question."""
@@ -197,7 +197,7 @@ def _pick_provider(
         return provider_id, entry
 
     options = [Option(provider_id, e.display_name) for provider_id, e in buildable.items()]
-    chosen = _answered(prompter.choose("provider", options))
+    chosen = _answered(await prompter.choose("provider", options))
     return chosen, buildable[chosen]
 
 
@@ -215,7 +215,7 @@ async def _working_key(
     stored = load_api_key(provider_id)
 
     while True:
-        typed = _answered(prompter.secret("api_key_keep" if stored else "api_key"))
+        typed = _answered(await prompter.secret("api_key_keep" if stored else "api_key"))
         api_key = typed or stored or ""
         if not api_key:
             prompter.say("key_needed")
@@ -248,7 +248,15 @@ def _answered(value: str | None) -> str:
 
 
 class TerminalPrompter:
-    """The real terminal: `rich` for what is said, `questionary` for answers."""
+    """The real terminal: `rich` for what is said, `questionary` for answers.
+
+    Asked with `ask_async`, never with `ask`. The wizard checks the key against
+    the provider and asks it for a model list, so `run_setup` is a coroutine
+    and every question is drawn while an event loop is already running -
+    `questionary`'s synchronous `ask` starts a second one underneath, and
+    Python refuses. A scripted prompter cannot find that out, which is why
+    `test_setup_wizard.py` drives this class through a pipe as well.
+    """
 
     def __init__(self, *, text: Mapping[str, str] | None = None) -> None:
         self._text = wording() if text is None else text
@@ -257,8 +265,8 @@ class TerminalPrompter:
     def say(self, key: str, **fields: object) -> None:
         self._console.print(self._text[key].format(**fields))
 
-    def choose(self, key: str, options: Sequence[Option]) -> str | None:
-        answer = questionary.select(
+    async def choose(self, key: str, options: Sequence[Option]) -> str | None:
+        answer = await questionary.select(
             self._text[key],
             choices=[
                 questionary.Choice(title=option.label, value=option.value) for option in options
@@ -267,11 +275,11 @@ class TerminalPrompter:
             # arrow presses. With the filter on, j and k are letters again.
             use_search_filter=True,
             use_jk_keys=False,
-        ).ask()
+        ).ask_async()
         return _as_answer(answer)
 
-    def secret(self, key: str) -> str | None:
-        return _as_answer(questionary.password(self._text[key]).ask())
+    async def secret(self, key: str) -> str | None:
+        return _as_answer(await questionary.password(self._text[key]).ask_async())
 
 
 def _as_answer(value: object) -> str | None:

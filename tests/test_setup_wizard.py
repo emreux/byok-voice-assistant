@@ -13,12 +13,16 @@ recorded transcript rather than a session someone has to sit through.
 
 from __future__ import annotations
 
-from collections.abc import AsyncIterator, Mapping, Sequence
+from collections.abc import AsyncIterator, Iterator, Mapping, Sequence
+from contextlib import contextmanager
 from pathlib import Path
 from typing import ClassVar
 
 import pytest
 import questionary
+from prompt_toolkit.application import create_app_session
+from prompt_toolkit.input import create_pipe_input
+from prompt_toolkit.output import DummyOutput
 
 from assistant import locales
 from assistant.config import (
@@ -91,11 +95,11 @@ class ScriptedPrompter:
         assert key in TEXT, f"the wizard said {key!r}, which has no text"
         self.said.append((key, fields))
 
-    def choose(self, key: str, options: Sequence[Option]) -> str | None:
+    async def choose(self, key: str, options: Sequence[Option]) -> str | None:
         self.offered[key] = [option.value for option in options]
         return self._answer(key)
 
-    def secret(self, key: str) -> str | None:
+    async def secret(self, key: str) -> str | None:
         return self._answer(key)
 
     def _answer(self, key: str) -> str | None:
@@ -393,12 +397,12 @@ async def test_a_key_that_reaches_no_model_stops_the_wizard(
 
 
 class FakeQuestion:
-    """What `questionary` hands back: something with an `ask()`."""
+    """What `questionary` hands back: something with an `ask_async()`."""
 
     def __init__(self, answer: object) -> None:
         self._answer = answer
 
-    def ask(self) -> object:
+    async def ask_async(self) -> object:
         return self._answer
 
 
@@ -410,7 +414,7 @@ def test_the_terminal_says_the_sentence_with_its_fields_filled_in(
     assert "https://example.test/apikey" in capsys.readouterr().out
 
 
-def test_the_terminal_stores_the_value_and_shows_the_label(
+async def test_the_terminal_stores_the_value_and_shows_the_label(
     config_home: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -425,7 +429,9 @@ def test_the_terminal_stores_the_value_and_shows_the_label(
 
     monkeypatch.setattr(questionary, "select", select)
 
-    answer = TerminalPrompter().choose("model", [Option("fast", "Fast"), Option("smart", "Smart")])
+    answer = await TerminalPrompter().choose(
+        "model", [Option("fast", "Fast"), Option("smart", "Smart")]
+    )
 
     assert answer == "fast"
     assert seen["values"] == ["fast", "smart"]
@@ -433,7 +439,7 @@ def test_the_terminal_stores_the_value_and_shows_the_label(
     assert seen["message"] == wording()["model"]
 
 
-def test_the_terminal_reads_a_key_without_echoing_it(
+async def test_the_terminal_reads_a_key_without_echoing_it(
     config_home: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """`password` is what hides the typing; `text` would put the key on screen."""
@@ -442,13 +448,52 @@ def test_the_terminal_reads_a_key_without_echoing_it(
         questionary, "text", lambda *a, **k: pytest.fail("the key must not be echoed")
     )
 
-    assert TerminalPrompter().secret("api_key") == "typed-key"
+    assert await TerminalPrompter().secret("api_key") == "typed-key"
 
 
-def test_an_interrupted_question_is_not_an_answer(
+async def test_an_interrupted_question_is_not_an_answer(
     config_home: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """Ctrl+C makes `questionary` return None, which the wizard reads as walking away."""
     monkeypatch.setattr(questionary, "password", lambda message: FakeQuestion(None))
 
-    assert TerminalPrompter().secret("api_key") is None
+    assert await TerminalPrompter().secret("api_key") is None
+
+
+# --------------------------------------------------------------------------
+# The terminal the wizard really runs in
+#
+# Everything above hands the wizard a scripted prompter, which is the right
+# way to test what it asks and what it does with the answers - and is exactly
+# why the terminal itself went untested until somebody ran `assistant setup`.
+# These two drive the real one, through a pipe instead of a keyboard.
+# --------------------------------------------------------------------------
+
+
+@contextmanager
+def typed(keys: str) -> Iterator[None]:
+    """A terminal that answers with `keys` and draws nowhere."""
+    with create_pipe_input() as keyboard:
+        keyboard.send_text(keys)
+        with create_app_session(input=keyboard, output=DummyOutput()):
+            yield
+
+
+async def test_a_question_can_be_asked_from_inside_the_event_loop() -> None:
+    """`run_setup` is a coroutine, so every prompt is drawn while an event loop
+    is already running. `questionary`'s synchronous `ask` starts a second one
+    and Python refuses outright - which no scripted prompter can find out."""
+    prompter = TerminalPrompter(text={"locale": "Which language?"})
+
+    with typed("\r"):
+        chosen = await prompter.choose("locale", [Option("tr", "Türkçe"), Option("en", "English")])
+
+    assert chosen == "tr"
+
+
+async def test_a_key_can_be_typed_from_inside_the_event_loop() -> None:
+    """The same for the one question whose answer is a secret."""
+    prompter = TerminalPrompter(text={"api_key": "Paste your API key"})
+
+    with typed("a-key\r"):
+        assert await prompter.secret("api_key") == "a-key"
