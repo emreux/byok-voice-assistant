@@ -27,6 +27,7 @@ __all__ = [
     "ADAPTERS",
     "MissingAPIKeyError",
     "ProviderEntry",
+    "RegistryError",
     "UnknownProviderError",
     "UnsupportedAdapterError",
     "create_provider",

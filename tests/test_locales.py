@@ -21,15 +21,24 @@ import tomllib
 from pathlib import Path
 from typing import Any
 
+from assistant import __main__ as cli
 from assistant import app, locales, setup_wizard
 from assistant.locales import FALLBACK_CODE, available, iso_code, load, system_code
+from assistant.ui import status
 
 PACKAGED = Path(locales.__file__).parent
 
-# A pack has one `[ui]` table, and more than one module says things: the setup
-# wizard asks the questions, `app.py` says what went wrong in a turn. What a
-# pack may translate is the two of them together.
-SENTENCES = {**setup_wizard.TEXT, **app.TEXT}
+# A pack has one `[ui]` table, and four modules say things: the wizard asks the
+# questions, `app.py` says what went wrong in a turn, the status line says what
+# is happening, and the command line says whether it can start at all. What a
+# pack may translate is the four of them together.
+TABLES = {
+    "setup_wizard": setup_wizard.TEXT,
+    "app": app.TEXT,
+    "ui.status": status.TEXT,
+    "__main__": cli.TEXT,
+}
+SENTENCES = {key: text for table in TABLES.values() for key, text in table.items()}
 
 
 def shipped() -> list[Path]:
@@ -98,9 +107,10 @@ def test_the_template_offers_every_sentence_a_translator_has_to_write() -> None:
 def test_no_two_modules_claim_the_same_sentence() -> None:
     """One table, one key, one sentence. Two modules using the same key for two
     different sentences means the translation of one becomes the other."""
-    shared = set(setup_wizard.TEXT) & set(app.TEXT)
+    for name, table in TABLES.items():
+        others = {key for other, t in TABLES.items() if other != name for key in t}
 
-    assert not shared, f"both modules define {shared}"
+        assert not set(table) & others, f"{name} shares {set(table) & others}"
 
 
 def test_a_pack_translates_only_sentences_the_product_actually_says() -> None:

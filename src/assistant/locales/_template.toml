@@ -61,3 +61,21 @@ cancelled = "Setup cancelled. Nothing was changed."
 unreachable = "I could not reach the provider. Will you try again?"
 key_invalid = "Your API key is not being accepted any more. You need to renew it."
 took_too_long = "That took too long. Will you try again?"
+
+# Shown on screen while the assistant runs (item 1.11). The status line holds
+# the state and the hotkey together on one line, so keep these short.
+hold_to_talk = "Hold {hotkey} to talk. Ctrl+C stops."
+loading_speech = "Loading the speech model..."
+state_idle = "ready"
+state_listening = "listening"
+state_transcribing = "writing it down"
+state_thinking = "thinking"
+state_speaking = "speaking"
+you_said = "you"
+it_said = "assistant"
+turn_cost = "{input} in, {output} out"
+
+# Said once, by the command line itself, when it can or cannot start.
+not_set_up = "Nothing is set up yet. Run 'assistant setup' first."
+cannot_start = "The assistant cannot start: {problem}"
+stopped = "Stopped."
