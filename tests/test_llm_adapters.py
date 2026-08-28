@@ -1,15 +1,34 @@
-"""Contract tests for the provider layer (design.md section 3.2).
+"""The contract every provider adapter has to pass, unchanged (section 3.2).
 
-Every adapter has to pass this file unchanged. Phase 1 ships one adapter, so
-for now the suite proves the shape of the contract itself: that an async
-generator satisfies `LLMProvider`, that a stream is consumed without awaiting
-the call, and that no provider SDK leaks into the protocol module.
+This is the exam the project's headline claim sits: the application talks to
+Anthropic, to anything OpenAI-shaped and to Gemini through one protocol, and
+the way that stays true is that one suite says what an adapter must do and
+every adapter is run through it. Phase 2.7 adds a second and phase 4.5 a third;
+neither of them may edit a line below.
+
+Nothing here names a vendor. The tests script a provider in the words of
+`contract.py` - it says something, it asks for a tool, it reports what the
+request cost, it refuses - and each adapter's own test file translates that
+script into the shapes its SDK really produces. `test_every_adapter_this_build
+_has_is_in_this_suite` is what stops an adapter from being added to the
+registry without one.
+
+The two claims worth reading twice:
+
+**`Delta.tool_call` is never half-built.** Every provider streams tool
+arguments as partial JSON. The adapter buffers them and emits one whole call or
+nothing, because the permission gate of section 3.9 cannot judge an action it
+can only see the beginning of - and by the time the rest arrives, the gate has
+already run.
+
+**A refusal arrives as one of two exceptions and never as an SDK's own.** The
+application decides out loud what to say about a failure (`app.py`), and it
+cannot import three SDKs to find out which of them just failed.
 
 The `def stream` signature is the subtle part. Adapters implement it with
 `async def ... yield`, which returns an `AsyncIterator` when called, with no
 `await`. Declaring it `async def` in the protocol would force callers to await
-first and no adapter would satisfy the type. `test_stream_is_consumed_without
-_awaiting_the_call` is what keeps somebody from "fixing" that signature.
+first and no adapter would satisfy the type.
 """
 
 from __future__ import annotations
@@ -21,6 +40,7 @@ from pathlib import Path
 
 import pytest
 
+from assistant.llm import registry
 from assistant.llm.base import (
     AuthenticationError,
     Delta,
@@ -32,15 +52,35 @@ from assistant.llm.base import (
     ToolSpec,
     Usage,
 )
+from tests.contract import COMPLAINT, Adapter, Calls, Nothing, Refuses, Says, Spends, Starts, Stops
+from tests.test_gemini_adapter import GEMINI
 
 PROVIDER_SDKS = frozenset({"google", "openai", "anthropic", "litellm"})
+
+# One entry per adapter this build can construct. Phase 2.7 appends the
+# OpenAI-compatible one and phase 4.5 the Anthropic one; the tests do not move.
+ADAPTERS = [GEMINI]
+
+
+@pytest.fixture(params=ADAPTERS, ids=lambda adapter: adapter.name)
+def adapter(request: pytest.FixtureRequest) -> Adapter:
+    """Every adapter in turn. Each test below runs once for each of them."""
+    built: Adapter = request.param
+    return built
+
+
+async def spoken(provider: LLMProvider) -> list[Delta]:
+    """One whole answer, collected. Phase 1 offers no tools (section 8)."""
+    return [delta async for delta in provider.stream([Message.user("merhaba")], [], model="any")]
 
 
 class FakeProvider:
     """A minimal provider that satisfies the protocol without any network call.
 
-    Adapter tests reuse this as the reference implementation: whatever a real
-    adapter does differently, it must still look like this from the outside.
+    The reference implementation: whatever a real adapter does differently, it
+    must still look like this from the outside. Tests elsewhere in the suite
+    use it as a stand-in for a real one, which is only honest as long as it
+    answers the protocol the same way.
     """
 
     id = "fake"
@@ -67,6 +107,11 @@ class FakeProvider:
         self.calls.append({"messages": messages, "tools": tools, "model": model})
         for delta in self.deltas:
             yield delta
+
+
+# --------------------------------------------------------------------------
+# The shape of the protocol itself
+# --------------------------------------------------------------------------
 
 
 def test_an_async_generator_implementation_satisfies_the_protocol() -> None:
@@ -146,3 +191,194 @@ def test_a_refused_key_is_a_refusal_of_its_own_kind() -> None:
     narrow case be answered first."""
     assert issubclass(AuthenticationError, ProviderError)
     assert issubclass(ProviderError, Exception)
+
+
+# --------------------------------------------------------------------------
+# The contract: every adapter, the same questions
+# --------------------------------------------------------------------------
+
+
+def test_every_adapter_this_build_has_is_in_this_suite() -> None:
+    """An adapter added to the registry without a line here would leave the
+    contract untested for exactly the one nobody has run yet."""
+    assert {entry.name for entry in ADAPTERS} == set(registry.ADAPTERS)
+
+
+def test_every_adapter_satisfies_the_protocol(adapter: Adapter) -> None:
+    provider: LLMProvider = adapter.build()
+
+    assert isinstance(provider, LLMProvider)
+    assert provider.id
+
+
+def test_every_adapter_announces_what_it_can_do(adapter: Adapter) -> None:
+    """A vendor-only feature - prompt caching, `reasoning_effort` - reaches the
+    agent loop through `capabilities` and never through the protocol, which
+    would drag every other adapter down to the common denominator."""
+    announced = getattr(adapter.build(), "capabilities", None)
+
+    assert isinstance(announced, frozenset)
+
+
+async def test_the_stream_is_iterated_rather_than_awaited(adapter: Adapter) -> None:
+    """No `await` on the call itself - see the note in the module docstring."""
+    chunks = adapter.build(Says("hi")).stream([Message.user("merhaba")], [], model="any")
+
+    assert [delta.text async for delta in chunks] == ["hi"]
+
+
+async def test_text_arrives_in_the_order_it_was_streamed(adapter: Adapter) -> None:
+    deltas = await spoken(adapter.build(Says("Mer"), Says("haba")))
+
+    assert [delta.text for delta in deltas] == ["Mer", "haba"]
+
+
+async def test_a_chunk_that_carried_nothing_is_not_a_delta(adapter: Adapter) -> None:
+    """Every provider sends chunks that only advance its own state. An empty
+    `Delta` would have the agent loop append nothing to the answer, over and
+    over, and the turn would still be counted as having said something."""
+    deltas = await spoken(adapter.build(Nothing(), Says("hi"), Nothing()))
+
+    assert [delta.text for delta in deltas] == ["hi"]
+
+
+# --------------------------------------------------------------------------
+# What the turn cost
+# --------------------------------------------------------------------------
+
+
+async def test_the_token_counts_arrive_once_and_are_the_total(adapter: Adapter) -> None:
+    """Providers disagree about when and how often they report cost, and some
+    repeat a running total on every chunk. A consumer that added up every
+    `Delta.usage` would report - and be billed for - several times the truth,
+    and the cost report of section 6 would be quietly wrong."""
+    deltas = await spoken(
+        adapter.build(Says("One,"), Spends(7, 2), Says(" two"), Spends(7, 20), Stops())
+    )
+
+    spent = [delta.usage for delta in deltas if delta.usage is not None]
+
+    assert len(spent) == 1
+    assert (spent[0].input_tokens, spent[0].output_tokens) == (7, 20)
+
+
+async def test_a_provider_that_reported_no_cost_is_not_given_one(adapter: Adapter) -> None:
+    """Zero tokens is a claim that the request was free. Silence is not, and
+    inventing the difference puts a number in the cost report nothing backs.
+    The stream below ended properly; it simply never said what it cost."""
+    deltas = await spoken(adapter.build(Says("hi"), Stops()))
+
+    assert all(delta.usage is None for delta in deltas)
+
+
+async def test_the_reason_generation_stopped_is_reported(adapter: Adapter) -> None:
+    """What the word is, is the provider's business - `STOP`, `stop`,
+    `end_turn`. That there is one is not."""
+    deltas = await spoken(adapter.build(Says("hi"), Stops()))
+
+    reasons = [delta.finish_reason for delta in deltas if delta.finish_reason is not None]
+
+    assert len(reasons) == 1
+    assert isinstance(reasons[0], str)
+
+
+# --------------------------------------------------------------------------
+# Tool calls, which phase 1 never sees and phase 2 depends on
+# --------------------------------------------------------------------------
+
+
+async def test_a_finished_tool_call_arrives_whole(adapter: Adapter) -> None:
+    deltas = await spoken(adapter.build(Calls("open_app", {"name": "notepad"}, id="c7")))
+
+    calls = [delta.tool_call for delta in deltas if delta.tool_call is not None]
+
+    assert len(calls) == 1
+    assert (calls[0].id, calls[0].name) == ("c7", "open_app")
+    assert dict(calls[0].arguments) == {"name": "notepad"}
+
+
+async def test_a_tool_call_still_being_streamed_is_never_yielded(adapter: Adapter) -> None:
+    """Section 3.2's own sentence: `Delta.tool_call` is never half-built. The
+    gate of section 3.9 cannot judge an action it can only see the beginning
+    of, and by the time the rest arrives the gate has already run."""
+    deltas = await spoken(
+        adapter.build(
+            Starts("send_email", {"to": "a@b"}),
+            Calls("send_email", {"to": "a@b.com", "body": "hi"}),
+        )
+    )
+
+    calls = [delta.tool_call for delta in deltas if delta.tool_call is not None]
+
+    assert len(calls) == 1
+    assert dict(calls[0].arguments) == {"to": "a@b.com", "body": "hi"}
+
+
+# --------------------------------------------------------------------------
+# Refusals: two kinds, and never the SDK's own
+# --------------------------------------------------------------------------
+
+
+async def test_a_refused_key_is_named_as_one(adapter: Adapter) -> None:
+    """The turn is cancelled and the user is told to renew the key. Nothing
+    above this layer may import an SDK to find that out."""
+    with pytest.raises(AuthenticationError):
+        await spoken(adapter.build(refuses=Refuses.THE_KEY))
+
+
+async def test_a_provider_having_a_bad_day_is_not_a_key_problem(adapter: Adapter) -> None:
+    """Telling the user to renew a working key over a 503 sends them to the
+    provider's console to fix something that is not broken."""
+    with pytest.raises(ProviderError) as raised:
+        await spoken(adapter.build(refuses=Refuses.THE_REQUEST))
+
+    assert not isinstance(raised.value, AuthenticationError)
+
+
+async def test_a_refusal_carries_what_the_provider_said_about_it(adapter: Adapter) -> None:
+    """The sentence the user hears is ours and says nothing useful to whoever
+    has to diagnose this afterwards; the exception is where the provider's own
+    words go."""
+    with pytest.raises(ProviderError, match=COMPLAINT):
+        await spoken(adapter.build(refuses=Refuses.THE_REQUEST))
+
+
+async def test_a_stream_that_dies_part_way_through_is_a_refusal_too(adapter: Adapter) -> None:
+    """The shape a dropped network really takes: the request was accepted and
+    then the answer stopped arriving. Half an answer has already been yielded,
+    and it must still not escape as an SDK exception."""
+    provider = adapter.build(
+        Says("Türkiye'nin"), Says(" başkenti"), refuses=Refuses.THE_REQUEST, after=1
+    )
+
+    with pytest.raises(ProviderError):
+        await spoken(provider)
+
+
+async def test_a_key_refused_while_listing_models_is_the_same_refusal(adapter: Adapter) -> None:
+    """Every way out of an adapter reports failure in the same currency."""
+    with pytest.raises(AuthenticationError):
+        await adapter.build(refuses=Refuses.THE_KEY).list_models()
+
+
+# --------------------------------------------------------------------------
+# Which key, and which models it reaches
+# --------------------------------------------------------------------------
+
+
+async def test_a_key_that_was_refused_does_not_validate(adapter: Adapter) -> None:
+    """The setup command asks this before it stores anything, so a `False` here
+    is what keeps a dead key out of the Credential Manager (section 3.3)."""
+    assert await adapter.build(refuses=Refuses.THE_KEY).validate_credentials() is False
+
+
+async def test_a_working_key_validates(adapter: Adapter) -> None:
+    assert await adapter.build(models=[("m-1", "Model One")]).validate_credentials() is True
+
+
+async def test_the_models_a_key_reaches_are_reported_as_model_info(adapter: Adapter) -> None:
+    """Whatever a provider calls its model list, the setup command reads one
+    shape: an id to store in `config.toml` and a name to show."""
+    listed = await adapter.build(models=[("m-1", "Model One")]).list_models()
+
+    assert [(model.id, model.display_name) for model in listed] == [("m-1", "Model One")]

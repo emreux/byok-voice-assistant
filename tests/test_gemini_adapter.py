@@ -5,16 +5,17 @@ chunks it yields are real `google.genai.types` objects, so a field this suite
 reads is a field the SDK actually has. A hand-rolled stub would let the tests
 pass while the adapter reads an attribute that does not exist.
 
-Phase 1 calls the adapter with an empty tool list, so the tool-call tests
-describe a contract that only pays off in phase 2. They are here now because
-the buffering rule - never emit a half-built call - is easy to get right while
-writing the loop and expensive to retrofit once the permission gate depends on
-it (design.md section 3.2).
+What is *not* here is anything every adapter has to do. Text arriving in
+order, a tool call never arriving half-built, a refusal reaching the caller as
+one of the two exceptions the application knows - all of those are the
+contract, and they are tested once for every adapter in `test_llm_adapters.py`.
+This file is only what Gemini does differently, plus the `build` function at
+the bottom that lets the contract suite drive it.
 """
 
 from __future__ import annotations
 
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Sequence
 from typing import Any
 
 import pytest
@@ -25,10 +26,20 @@ from assistant.llm.base import (
     Delta,
     LLMProvider,
     Message,
-    ProviderError,
     ToolSpec,
 )
 from assistant.llm.gemini_adapter import GeminiAdapter
+from tests.contract import (
+    COMPLAINT,
+    Adapter,
+    Calls,
+    Nothing,
+    Refuses,
+    Says,
+    Spends,
+    Starts,
+    Step,
+)
 
 
 def text_chunk(
@@ -49,13 +60,20 @@ def text_chunk(
 
 
 def final_chunk(
-    *, reason: types.FinishReason = types.FinishReason.STOP, prompt: int = 0, output: int = 0
+    *,
+    reason: types.FinishReason = types.FinishReason.STOP,
+    prompt: int | None = None,
+    output: int = 0,
 ) -> types.GenerateContentResponse:
+    """The end of the stream, with token counts only if the caller asks for
+    them - a provider that reported none must not be read as reporting zero."""
     return types.GenerateContentResponse(
         candidates=[
             types.Candidate(content=types.Content(role="model", parts=[]), finish_reason=reason)
         ],
-        usage_metadata=types.GenerateContentResponseUsageMetadata(
+        usage_metadata=None
+        if prompt is None
+        else types.GenerateContentResponseUsageMetadata(
             prompt_token_count=prompt, candidates_token_count=output, cached_content_token_count=0
         ),
     )
@@ -146,30 +164,6 @@ async def collect(adapter: GeminiAdapter, **kwargs: Any) -> list[Delta]:
     ]
 
 
-def test_the_adapter_satisfies_the_protocol() -> None:
-    provider: LLMProvider = adapter_for(FakeModels())
-
-    assert isinstance(provider, LLMProvider)
-    assert provider.id == "gemini"
-
-
-async def test_text_arrives_in_the_order_the_provider_sent_it() -> None:
-    adapter = adapter_for(FakeModels([text_chunk("Mer"), text_chunk("haba")]))
-
-    deltas = await collect(adapter)
-
-    assert [d.text for d in deltas] == ["Mer", "haba"]
-
-
-async def test_the_closing_chunk_carries_the_token_counts() -> None:
-    adapter = adapter_for(FakeModels([text_chunk("hi"), final_chunk(prompt=12, output=5)]))
-
-    usage = [d.usage for d in await collect(adapter) if d.usage is not None]
-
-    assert len(usage) == 1
-    assert (usage[0].input_tokens, usage[0].output_tokens) == (12, 5)
-
-
 async def test_the_token_counts_are_reported_once_not_per_chunk() -> None:
     """Every Gemini chunk repeats a running total, so a consumer that added
     them up would report - and charge for - several times the real usage."""
@@ -204,32 +198,6 @@ async def test_the_reason_generation_stopped_is_reported() -> None:
     reasons = [d.finish_reason for d in await collect(adapter) if d.finish_reason]
 
     assert reasons == ["MAX_TOKENS"]
-
-
-async def test_a_complete_tool_call_is_handed_over_whole() -> None:
-    adapter = adapter_for(FakeModels([call_chunk("open_app", {"name": "notepad"})]))
-
-    calls = [d.tool_call for d in await collect(adapter) if d.tool_call is not None]
-
-    assert len(calls) == 1
-    assert (calls[0].name, dict(calls[0].arguments)) == ("open_app", {"name": "notepad"})
-
-
-async def test_a_tool_call_still_being_streamed_is_withheld() -> None:
-    """The permission gate cannot judge an action it can only see the start of."""
-    adapter = adapter_for(
-        FakeModels(
-            [
-                call_chunk("send_email", {"to": "a@b"}, still_streaming=True),
-                call_chunk("send_email", {"to": "a@b.com", "body": "hi"}),
-            ]
-        )
-    )
-
-    calls = [d.tool_call for d in await collect(adapter) if d.tool_call is not None]
-
-    assert len(calls) == 1
-    assert dict(calls[0].arguments) == {"to": "a@b.com", "body": "hi"}
 
 
 async def test_the_system_message_is_lifted_out_of_the_conversation() -> None:
@@ -311,35 +279,13 @@ async def test_only_models_that_can_generate_text_are_offered() -> None:
     assert listed[0].context_window == 1000
 
 
-async def test_a_rejected_key_is_reported_rather_than_raised() -> None:
+async def test_a_key_that_fails_in_an_unexpected_way_is_still_just_a_no() -> None:
+    """Not every refusal arrives as an SDK error - a proxy, a DNS failure and a
+    closed socket all reach this as something else entirely. The setup command
+    needs one answer, and it is the same answer."""
     adapter = adapter_for(FakeModels(error=RuntimeError("API key not valid")))
 
     assert await adapter.validate_credentials() is False
-
-
-async def test_a_working_key_validates() -> None:
-    models = FakeModels(
-        models=[types.Model(name="models/gemini-x", supported_actions=["generateContent"])]
-    )
-
-    assert await adapter_for(models).validate_credentials() is True
-
-
-def test_the_adapter_announces_what_it_can_do() -> None:
-    adapter = adapter_for(FakeModels())
-
-    assert isinstance(adapter.capabilities, frozenset)
-
-
-async def test_an_empty_chunk_does_not_become_an_empty_delta() -> None:
-    """Providers send chunks that only advance their own state; they are not output."""
-    adapter = adapter_for(
-        FakeModels([types.GenerateContentResponse(candidates=[]), text_chunk("hi")])
-    )
-
-    deltas = await collect(adapter)
-
-    assert [d.text for d in deltas] == ["hi"]
 
 
 @pytest.mark.parametrize("role", ["user", "assistant"])
@@ -383,45 +329,69 @@ async def test_the_shape_gemini_actually_refuses_a_bad_key_in_is_recognised() ->
         await collect(adapter)
 
 
-async def test_a_provider_merely_having_a_bad_day_is_not_a_key_problem() -> None:
-    """Telling the user to renew a working key over a 503 sends them to the
-    provider's console to fix something that is not broken."""
-    adapter = adapter_for(FakeModels(error=refusal(503, "The model is overloaded", "UNAVAILABLE")))
-
-    with pytest.raises(ProviderError) as raised:
-        await collect(adapter)
-
-    assert not isinstance(raised.value, AuthenticationError)
-
-
-async def test_a_refusal_carries_what_the_provider_said_about_it() -> None:
-    """The sentence the user hears is ours and says nothing useful to whoever
-    has to diagnose this; the exception is where the provider's words go."""
-    adapter = adapter_for(FakeModels(error=refusal(429, "Quota exceeded", "RESOURCE_EXHAUSTED")))
-
-    with pytest.raises(ProviderError, match="Quota exceeded"):
-        await collect(adapter)
+# --------------------------------------------------------------------------
+# How the contract suite drives this adapter
+#
+# `test_llm_adapters.py` scripts a provider without naming one; this is where
+# that script becomes Gemini. Everything vendor-shaped about the contract suite
+# is in these three functions, which is the same rule the adapter itself lives
+# by (section 3.2).
+# --------------------------------------------------------------------------
 
 
-async def test_a_key_refused_while_listing_models_is_the_same_refusal() -> None:
-    """Every way out of this adapter reports failure in the same currency."""
-    adapter = adapter_for(FakeModels(error=refusal(401, "Unauthenticated", "UNAUTHENTICATED")))
+def _chunk(step: Step) -> types.GenerateContentResponse:
+    """One step of a scripted provider, in the shapes Gemini produces."""
+    if isinstance(step, Nothing):
+        return types.GenerateContentResponse(candidates=[])
+    if isinstance(step, Says):
+        return text_chunk(step.text)
+    if isinstance(step, Calls):
+        return call_chunk(step.name, dict(step.arguments), call_id=step.id)
+    if isinstance(step, Starts):
+        return call_chunk(step.name, dict(step.arguments), call_id=step.id, still_streaming=True)
+    if isinstance(step, Spends):
+        return types.GenerateContentResponse(
+            candidates=[],
+            usage_metadata=types.GenerateContentResponseUsageMetadata(
+                prompt_token_count=step.input,
+                candidates_token_count=step.output,
+                cached_content_token_count=step.cached,
+            ),
+        )
+    return final_chunk()
 
-    with pytest.raises(AuthenticationError):
-        await adapter.list_models()
+
+def _how_it_refuses(refuses: Refuses | None) -> Exception | None:
+    if refuses is None:
+        return None
+    if refuses is Refuses.THE_KEY:
+        # The shape it really uses, rather than the 401 everybody expects.
+        return refusal(400, "API key not valid. Please pass a valid API key.", "INVALID_ARGUMENT")
+    return refusal(503, COMPLAINT, "UNAVAILABLE")
 
 
-async def test_a_stream_that_dies_part_way_through_is_a_refusal_too() -> None:
-    """The common shape of a network that dropped: the request was accepted and
-    the answer stopped arriving. Nothing above this layer can read an SDK
-    exception, so it must not escape as one."""
-    adapter = adapter_for(
+def build(
+    *script: Step,
+    refuses: Refuses | None = None,
+    after: int = 0,
+    models: Sequence[tuple[str, str]] = (),
+) -> LLMProvider:
+    """What `contract.Build` asks for, answered in Gemini's own shapes."""
+    return adapter_for(
         FakeModels(
-            [text_chunk("Türkiye'nin"), text_chunk(" başkenti")],
-            error=refusal(500, "Internal error", "INTERNAL"),
-            error_after=1,
+            chunks=[_chunk(step) for step in script],
+            models=[
+                types.Model(
+                    name=f"models/{model_id}",
+                    display_name=name,
+                    supported_actions=["generateContent"],
+                )
+                for model_id, name in models
+            ],
+            error=_how_it_refuses(refuses),
+            error_after=after,
         )
     )
 
-    with pytest.raises(ProviderError, match="Internal error"):
-        await collect(adapter)
+
+GEMINI = Adapter(name="gemini", build=build)
