@@ -85,7 +85,19 @@ def log_turn(finished: Turn) -> None:
     silence - and logging those buries the turns that cost something under the
     ones that cost nothing. A turn that *failed* is kept: it reports no tokens,
     and it is the line worth finding afterwards.
+
+    So is a turn that was *missed*. It cost nothing, which is exactly why the
+    line matters: a user reporting that the assistant "does nothing" and a log
+    full of missed turns at 0.5 have already answered each other, and the
+    number is the whole of the answer. The words are still not written down -
+    a transcript nothing stood behind is no more worth keeping than one that
+    was.
     """
+    if finished.missed:
+        confidence = "-" if finished.confidence is None else f"{finished.confidence:.2f}"
+        logger.info("missed: nothing worth answering, confidence {value}", value=confidence)
+        return
+
     if not finished.heard:
         return
 

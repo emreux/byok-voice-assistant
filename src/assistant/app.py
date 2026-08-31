@@ -65,6 +65,7 @@ __all__ = [
     "THINKING_TIMEOUT",
     "Assistant",
     "Capture",
+    "Heard",
     "State",
     "Turn",
     "choose_voice",
@@ -102,7 +103,24 @@ TEXT: dict[str, str] = {
     "unreachable": "I could not reach the provider. Will you try again?",
     "key_invalid": "Your API key is not being accepted any more. You need to renew it.",
     "took_too_long": "That took too long. Will you try again?",
+    "not_understood": "I did not catch that. Will you say it again?",
 }
+
+
+@dataclass(frozen=True, slots=True)
+class Heard:
+    """What the recogniser made of a recording, and whether it is worth a reply.
+
+    Three outcomes rather than two, because "nothing happened" and "you said
+    something and I could not read it" are different things to the person in
+    the chair. A tapped key deserves silence; a sentence that did not survive
+    the confidence floor deserves to be told so, or the assistant looks broken
+    at exactly the moment it is working as designed.
+    """
+
+    text: str = ""
+    missed: bool = False
+    confidence: float | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -114,11 +132,18 @@ class Turn:
     log every turn, which is what the cost report of section 6 is built from -
     so they have to leave the turn, and a turn that only reported success would
     hide the ones that cost tokens and still failed.
+
+    A turn that was *missed* carries no `heard` on purpose: there is no
+    transcript this application is willing to stand behind. What it carries
+    instead is the number that decided it, which is the only thing that makes
+    a run of them diagnosable afterwards.
     """
 
     heard: str = ""
     said: str = ""
     usage: Usage = field(default_factory=Usage)
+    missed: bool = False
+    confidence: float | None = None
 
 
 class Capture(Protocol):
@@ -197,6 +222,14 @@ class Assistant:
         self._capture.on_listening = self._key_went_down
         self._capture.start()
 
+        # Said out loud to whoever is watching, rather than merely being true.
+        # The state has been `IDLE` since the constructor, but nothing had ever
+        # announced it, so the status line went on showing the last thing it
+        # was told - which is "loading the speech model" - until the first turn
+        # was over. A program that looks like it never finished starting is one
+        # nobody presses a key at.
+        self._enter(State.IDLE)
+
     async def run(self) -> None:
         """Answers utterances until something stops the program."""
         await self.begin()
@@ -212,29 +245,60 @@ class Assistant:
         """One recording, from what was heard to what was said back."""
         self._enter(State.TRANSCRIBING)
         heard = await self._heard(pcm)
-        if heard is None or self._withdrawn():
+
+        # A question the user has already withdrawn is answered by saying
+        # nothing at all, including about not having understood it.
+        if self._withdrawn():
             self._rest()
             return Turn()
 
+        if not heard.text:
+            return await self._missed(heard)
+
         self._enter(State.THINKING)
-        said, usage = await self._answer(heard)
+        said, usage = await self._answer(heard.text)
         await self._speak(said)
         self._rest()
-        return Turn(heard=heard, said=said, usage=usage)
+        return Turn(heard=heard.text, said=said, usage=usage)
+
+    async def _missed(self, heard: Heard) -> Turn:
+        """Nothing usable came back. Whether that is worth saying depends.
+
+        A recording too short to be a word is a key touched by accident, and an
+        assistant that announced every one of those would be unusable. A
+        recording that held speech the recogniser could not read is the
+        opposite: silence there is indistinguishable from a broken program,
+        and the user has no way to learn that speaking up would fix it.
+        """
+        if not heard.missed:
+            self._rest()
+            return Turn()
+
+        said = self._said["not_understood"]
+        await self._speak(said)
+        self._rest()
+        return Turn(said=said, missed=True, confidence=heard.confidence)
 
     # ----------------------------------------------------------------------
     # The turn, one stage at a time
     # ----------------------------------------------------------------------
 
-    async def _heard(self, pcm: Audio) -> str | None:
-        """What the user said, or `None` if they did not say anything."""
+    async def _heard(self, pcm: Audio) -> Heard:
+        """What the user said, and what to make of it when they said nothing."""
         if len(pcm) < MIN_UTTERANCE_SECONDS * SAMPLE_RATE:
             # A tap rather than a hold. Transcribing it costs seconds of four
-            # cores and answering it costs an API call, both for nothing.
-            return None
+            # cores and answering it costs an API call, both for nothing - and
+            # there is nothing here to have misheard, so nothing to say about.
+            return Heard()
 
         transcript = await self._stt.transcribe(pcm, hint=self._locale.stt_language)
-        return transcript.text.strip() if is_speech(transcript) else None
+        if is_speech(transcript):
+            return Heard(text=transcript.text.strip(), confidence=transcript.confidence)
+
+        # Long enough to have been a sentence, and it was not one this can
+        # stand behind. The number is kept because a run of these is only
+        # diagnosable with it (`logs.py`).
+        return Heard(missed=True, confidence=transcript.confidence)
 
     async def _answer(self, heard: str) -> tuple[str, Usage]:
         """The model's answer, or the sentence that explains why there is none.

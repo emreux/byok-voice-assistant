@@ -58,6 +58,7 @@ TURKISH = Locale(
         "key_invalid": "API anahtarın geçersiz görünüyor, yenilemen gerekiyor.",
         "unreachable": "Sağlayıcıya bağlanamadım, tekrar dener misin?",
         "took_too_long": "Bu iş uzadı, tekrar dener misin?",
+        "not_understood": "Seni anlayamadım, tekrar söyler misin?",
     },
 )
 
@@ -233,7 +234,16 @@ async def test_a_turn_walks_through_the_states_the_design_names() -> None:
 
     await one_turn(assistant_with(on_state=seen.append))
 
-    assert seen == [State.TRANSCRIBING, State.THINKING, State.SPEAKING, State.IDLE]
+    assert seen == [
+        # `begin` says so, and it has to: the state has been `IDLE` since the
+        # constructor, but a status line that was never told goes on showing
+        # "loading the speech model" until the first turn is over.
+        State.IDLE,
+        State.TRANSCRIBING,
+        State.THINKING,
+        State.SPEAKING,
+        State.IDLE,
+    ]
 
 
 async def test_the_key_going_down_is_what_starts_listening() -> None:
@@ -244,7 +254,7 @@ async def test_the_key_going_down_is_what_starts_listening() -> None:
     await assistant.begin()
     capture.press()
 
-    assert seen == [State.LISTENING]
+    assert seen == [State.IDLE, State.LISTENING]
     assert assistant.state is State.LISTENING
 
 
@@ -324,7 +334,71 @@ async def test_silence_that_whisper_turned_into_words_is_dropped() -> None:
 
     await one_turn(assistant_with(stt=stt, provider=provider, speaker=speaker))
 
-    assert (provider.calls, speaker.played) == ([], [])
+    assert provider.calls == [], "words nobody said were sent to the model"
+    # Said out loud rather than swallowed: the recording was long enough to
+    # have been a sentence, and silence here is what a broken program sounds
+    # like. What must not happen is the model being asked about it.
+    assert speaker.heard == TURKISH.ui["not_understood"]
+
+
+async def test_the_assistant_says_it_is_ready_before_anybody_presses_anything() -> None:
+    """The state has been `IDLE` since the constructor, and for a while nobody
+    was ever told. The status line went on showing "loading the speech model"
+    until the first turn was over, which reads as a program that never finished
+    starting - so nobody pressed the key that would have cleared it."""
+    seen: list[State] = []
+
+    await assistant_with(on_state=seen.append).begin()
+
+    assert seen == [State.IDLE]
+
+
+async def test_a_sentence_the_recogniser_could_not_read_is_said_out_loud() -> None:
+    """Silence here is indistinguishable from a broken program, and the user
+    has no way to learn that speaking up would have fixed it."""
+    stt = FakeSTT(Transcript(text="bu cümlemik takılın", confidence=0.55))
+    speaker = FakeSpeaker()
+
+    turn = await one_turn(assistant_with(stt=stt, speaker=speaker))
+
+    assert speaker.heard == TURKISH.ui["not_understood"]
+    assert (turn.missed, turn.confidence) == (True, 0.55)
+
+
+async def test_a_key_touched_by_accident_is_not_apologised_for() -> None:
+    """Nothing was said, so there is nothing to have misheard. An assistant
+    that announced every brushed key would be unusable."""
+    speaker = FakeSpeaker()
+
+    turn = await one_turn(assistant_with(speaker=speaker), speech(0.1))
+
+    assert speaker.played == []
+    assert turn.missed is False
+
+
+async def test_a_question_the_user_withdrew_is_not_apologised_for_either() -> None:
+    """They are already saying the next thing. Talking over it to say the last
+    one was not understood is worse than saying nothing."""
+    capture = FakeCapture()
+    speaker = FakeSpeaker()
+    stt = FakeSTT(Transcript(text="Altyazı M.K.", confidence=0.494), before=capture.press)
+
+    turn = await one_turn(assistant_with(capture=capture, stt=stt, speaker=speaker))
+
+    assert speaker.played == []
+    assert turn.missed is False
+
+
+async def test_the_microphone_is_deaf_while_the_apology_is_spoken() -> None:
+    """It is an answer like any other, and a live microphone would hear it."""
+    capture = FakeCapture(speech())
+    stt = FakeSTT(Transcript(text="Altyazı M.K.", confidence=0.494))
+    during: list[bool] = []
+    speaker = FakeSpeaker(on_play=lambda: during.append(capture.deaf))
+
+    await one_turn(assistant_with(capture=capture, stt=stt, speaker=speaker))
+
+    assert during == [True]
 
 
 async def test_a_transcript_the_recogniser_is_sure_of_is_a_turn() -> None:
@@ -643,11 +717,20 @@ async def test_the_tokens_a_turn_spent_leave_the_turn() -> None:
 
 
 async def test_a_recording_that_was_not_speech_is_a_turn_that_came_to_nothing() -> None:
+    """It cost no tokens and left no transcript - but it carries the number
+    that decided it, which is the only thing that makes a run of them
+    diagnosable afterwards (`logs.py`)."""
     stt = FakeSTT(Transcript(text="Altyazı M.K.", confidence=0.494))
 
     turn = await one_turn(assistant_with(stt=stt))
 
-    assert turn == Turn(heard="", said="", usage=Usage())
+    assert turn == Turn(
+        heard="",
+        said=TURKISH.ui["not_understood"],
+        usage=Usage(),
+        missed=True,
+        confidence=0.494,
+    )
 
 
 async def test_what_the_assistant_said_about_a_failure_is_part_of_the_turn() -> None:

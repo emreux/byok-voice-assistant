@@ -61,6 +61,7 @@ cancelled = "Setup cancelled. Nothing was changed."
 unreachable = "I could not reach the provider. Will you try again?"
 key_invalid = "Your API key is not being accepted any more. You need to renew it."
 took_too_long = "That took too long. Will you try again?"
+not_understood = "I did not catch that. Will you say it again?"
 
 # Shown on screen while the assistant runs (item 1.11). The status line holds
 # the state and the hotkey together on one line, so keep these short.
@@ -75,6 +76,7 @@ state_speaking = "speaking"
 you_said = "you"
 it_said = "assistant"
 turn_cost = "{input} in, {output} out"
+not_caught = "(not caught - confidence {confidence})"
 
 # Said once, by the command line itself, when it can or cannot start.
 not_set_up = "Nothing is set up yet. Run 'assistant setup' first."

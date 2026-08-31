@@ -62,6 +62,7 @@ TEXT: dict[str, str] = {
     "you_said": "you",
     "it_said": "assistant",
     "turn_cost": "{input} in, {output} out",
+    "not_caught": "(not caught - confidence {confidence})",
 }
 
 # Colour is the fastest way to read a line somebody is not looking at, and it
@@ -156,10 +157,19 @@ class StatusLine:
         after the process ends, and the log deliberately holds the numbers
         rather than the words (`logs.py`).
         """
-        if not finished.heard:
+        if not finished.heard and not finished.missed:
             # A key tapped by accident, a recording of silence, or a question
             # withdrawn mid-turn. None of them is a turn the user had.
             return
+
+        # A missed turn shows the number instead of the words. There is no
+        # transcript worth printing - that is what missed means - and the
+        # number is what tells the user whether speaking up would have helped.
+        if finished.missed:
+            confidence = "-" if finished.confidence is None else f"{finished.confidence:.2f}"
+            heard = Text(self._said["not_caught"].format(confidence=confidence), style="dim")
+        else:
+            heard = Text(finished.heard)
 
         answer = Text(finished.said)
         spent = self._spent(finished.usage)
@@ -169,7 +179,7 @@ class StatusLine:
         exchange = Table.grid(padding=(0, 2))
         exchange.add_column(style="dim", justify="right")
         exchange.add_column()
-        exchange.add_row(self._said["you_said"], finished.heard)
+        exchange.add_row(self._said["you_said"], heard)
         exchange.add_row(self._said["it_said"], answer)
         self._console.print(exchange)
 
