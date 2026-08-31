@@ -30,7 +30,7 @@ from rich.table import Table
 from rich.text import Text
 
 from assistant.app import State, Turn
-from assistant.audio.capture import DEFAULT_HOTKEY
+from assistant.audio.capture import DEFAULT_HOTKEY, DEFAULT_TOGGLE_HOTKEY
 from assistant.llm.base import Usage
 from assistant.locales import Locale
 
@@ -51,7 +51,8 @@ def label_key(state: State) -> str:
 
 
 TEXT: dict[str, str] = {
-    "hold_to_talk": "Hold {hotkey} to talk. Ctrl+C stops.",
+    "hold_to_talk": "Hold {hotkey} to talk, or press {toggle} to keep listening. Ctrl+C stops.",
+    "hands_free": "Listening - just talk. {toggle} stops listening, Ctrl+C stops everything.",
     "loading_speech": "Loading the speech model...",
     "state_idle": "ready",
     "state_listening": "listening",
@@ -92,11 +93,25 @@ class StatusLine:
         locale: Locale,
         *,
         hotkey: str = DEFAULT_HOTKEY,
+        toggle: str = DEFAULT_TOGGLE_HOTKEY,
         console: Console | None = None,
     ) -> None:
         self._said = {key: locale.say(key, default) for key, default in TEXT.items()}
         self._console = console if console is not None else Console()
-        self._hint = self._said["hold_to_talk"].format(hotkey=spell(hotkey))
+
+        keys = {"hotkey": spell(hotkey), "toggle": spell(toggle)}
+        # Both are built up front. Which one is shown is the only thing that
+        # changes when the mode does, and a hint assembled at that moment would
+        # be assembled on the keyboard's own thread.
+        self._hints = {
+            False: self._said["hold_to_talk"].format(**keys),
+            True: self._said["hands_free"].format(**keys),
+        }
+        self._hint = self._hints[False]
+
+        # What is on the line now, so that switching the mode can redraw it
+        # without knowing which state the assistant is in.
+        self._line = ("", "", False)
 
         # Drawn only when something changes: `auto_refresh` would start a
         # thread to redraw a line that has not moved.
@@ -122,6 +137,17 @@ class StatusLine:
 
     def state(self, state: State) -> None:
         self._show(self._said[label_key(state)], _STYLES.get(state, ""))
+
+    def hands_free(self, listening: bool) -> None:
+        """Says whether the microphone is live without anybody holding a key.
+
+        The only thing on screen that answers it. A mode the user cannot see
+        the state of is a mode they leave on by accident in a room with other
+        people in it, which is the one way this feature can cost them money.
+        """
+        self._hint = self._hints[listening]
+        message, style, hint = self._line
+        self._show(message, style, hint=hint)
 
     def turn(self, finished: Turn) -> None:
         """Writes a finished turn above the line, where it stays.
@@ -150,6 +176,8 @@ class StatusLine:
     # ----------------------------------------------------------------------
 
     def _show(self, message: str, style: str, *, hint: bool = True) -> None:
+        self._line = (message, style, hint)
+
         line = Text()
         line.append(f"{BULLET} {message}", style=style or None)
         if hint:

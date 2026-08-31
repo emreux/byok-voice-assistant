@@ -67,7 +67,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     subparsers = parser.add_subparsers(dest="command", metavar="<command>")
     subparsers.add_parser("setup", help="Choose a provider, store the API key, pick a model.")
-    subparsers.add_parser("run", help="Start the assistant and listen for the hotkey.")
+    subparsers.add_parser("run", help="Start the assistant and watch for the hotkeys.")
 
     return parser
 
@@ -159,8 +159,9 @@ async def _talk(settings: Settings, pack: Locale) -> None:
     """Builds the pieces of phase 1 and lets the state machine drive them."""
     from assistant.agent.core import Agent
     from assistant.app import Assistant
-    from assistant.audio.capture import PushToTalk
+    from assistant.audio.capture import HandsFree
     from assistant.audio.player import SystemSpeaker
+    from assistant.audio.vad import Endpoint, SileroVAD
     from assistant.llm.registry import create_provider
     from assistant.stt.local_whisper import LocalWhisper
     from assistant.tts.sapi import SapiTTS
@@ -170,16 +171,20 @@ async def _talk(settings: Settings, pack: Locale) -> None:
     # likeliest thing to be wrong, and the cheapest to find out about.
     provider = create_provider(settings.llm.provider)
     speech = LocalWhisper()
+    detector = SileroVAD()
 
     with StatusLine(pack) as screen:
         screen.starting()
         # Loading Whisper takes seconds of four cores. Doing it now rather than
         # at the first press is what keeps the first sentence from waiting for
-        # it (item 1.6).
+        # it (item 1.6). The detector is a tenth of a second beside it, and is
+        # loaded here for the same reason rather than inside the first block
+        # of audio it is asked about.
         await speech.load()
+        await detector.load()
 
         assistant = Assistant(
-            capture=PushToTalk(),
+            capture=HandsFree(endpoint=Endpoint(detector), on_mode=screen.hands_free),
             stt=speech,
             agent=Agent(provider, model=settings.llm.model),
             tts=SapiTTS(),

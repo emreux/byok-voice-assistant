@@ -64,7 +64,8 @@ took_too_long = "That took too long. Will you try again?"
 
 # Shown on screen while the assistant runs (item 1.11). The status line holds
 # the state and the hotkey together on one line, so keep these short.
-hold_to_talk = "Hold {hotkey} to talk. Ctrl+C stops."
+hold_to_talk = "Hold {hotkey} to talk, or press {toggle} to keep listening. Ctrl+C stops."
+hands_free = "Listening - just talk. {toggle} stops listening, Ctrl+C stops everything."
 loading_speech = "Loading the speech model..."
 state_idle = "ready"
 state_listening = "listening"

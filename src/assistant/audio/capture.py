@@ -1,10 +1,12 @@
-"""Push to talk: record while the hotkey is held (design.md section 8, item 1.5).
+"""Two ways to be listened to: hold a key, or press one and stop holding keys.
 
-Phase 1 has no voice activity detection on purpose. The user says where the
-sentence ends by letting go of the key, which costs nothing and cuts nobody
-off mid-word; live endpointing arrives in phase 2.9 with a measured threshold
-behind it. Everything here is written so that turning it on later replaces one
-class and leaves `app.py` alone.
+`PushToTalk` is the first and the one that always works - the user says where
+the sentence ends by letting go, which costs nothing, cuts nobody off mid-word
+and cannot be confused by a television. `HandsFree` adds the second key of item
+1.5b: press it once and the microphone stays live, with `audio/vad.py` deciding
+where each sentence begins and ends. It is the same class plus a trigger, so
+the key still works while hands-free is on, and it is still there on the day
+the detector is wrong about a room.
 
 Three threads meet in this file and only one of them owns the state.
 
@@ -21,7 +23,10 @@ Three threads meet in this file and only one of them owns the state.
 The microphone stays open for as long as the assistant runs - opening a
 PortAudio stream takes long enough to swallow the first syllable. Open is not
 the same as recording: a block that arrives while no key is held is dropped in
-the callback and never reaches memory.
+the callback and never reaches memory. Hands-free is exactly the decision to
+stop dropping them - fifty blocks a second do cross into the event loop while
+it is on, each costing a fraction of a millisecond, and none at all while it
+is off.
 """
 
 from __future__ import annotations
@@ -30,15 +35,19 @@ import asyncio
 import threading
 from collections.abc import Callable
 from types import TracebackType
-from typing import Any, Protocol, runtime_checkable
+from typing import Any, Protocol, Self, runtime_checkable
 
 import numpy as np
 
+from assistant.audio.vad import Endpoint, Segmenter
 from assistant.stt.base import SAMPLE_RATE, Audio
 
 __all__ = [
     "CHUNK_FRAMES",
     "DEFAULT_HOTKEY",
+    "DEFAULT_TOGGLE_HOTKEY",
+    "ECHO_TAIL_SECONDS",
+    "HandsFree",
     "Hotkey",
     "KeyCombination",
     "Microphone",
@@ -51,6 +60,18 @@ __all__ = [
 # is one constant rather than a string repeated in three places.
 DEFAULT_HOTKEY = "<ctrl>+<alt>+<space>"
 
+# The other key: it turns hands-free on and off rather than being held. A
+# letter and not a second space, so that a key held down by a game or a chat
+# application cannot be the one that opens the microphone by accident.
+DEFAULT_TOGGLE_HOTKEY = "<ctrl>+<alt>+h"
+
+# How long the microphone stays deaf after the assistant stops speaking. The
+# sound card holds some of the answer and the room holds the rest of it; both
+# arrive after the speaker has been told to stop, and the detector would hear
+# the assistant finishing its own sentence and answer it. This is not echo
+# cancellation - that is phase 5.3, and it is what barge-in needs.
+ECHO_TAIL_SECONDS = 0.25
+
 # 20 ms per block. The block being filled when the key comes up is still in
 # PortAudio's hands and never arrives, so this is also how much of the end of
 # the sentence can be lost: measured at 100 ms blocks, two seconds of holding
@@ -60,6 +81,7 @@ CHUNK_FRAMES = SAMPLE_RATE // 50
 
 OnChunk = Callable[[Audio], None]
 OnEvent = Callable[[], None]
+OnMode = Callable[[bool], None]
 
 
 @runtime_checkable
@@ -155,7 +177,20 @@ class PushToTalk:
         self._hotkey.stop()
         self._microphone.close()
 
-    def __enter__(self) -> PushToTalk:
+    def mute(self) -> None:
+        """Nothing, and deliberately so.
+
+        The state machine deafens the microphone while it is speaking, which is
+        what stops `HandsFree` from hearing the assistant's own voice and
+        answering it. Push to talk has no such problem and must not pretend to:
+        a key pressed while the assistant is talking is the user interrupting
+        it, and that is the one thing that has to keep working.
+        """
+
+    def unmute(self) -> None:
+        """The other half of `mute`, and just as empty."""
+
+    def __enter__(self) -> Self:
         self.start()
         return self
 
@@ -216,6 +251,158 @@ class PushToTalk:
         take, self._take = self._take, None
         if take is not None:
             self._finished.put_nowait(take)
+
+
+class HandsFree(PushToTalk):
+    """Push to talk, and a second key that leaves the microphone listening.
+
+    Everything the parent does still works. That is the point rather than an
+    implementation detail: the detector will be wrong about some room, and the
+    key that is never wrong has to be under the user's thumb when it is
+    (design.md section 3.5 says the same thing about the wake word of phase
+    5.2 - push to talk always works).
+
+    Three rules are worth stating, because each is about something *not*
+    happening.
+
+    **The toggle does not interrupt an answer.** Pressing it arms the mode; it
+    does not stop the assistant mid-sentence, because stopping it would mean
+    claiming the user is talking when they have only pressed a key, and the
+    state machine reads that claim as a question being withdrawn. The push to
+    talk key still interrupts, and interrupting by voice is phase 5.3.
+
+    **The microphone is deaf while the assistant speaks.** `mute` is called by
+    the state machine, and without it the detector hears the answer coming out
+    of the speakers, the assistant answers itself, and every round of that
+    costs an API call. `ECHO_TAIL_SECONDS` covers what the sound card and the
+    room hand over after the speaker has already been told to stop.
+
+    **The key wins.** A block that arrives while the combination is held goes
+    to the parent's recording and is never shown to the detector, so holding
+    the key inside hands-free mode is one deliberate sentence rather than two
+    overlapping ones.
+    """
+
+    def __init__(
+        self,
+        *,
+        hotkey: Hotkey | None = None,
+        microphone: Microphone | None = None,
+        toggle: Hotkey | None = None,
+        endpoint: Segmenter | None = None,
+        on_listening: OnEvent | None = None,
+        on_mode: OnMode | None = None,
+    ) -> None:
+        super().__init__(hotkey=hotkey, microphone=microphone, on_listening=on_listening)
+        self._toggle = toggle if toggle is not None else SystemHotkey(DEFAULT_TOGGLE_HOTKEY)
+        self._endpoint = endpoint if endpoint is not None else Endpoint()
+
+        # Called on the event loop when the mode is switched. The status line
+        # is the only thing that says whether the microphone is live, and a
+        # mode nobody can see the state of is a mode nobody trusts.
+        self.on_mode = on_mode
+
+        # Read by the audio callback on PortAudio's thread and written by the
+        # keyboard's, exactly like `_recording` above. `_muted` is written by
+        # the event loop instead, and is an event for the same reason: it has
+        # to be visible to the audio thread in the same instant.
+        self._on = threading.Event()
+        self._muted = threading.Event()
+
+        # Counted down on the event loop, in samples rather than blocks so that
+        # a block of any size costs what it actually holds.
+        self._deaf_samples = 0
+
+    @property
+    def listening(self) -> bool:
+        """Whether the microphone is live without anybody holding a key."""
+        return self._on.is_set()
+
+    def start(self) -> None:
+        super().start()
+        self._toggle.watch(on_press=self._toggled, on_release=_nothing)
+
+    def stop(self) -> None:
+        self._on.clear()
+        self._toggle.stop()
+        super().stop()
+
+    def mute(self) -> None:
+        """Stops listening while the assistant speaks. Called by `app.py`."""
+        self._muted.set()
+
+    def unmute(self) -> None:
+        """Listens again, once the room has stopped repeating the answer.
+
+        The order matters: the tail and the reset are in place before the flag
+        is cleared, so no block of the assistant's own voice can arrive between
+        the two and be treated as the beginning of a question.
+        """
+        self._deaf_samples = round(ECHO_TAIL_SECONDS * SAMPLE_RATE)
+        self._endpoint.reset()
+        self._muted.clear()
+
+    # ----------------------------------------------------------------------
+    # Called from other threads. Nothing here touches asyncio directly.
+    # ----------------------------------------------------------------------
+
+    def _heard(self, chunk: Audio) -> None:
+        if self._recording.is_set():
+            # The key is held: this block belongs to that recording, and the
+            # detector is not shown it.
+            self._to_loop(self._keep, chunk)
+        elif self._on.is_set() and not self._muted.is_set():
+            self._to_loop(self._examine, chunk)
+
+    def _pressed(self) -> None:
+        # Whatever the detector had half collected is not part of what the user
+        # is about to say deliberately.
+        super()._pressed()
+        self._to_loop(self._endpoint.reset)
+
+    def _toggled(self) -> None:
+        if self._on.is_set():
+            self._on.clear()
+        else:
+            self._on.set()
+
+        # Which way it went travels with the message rather than being read
+        # again on the other side. Two presses in quick succession are two
+        # messages that both run after both flips, and a listener that read the
+        # flag would be told the mode changed to whatever it is *now*, twice.
+        self._to_loop(self._switched, self._on.is_set())
+
+    # ----------------------------------------------------------------------
+    # Called on the event loop, in the order the threads above submitted them.
+    # ----------------------------------------------------------------------
+
+    def _switched(self, listening: bool) -> None:
+        self._deaf_samples = 0
+        self._endpoint.reset()
+        if self.on_mode is not None:
+            self.on_mode(listening)
+
+    def _examine(self, chunk: Audio) -> None:
+        """One block through the detector, and a sentence out when one ended."""
+        if self._deaf_samples > 0:
+            self._deaf_samples -= len(chunk)
+            return
+
+        started = self._endpoint.speaking
+        finished = self._endpoint.feed(chunk)
+
+        # Announced before the sentence is handed over, and for the same reason
+        # the parent announces the key going down: this is the moment the state
+        # machine learns that whatever it was doing has been overtaken.
+        if not started and self._endpoint.speaking and self.on_listening is not None:
+            self.on_listening()
+
+        for utterance in finished:
+            self._finished.put_nowait([utterance])
+
+
+def _nothing() -> None:
+    """A key coming up means nothing to a key that toggles."""
 
 
 class SystemHotkey:

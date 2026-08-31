@@ -76,6 +76,11 @@ class FakeCapture:
     def __init__(self, *utterances: Audio) -> None:
         self.on_listening: Callable[[], None] | None = None
         self.started = False
+        # Whether the state machine has told it to stop listening, and how many
+        # times it has been told either thing - a microphone left deaf and one
+        # that was never deafened look the same from the flag alone.
+        self.deaf = False
+        self.switches: list[bool] = []
         self._waiting = list(utterances)
 
     def start(self) -> None:
@@ -83,6 +88,14 @@ class FakeCapture:
 
     def stop(self) -> None:
         self.started = False
+
+    def mute(self) -> None:
+        self.deaf = True
+        self.switches.append(True)
+
+    def unmute(self) -> None:
+        self.deaf = False
+        self.switches.append(False)
 
     async def utterance(self) -> Audio:
         if not self._waiting:
@@ -369,6 +382,48 @@ async def test_the_answer_reaches_the_speaker_at_the_rate_the_engine_declares() 
 
     assert speaker.heard == "Saat üç."
     assert speaker.rates == [FakeTTS.sample_rate]
+
+
+async def test_the_microphone_is_deaf_for_exactly_as_long_as_the_answer_lasts() -> None:
+    """A microphone that is live on its own hears the answer come out of the
+    speakers, takes it for a question and answers it - once per API call, for
+    as long as nobody stops it."""
+    capture = FakeCapture(speech())
+    during: list[bool] = []
+    speaker = FakeSpeaker(on_play=lambda: during.append(capture.deaf))
+
+    await one_turn(assistant_with(capture=capture, speaker=speaker))
+
+    assert during == [True], "the microphone was still listening while it spoke"
+    assert capture.deaf is False
+    assert capture.switches == [True, False]
+
+
+async def test_an_answer_that_failed_halfway_still_leaves_the_microphone_listening() -> None:
+    """Deafness is the state that has to be undone. A sound card that threw
+    would otherwise leave an assistant that can speak and never hear again."""
+    capture = FakeCapture(speech())
+    speaker = FakeSpeaker(on_play=_fails)
+
+    with pytest.raises(OSError, match="sound card"):
+        await one_turn(assistant_with(capture=capture, speaker=speaker))
+
+    assert capture.deaf is False
+
+
+async def test_a_turn_with_nothing_to_say_never_deafens_the_microphone() -> None:
+    """Nothing is played, so there is nothing to mishear - and a mode switched
+    off and on again for no reason is a gap in what the user can be heard in."""
+    capture = FakeCapture(speech())
+    provider = ScriptedProvider([Delta(finish_reason="SAFETY")])
+
+    await one_turn(assistant_with(capture=capture, provider=provider))
+
+    assert capture.switches == []
+
+
+def _fails() -> None:
+    raise OSError("the sound card went away")
 
 
 async def test_a_locale_with_no_voice_of_its_own_still_gets_a_voice() -> None:

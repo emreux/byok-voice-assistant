@@ -40,7 +40,8 @@ took_too_long = "Bu iş uzadı, tekrar dener misin?"
 
 # Shown on screen while it runs - the status line and what a turn left behind
 # (item 1.11). Short: they share one line with the hotkey.
-hold_to_talk = "Konuşmak için {hotkey} basılı tut. Ctrl+C durdurur."
+hold_to_talk = "Konuşmak için {hotkey} basılı tut, ya da {toggle} ile dinlemede kal. Ctrl+C durdurur."
+hands_free = "Dinliyorum - konuşman yeterli. {toggle} dinlemeyi kapatır, Ctrl+C her şeyi."
 loading_speech = "Konuşma modeli yükleniyor..."
 state_idle = "hazır"
 state_listening = "dinliyor"

@@ -24,6 +24,14 @@ and something the microphone is recording. The same press abandons a turn that
 is still being transcribed or thought about - there is no point paying for an
 answer to a question that has been withdrawn.
 
+**The microphone is deaf for exactly as long as the answer lasts.** Push to
+talk never needed that - nobody holds the key while the assistant is talking -
+but hands-free (`audio/capture.py`) would otherwise hear the answer come out of
+the speakers, take it for a question and answer it, once per API call, until
+somebody noticed. Which microphone is being deafened is not this file's
+business: it calls `mute` and `unmute`, and the capture that has nothing to
+mute does nothing.
+
 **Three failures are said out loud, and no others.** A refused key means the
 user has to go and renew it (section 3.2), a provider that cannot be reached
 means try again, and a minute of thinking means the same. Anything else is a
@@ -124,6 +132,20 @@ class Capture(Protocol):
     def start(self) -> None: ...
 
     def stop(self) -> None: ...
+
+    def mute(self) -> None:
+        """Stops listening, because the assistant is about to speak.
+
+        A microphone that is only live while a key is held has nothing to do
+        here. One that is live on its own would otherwise hear the answer come
+        out of the speakers, take it for a question, and answer it - once per
+        API call, for as long as nobody stopped it.
+        """
+        ...
+
+    def unmute(self) -> None:
+        """Listens again, now that the answer has been said."""
+        ...
 
     async def utterance(self) -> Audio:
         """Waits for the next completed recording."""
@@ -242,10 +264,17 @@ class Assistant:
             return
 
         self._enter(State.SPEAKING)
-        await self._speaker.play(
-            self._tts.stream(_one(said), voice=self._voice),
-            sample_rate=self._tts.sample_rate,
-        )
+        # The microphone is deaf for exactly as long as there is something for
+        # it to mishear, and in a `finally` because an answer that failed
+        # halfway through must not leave the assistant unable to hear at all.
+        self._capture.mute()
+        try:
+            await self._speaker.play(
+                self._tts.stream(_one(said), voice=self._voice),
+                sample_rate=self._tts.sample_rate,
+            )
+        finally:
+            self._capture.unmute()
 
     # ----------------------------------------------------------------------
     # Where it is

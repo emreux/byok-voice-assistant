@@ -140,6 +140,55 @@ def test_the_hotkey_is_spelled_the_way_a_keyboard_is() -> None:
     assert spell("<ctrl>+<shift>+k") == "Ctrl+Shift+K"
 
 
+def test_the_line_says_which_key_keeps_it_listening(screen: Screen) -> None:
+    """Both keys are on the line, because a mode nobody knows about is a mode
+    nobody turns on."""
+    with line(screen) as status:
+        status.state(State.IDLE)
+
+    assert "Ctrl+Alt+H" in str(screen)
+
+
+def test_the_line_says_when_the_microphone_is_live_without_a_key(screen: Screen) -> None:
+    """The only thing on screen that answers it. Left unsaid, the mode is one
+    the user forgets is on in a room with other people in it."""
+    with line(screen) as status:
+        status.state(State.IDLE)
+        status.hands_free(True)
+
+    assert TEXT["hands_free"].format(hotkey="", toggle="Ctrl+Alt+H") in str(screen)
+
+
+def test_switching_it_off_puts_the_key_back_on_the_line(screen: Screen) -> None:
+    with line(screen) as status:
+        status.hands_free(True)
+        status.hands_free(False)
+
+    assert str(screen).rstrip().endswith("Ctrl+C stops.")
+
+
+def test_the_mode_changes_without_the_state_changing(screen: Screen) -> None:
+    """The two are independent: the assistant is thinking about the same thing
+    whether or not the microphone stayed open behind it."""
+    with line(screen) as status:
+        status.state(State.THINKING)
+        status.hands_free(True)
+
+    shown = str(screen).rstrip().rpartition(chr(13))[2]
+    assert TEXT["state_thinking"] in shown
+    assert "Ctrl+Alt+H stops listening" in shown
+
+
+def test_a_pack_that_says_nothing_about_the_mode_still_says_something(
+    screen: Screen,
+) -> None:
+    """`TURKISH` above translates four keys and this is not one of them."""
+    with line(screen, TURKISH) as status:
+        status.hands_free(True)
+
+    assert "Ctrl+Alt+H" in str(screen)
+
+
 # --------------------------------------------------------------------------
 # What a turn leaves behind
 # --------------------------------------------------------------------------

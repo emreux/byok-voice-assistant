@@ -2,7 +2,8 @@
 
 A Windows voice assistant that runs on **your** API key, **your** model, and speaks **your** language.
 
-> **v0.1.0 — the voice loop.** Hold a hotkey, say something, hear the model answer out loud.
+> **v0.1.0 — the voice loop.** Hold a hotkey - or press one and stop holding keys - say
+> something, and hear the model answer out loud.
 > That is all it does, and it does it end to end: your speech is transcribed on your own
 > machine, only text leaves it, and the answer is spoken by a Windows voice.
 
@@ -11,7 +12,7 @@ A Windows voice assistant that runs on **your** API key, **your** model, and spe
 ```
     you  What is the capital of Turkey?
 assistant  Ankara is the capital of Turkey.   297 in, 8 out
-● ready    Hold Ctrl+Alt+Space to talk. Ctrl+C stops.
+● ready    Hold Ctrl+Alt+Space to talk, or press Ctrl+Alt+H to keep listening. Ctrl+C stops.
 ```
 
 ## Two things are the point
@@ -80,19 +81,39 @@ The key is checked against the provider before anything is written down, and it 
 uv run assistant run
 ```
 
-Wait for the line to say `ready`, then **hold `Ctrl+Alt+Space`, speak, and let go.** The
-hotkey works wherever you are; the terminal does not need to be in front. About four
-seconds later you hear the answer, and what was said scrolls past above the status line.
-`Ctrl+C` stops.
+Wait for the line to say `ready`. There are two ways to be heard, and both keys work
+wherever you are — the terminal does not need to be in front.
 
-Three things worth knowing:
+**Hold `Ctrl+Alt+Space`, speak, and let go.** About four seconds later you hear the
+answer, and what was said scrolls past above the status line. `Ctrl+C` stops.
+
+**Or press `Ctrl+Alt+H` once and just talk.** The microphone stays live, and each time you
+stop speaking for about half a second that sentence becomes a turn. Press it again to
+switch back. The status line always says which of the two you are in.
+
+Five things worth knowing:
 
 - **Speak while you hold.** Releasing the key ends the recording. Anything shorter than a
   third of a second is treated as a key touched by accident.
-- **Press again to cut it off.** If the assistant is still talking and you press the key,
-  it stops immediately and listens — otherwise it would be talking into your microphone.
+- **Press again to cut it off.** If the assistant is still talking and you press
+  `Ctrl+Alt+Space`, it stops immediately and listens — otherwise it would be talking into
+  your microphone. `Ctrl+Alt+H` does not interrupt; it only switches the mode.
+- **Hands-free hears the whole room.** A television, a phone call, somebody else talking:
+  each is a turn it will try to answer. In a room with other people in it, use the key.
+  A wake word that answers only to its name is v0.5.0.
+- **It does not hear itself.** The microphone is deaf for as long as the answer lasts, plus
+  a quarter of a second for the room to stop repeating it.
 - **Silence is not answered.** A speech recogniser hands back confident-looking words for a
   recording of nothing; those turns are dropped rather than sent to a model.
+
+Before relying on hands-free from across the room, measure what your microphone actually
+picks up from there:
+
+```bash
+uv run python scripts/bench_mic.py --quiet        # the room, saying nothing
+uv run python scripts/bench_mic.py --at "2 m"     # speaking, from where you sit
+uv run python scripts/bench_mic.py --echo         # what the speakers put back in
+```
 
 ## What a turn costs
 
@@ -104,6 +125,7 @@ and never estimated.
 | Transcription, for about 2.5 s of speech | 2.8 s | 2.1 s |
 | The model's answer, in full | 1.3 s | 0.9 s |
 | **From the key coming up to the first sound** | **4.1 s** | **3.0 s** |
+| Hands-free adds, waiting for you to stop | +0.6 s | +0.6 s |
 | Tokens for a one-sentence question | 300 in / 10 out | 297 in / 8 out |
 
 Whisper is loaded once while the program starts, about six seconds, so the first press
