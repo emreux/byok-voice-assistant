@@ -31,6 +31,7 @@ from assistant import app, locales, logs, setup_wizard
 from assistant.__main__ import TEXT, build_parser, main, use_utf8
 from assistant.agent import core
 from assistant.app import State, Turn
+from assistant.audio import capture
 from assistant.config import LLMSettings, LocaleSettings, Settings, save_settings, store_api_key
 from assistant.llm.base import Usage
 from assistant.stt import local_whisper
@@ -195,6 +196,30 @@ def test_a_key_that_is_gone_is_a_sentence_rather_than_a_traceback(
     printed = capsys.readouterr().out
     assert "gemini" in printed
     assert wiring.happened == []
+
+
+@pytest.mark.parametrize(
+    "problem",
+    [
+        app.NoVoiceError("no speech voice is installed, for 'tr' or otherwise"),
+        local_whisper.ModelUnavailableError("the speech model 'small' could not be loaded"),
+        capture.MicrophoneUnavailableError("the microphone 'nope' could not be opened"),
+    ],
+    ids=["voice", "model", "microphone"],
+)
+def test_what_the_user_can_fix_is_a_sentence_rather_than_a_traceback(
+    configured: Path, wiring: Wiring, capsys: pytest.CaptureFixture[str], problem: Exception
+) -> None:
+    """A voice that is not installed, weights that could not be fetched, a
+    microphone that would not open. Each is the user's to fix, and a traceback
+    tells them nothing about how."""
+    wiring.stop = problem
+
+    assert main(["run"]) == 1
+
+    printed = capsys.readouterr().out
+    assert str(problem) in printed
+    assert "Traceback" not in printed
 
 
 # --------------------------------------------------------------------------

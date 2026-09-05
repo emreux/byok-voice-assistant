@@ -51,6 +51,7 @@ __all__ = [
     "Hotkey",
     "KeyCombination",
     "Microphone",
+    "MicrophoneUnavailableError",
     "PushToTalk",
     "SystemHotkey",
     "SystemMicrophone",
@@ -445,6 +446,11 @@ class SystemHotkey:
             self._listener = None
 
 
+class MicrophoneUnavailableError(RuntimeError):
+    """The input device could not be opened: nothing matched the name, or
+    PortAudio refused it. Fixable by the user, so named for `run`."""
+
+
 class SystemMicrophone:
     """The real microphone, through `sounddevice`."""
 
@@ -460,15 +466,27 @@ class SystemMicrophone:
         import sounddevice  # type: ignore[import-untyped]
 
         self._on_chunk = on_chunk
-        self._stream = sounddevice.InputStream(
-            samplerate=SAMPLE_RATE,
-            channels=1,
-            dtype="float32",
-            blocksize=CHUNK_FRAMES,
-            device=self._device,
-            callback=self._block,
-        )
-        self._stream.start()
+        try:
+            self._stream = sounddevice.InputStream(
+                samplerate=SAMPLE_RATE,
+                channels=1,
+                dtype="float32",
+                blocksize=CHUNK_FRAMES,
+                device=self._device,
+                callback=self._block,
+            )
+            self._stream.start()
+        except (ValueError, sounddevice.PortAudioError) as failure:
+            # `ValueError` is a name that matched no device. `PortAudioError`
+            # is a device that exists and would not open: held by another
+            # program, or unplugged since the list was made.
+            self.close()
+            which = (
+                "the default microphone"
+                if self._device is None
+                else f"the microphone {self._device!r}"
+            )
+            raise MicrophoneUnavailableError(f"{which} could not be opened: {failure}") from failure
 
     def close(self) -> None:
         if self._stream is not None:

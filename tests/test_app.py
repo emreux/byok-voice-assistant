@@ -38,6 +38,7 @@ from assistant.app import (
     THINKING_TIMEOUT,
     Assistant,
     Heard,
+    NoVoiceError,
     State,
     Turn,
     choose_voice,
@@ -564,8 +565,9 @@ async def test_a_locale_with_no_voice_of_its_own_still_gets_a_voice() -> None:
 
 async def test_a_machine_with_no_voice_at_all_says_so_before_it_listens() -> None:
     """Silently starting an assistant that can never answer is the worst of
-    the options; this is caught at startup, not on the first question."""
-    with pytest.raises(RuntimeError, match="voice"):
+    the options; this is caught at startup, not on the first question - and
+    by name, so that `assistant run` can say it in a sentence."""
+    with pytest.raises(NoVoiceError, match="voice"):
         await assistant_with(tts=FakeTTS(installed=[])).begin()
 
 

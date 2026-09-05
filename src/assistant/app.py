@@ -70,11 +70,20 @@ __all__ = [
     "Assistant",
     "Capture",
     "Heard",
+    "NoVoiceError",
     "State",
     "Turn",
     "choose_voice",
     "hear",
 ]
+
+
+class NoVoiceError(RuntimeError):
+    """No speech voice is installed, for the locale or otherwise.
+
+    The user can install one; the program cannot. Named so that `assistant
+    run` can say so in a sentence instead of a traceback.
+    """
 
 
 class State(StrEnum):
@@ -376,7 +385,7 @@ class Assistant:
             if voice:
                 return voice
 
-        raise RuntimeError(f"no speech voice is installed, for {self._locale.code!r} or otherwise")
+        raise NoVoiceError(f"no speech voice is installed, for {self._locale.code!r} or otherwise")
 
 
 def choose_voice(voices: Sequence[VoiceInfo], preferred: str | None) -> str:

@@ -32,6 +32,7 @@ from assistant.audio.capture import (
     ECHO_TAIL_SECONDS,
     HandsFree,
     KeyCombination,
+    MicrophoneUnavailableError,
     PushToTalk,
     SystemHotkey,
     SystemMicrophone,
@@ -90,10 +91,19 @@ class FakeMicrophone:
 
 
 def fake_sounddevice() -> tuple[SimpleNamespace, list[SimpleNamespace]]:
-    """Stands in for the module, and records how the stream was opened."""
+    """Stands in for the module, and records how the stream was opened.
+
+    A device called `nope` is refused the way `sounddevice` refuses a name
+    that matches nothing: a `ValueError` that quotes the name.
+    """
     streams: list[SimpleNamespace] = []
 
+    class PortAudioError(Exception):
+        pass
+
     def input_stream(**options: Any) -> SimpleNamespace:
+        if options.get("device") == "nope":
+            raise ValueError("No input device matching 'nope'")
         stream = SimpleNamespace(options=options, started=False, stopped=False, closed=False)
         stream.start = lambda: setattr(stream, "started", True)
         stream.stop = lambda: setattr(stream, "stopped", True)
@@ -101,7 +111,7 @@ def fake_sounddevice() -> tuple[SimpleNamespace, list[SimpleNamespace]]:
         streams.append(stream)
         return stream
 
-    return SimpleNamespace(InputStream=input_stream), streams
+    return SimpleNamespace(InputStream=input_stream, PortAudioError=PortAudioError), streams
 
 
 # --------------------------------------------------------------------------
@@ -437,6 +447,18 @@ def test_closing_the_microphone_releases_the_device(monkeypatch: pytest.MonkeyPa
     microphone.close()
 
     assert (streams[0].stopped, streams[0].closed) == (True, True)
+
+
+def test_a_microphone_that_cannot_be_opened_fails_by_name(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A name that matches no device, or a device another program is holding:
+    the user can fix either, so `assistant run` says which in a sentence."""
+    module, _ = fake_sounddevice()
+    monkeypatch.setitem(sys.modules, "sounddevice", module)
+
+    with pytest.raises(MicrophoneUnavailableError, match="nope"):
+        SystemMicrophone(device="nope").open(lambda chunk: None)
 
 
 def test_the_buffer_portaudio_hands_over_is_copied(monkeypatch: pytest.MonkeyPatch) -> None:

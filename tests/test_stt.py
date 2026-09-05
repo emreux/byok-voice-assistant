@@ -30,7 +30,7 @@ import numpy as np
 import pytest
 
 from assistant.stt.base import SAMPLE_RATE, Audio, STTProvider, Transcript, buffered_stream
-from assistant.stt.local_whisper import LocalWhisper
+from assistant.stt.local_whisper import LocalWhisper, ModelUnavailableError
 
 
 @dataclass
@@ -370,6 +370,19 @@ async def test_two_turns_at_once_do_not_load_two_models() -> None:
     await asyncio.gather(stt.transcribe(silence()), stt.transcribe(silence()))
 
     assert built == 1
+
+
+async def test_a_model_that_cannot_be_loaded_fails_by_name() -> None:
+    """No network on the first run, a broken cache: the user can fix these, so
+    `assistant run` has to be able to say so instead of printing a traceback."""
+
+    def broken() -> Any:
+        raise OSError("connection refused while fetching the weights")
+
+    stt = LocalWhisper(build=broken)
+
+    with pytest.raises(ModelUnavailableError, match="connection refused"):
+        await stt.load()
 
 
 # --------------------------------------------------------------------------

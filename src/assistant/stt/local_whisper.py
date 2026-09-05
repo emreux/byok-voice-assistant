@@ -11,7 +11,9 @@ second process is not needed.
 
 The model is loaded on first use, also in a thread - about a gigabyte of
 weights - and `load()` exists so `app.py` can pay that cost at startup instead
-of inside the user's first sentence.
+of inside the user's first sentence. When the weights cannot be loaded - no
+network on the first run, a broken cache - the failure is named
+(`ModelUnavailableError`), so that `assistant run` can say so in a sentence.
 
 **The recording is filtered for speech before it is decoded.** `vad_filter`
 runs the same Silero network `audio/vad.py` uses over the whole recording and
@@ -37,7 +39,7 @@ from typing import Any
 
 from assistant.stt.base import NO_SPEECH_CEILING, Audio, Transcript, buffered_stream
 
-__all__ = ["LocalWhisper"]
+__all__ = ["LocalWhisper", "ModelUnavailableError"]
 
 # Measured on the target machine (section 3.4): `small` int8 transcribes a
 # short sentence in about 2.5 s and the translation is faithful.
@@ -51,6 +53,11 @@ DEFAULT_CPU_THREADS = 4
 # the vendor package - see `_load_whisper`.
 Model = Any
 ModelFactory = Callable[[], Model]
+
+
+class ModelUnavailableError(RuntimeError):
+    """The weights could not be loaded: no network on the first run, a broken
+    cache, a disk that is full. Fixable by the user, so named for `run`."""
 
 
 class LocalWhisper:
@@ -102,7 +109,14 @@ class LocalWhisper:
     def _model_now(self) -> Model:
         with self._loading:
             if self._model is None:
-                self._model = self._build()
+                try:
+                    self._model = self._build()
+                except Exception as failure:
+                    # Whatever the download or the loader raised, the user's
+                    # next move is the same: check the network, or the cache.
+                    raise ModelUnavailableError(
+                        f"the speech model {self._model_size!r} could not be loaded: {failure}"
+                    ) from failure
             return self._model
 
     def _transcribe_now(self, pcm: Audio, hint: str | None) -> Transcript:

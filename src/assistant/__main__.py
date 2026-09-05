@@ -12,11 +12,13 @@ Three things about `run` are decisions rather than plumbing.
 four lines of help - and `run` should not load the wizard's prompt library it
 will never show.
 
-**Starting up fails in sentences.** A machine nobody has run setup on, or a key
-that has since been deleted from the Credential Manager, are things the user
-can fix; they get a sentence and an exit code, before anything slow is loaded.
-Anything else is a bug in this project and comes out as a traceback, for the
-same reason `app.py` refuses to say "I could not connect" about one.
+**Starting up fails in sentences.** A machine nobody has run setup on, a key
+that has since been deleted from the Credential Manager, a voice that is not
+installed, a speech model that could not be fetched, a microphone that would
+not open: these are things the user can fix, and each gets a sentence and an
+exit code - the first two before anything slow is loaded. Anything else is a
+bug in this project and comes out as a traceback, for the same reason `app.py`
+refuses to say "I could not connect" about one.
 
 **The terminal is told to speak UTF-8 first.** A redirected stream gets the
 machine's legacy code page from Windows, which has no `ş` and no `ğ` in it -
@@ -119,8 +121,11 @@ def _run() -> int:
     """Starts the assistant, or says why it cannot."""
     from rich.console import Console
 
+    from assistant.app import NoVoiceError
+    from assistant.audio.capture import MicrophoneUnavailableError
     from assistant.llm.registry import RegistryError
     from assistant.logs import setup_logging
+    from assistant.stt.local_whisper import ModelUnavailableError
 
     settings = load_settings()
     ready = is_configured()
@@ -141,6 +146,11 @@ def _run() -> int:
         return _GAVE_UP
 
     setup_logging()
+    # What the user can fix and the program cannot: a key that is gone, a
+    # voice that is not installed, weights that could not be fetched, a
+    # microphone that would not open. Each is one sentence and exit code 1.
+    # Anything else is a bug in this project and keeps its traceback.
+    fixable = (RegistryError, NoVoiceError, ModelUnavailableError, MicrophoneUnavailableError)
     try:
         asyncio.run(_talk(settings, pack))
     except KeyboardInterrupt:
@@ -148,7 +158,7 @@ def _run() -> int:
         # crash - and the microphone and the keyboard hook are already closed
         # by the time this is printed (`app.run`).
         say("stopped")
-    except RegistryError as problem:
+    except fixable as problem:
         say("cannot_start", problem=problem)
         return _GAVE_UP
 
