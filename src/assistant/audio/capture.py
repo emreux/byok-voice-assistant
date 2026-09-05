@@ -38,6 +38,7 @@ from types import TracebackType
 from typing import Any, Protocol, Self, runtime_checkable
 
 import numpy as np
+from loguru import logger
 
 from assistant.audio.vad import Endpoint, Segmenter
 from assistant.stt.base import SAMPLE_RATE, Audio
@@ -451,6 +452,13 @@ class MicrophoneUnavailableError(RuntimeError):
     PortAudio refused it. Fixable by the user, so named for `run`."""
 
 
+# When a dropped block is worth a line in the log: the first, so that one bad
+# minute is on record, then rarely enough that a bad microphone cannot fill
+# the file. Between these the count is kept and nothing is written.
+_REPORT_OVERFLOWS_AT = frozenset({1, 10, 100})
+_REPORT_OVERFLOWS_EVERY = 1000
+
+
 class SystemMicrophone:
     """The real microphone, through `sounddevice`."""
 
@@ -458,6 +466,9 @@ class SystemMicrophone:
         self._device = device
         self._stream: Any = None
         self._on_chunk: OnChunk | None = None
+        # Blocks the driver dropped before this saw them. In hands-free mode
+        # each is a hole in a sentence that nothing else would notice.
+        self.overflows = 0
 
     def open(self, on_chunk: OnChunk) -> None:
         # Imported here rather than at module scope: it loads PortAudio's
@@ -495,11 +506,14 @@ class SystemMicrophone:
             self._stream = None
 
     def _block(self, indata: Any, frames: int, time_info: Any, status: Any) -> None:
-        """PortAudio's callback thread. Whatever this does, it does it quickly.
-
-        `status` carries the overrun flags; reporting them needs the logging
-        setup, which arrives with the state machine in item 1.10.
-        """
+        """PortAudio's callback thread. Whatever this does, it does it quickly."""
+        if status and status.input_overflow:
+            # Counted always, written rarely: a log line per block, on this
+            # thread, would be the next thing to cause an overflow.
+            self.overflows += 1
+            count = self.overflows
+            if count in _REPORT_OVERFLOWS_AT or count % _REPORT_OVERFLOWS_EVERY == 0:
+                logger.warning("microphone overflow: {count} blocks dropped so far", count=count)
         if self._on_chunk is not None:
             # One channel, and a copy: `indata` is PortAudio's own buffer and
             # holds the next block by the time anyone reads this one.

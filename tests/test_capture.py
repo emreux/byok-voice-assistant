@@ -24,6 +24,7 @@ from typing import Any
 
 import numpy as np
 import pytest
+from loguru import logger
 
 from assistant.audio.capture import (
     CHUNK_FRAMES,
@@ -480,6 +481,68 @@ def test_the_buffer_portaudio_hands_over_is_copied(monkeypatch: pytest.MonkeyPat
 
     assert [float(chunk[0]) for chunk in heard] == [pytest.approx(0.1), pytest.approx(0.9)]
     assert heard[0].shape == (3,), "the stream is mono; the channel axis is dropped"
+
+
+def overflowing(microphone: SystemMicrophone, callback: Any, times: int) -> list[str]:
+    """Drives the callback with `times` blocks the driver marked as overrun,
+    and returns what was logged about them."""
+    lines: list[str] = []
+    sink = logger.add(lines.append, format="{message}")
+    try:
+        block = np.zeros((3, 1), dtype=np.float32)
+        for _ in range(times):
+            callback(block, 3, None, SimpleNamespace(input_overflow=True))
+        callback(block, 3, None, None)
+    finally:
+        logger.remove(sink)
+    return [line for line in lines if "overflow" in line]
+
+
+def test_blocks_the_driver_dropped_are_counted_and_the_first_is_logged(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """PortAudio reports an overrun in `status`; until now it was thrown away
+    with the block. In hands-free mode that is a hole in the sentence with no
+    trace of it anywhere."""
+    module, streams = fake_sounddevice()
+    monkeypatch.setitem(sys.modules, "sounddevice", module)
+    microphone = SystemMicrophone()
+    microphone.open(lambda chunk: None)
+
+    logged = overflowing(microphone, streams[0].options["callback"], times=2)
+
+    assert microphone.overflows == 2
+    assert len(logged) == 1
+
+
+def test_dropped_blocks_are_written_down_rarely_after_the_first(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """One line per dropped block, on PortAudio's own thread, would be the
+    next cause of dropped blocks. The first, the tenth and the hundredth are
+    enough to tell a bad minute from a bad microphone."""
+    module, streams = fake_sounddevice()
+    monkeypatch.setitem(sys.modules, "sounddevice", module)
+    microphone = SystemMicrophone()
+    microphone.open(lambda chunk: None)
+
+    logged = overflowing(microphone, streams[0].options["callback"], times=100)
+
+    assert microphone.overflows == 100
+    assert len(logged) == 3
+    assert "100" in logged[-1]
+
+
+def test_a_block_that_arrived_whole_is_not_an_overflow(monkeypatch: pytest.MonkeyPatch) -> None:
+    module, streams = fake_sounddevice()
+    monkeypatch.setitem(sys.modules, "sounddevice", module)
+    microphone = SystemMicrophone()
+    microphone.open(lambda chunk: None)
+
+    logged = overflowing(microphone, streams[0].options["callback"], times=0)
+
+    assert microphone.overflows == 0
+    assert logged == []
 
 
 def test_the_default_combination_is_three_keys_the_system_knows() -> None:
