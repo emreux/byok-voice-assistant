@@ -56,6 +56,7 @@ __all__ = [
     "PushToTalk",
     "SystemHotkey",
     "SystemMicrophone",
+    "device_choice",
 ]
 
 # `pynput`'s own spelling. Phase 4 moves it into `config.toml`; until then it
@@ -445,6 +446,20 @@ class SystemHotkey:
         if self._listener is not None:
             self._listener.stop()
             self._listener = None
+
+
+def device_choice(text: str | None) -> int | str | None:
+    """A device setting as `sounddevice` wants it: an index, words, or the default.
+
+    An int is an index into its device list; a str is words matched, in order,
+    against "<device name>, <host API>". A digit string handed over as a str
+    matches no name at all - which is how `bench_mic.py --device 12` never
+    found a device. Empty, or nothing, is the system default.
+    """
+    chosen = (text or "").strip()
+    if not chosen:
+        return None
+    return int(chosen) if chosen.isdigit() else chosen
 
 
 class MicrophoneUnavailableError(RuntimeError):

@@ -20,6 +20,7 @@ import pytest
 
 from assistant.config import (
     KEYRING_SERVICE,
+    AudioSettings,
     LLMSettings,
     LocaleSettings,
     Settings,
@@ -97,6 +98,26 @@ def test_after_setup_the_settings_come_back(config_home: Path) -> None:
 
     assert settings.llm.primary == "gemini:gemini-3.5-flash-lite"
     assert is_configured() is True
+
+
+def test_the_input_device_round_trips_through_the_file(config_home: Path) -> None:
+    save_settings(Settings(audio=AudioSettings(input_device="Microphone Array WASAPI")))
+
+    assert load_settings().audio.input_device == "Microphone Array WASAPI"
+
+
+def test_no_input_device_means_the_system_default(config_home: Path) -> None:
+    assert load_settings().audio.input_device == ""
+
+
+def test_a_file_written_before_there_was_an_audio_table_still_loads(config_home: Path) -> None:
+    """Every `config.toml` `assistant setup` wrote before 2026-09-05 has no
+    `[audio]` table. It means what it always meant: the system default."""
+    config_path().parent.mkdir(parents=True, exist_ok=True)
+    config_path().write_text('[llm]\nprimary = "gemini:x"\n', encoding="utf-8")
+
+    assert load_settings().audio.input_device == ""
+    assert load_settings().llm.primary == "gemini:x"
 
 
 def test_the_saved_file_is_toml(config_home: Path) -> None:

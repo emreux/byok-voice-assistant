@@ -32,7 +32,14 @@ from assistant.__main__ import TEXT, build_parser, main, use_utf8
 from assistant.agent import core
 from assistant.app import State, Turn
 from assistant.audio import capture
-from assistant.config import LLMSettings, LocaleSettings, Settings, save_settings, store_api_key
+from assistant.config import (
+    AudioSettings,
+    LLMSettings,
+    LocaleSettings,
+    Settings,
+    save_settings,
+    store_api_key,
+)
 from assistant.llm.base import Usage
 from assistant.stt import local_whisper
 from assistant.ui import status
@@ -70,6 +77,7 @@ class Wiring:
     happened: list[str] = field(default_factory=list)
     built: list[dict[str, Any]] = field(default_factory=list)
     agents: list[tuple[str, str]] = field(default_factory=list)
+    microphones: list[Any] = field(default_factory=list)
     stop: BaseException | None = None
 
 
@@ -86,6 +94,16 @@ def wiring(monkeypatch: pytest.MonkeyPatch) -> Wiring:
         def __init__(self, provider: Any, *, model: str, **rest: Any) -> None:
             seen.agents.append((provider.id, model))
 
+    class FakeMicrophone:
+        def __init__(self, *, device: Any = None) -> None:
+            seen.microphones.append(device)
+
+        def open(self, on_chunk: Any) -> None:
+            pass
+
+        def close(self) -> None:
+            pass
+
     class FakeAssistant:
         def __init__(self, **parts: Any) -> None:
             seen.happened.append("assistant")
@@ -99,6 +117,7 @@ def wiring(monkeypatch: pytest.MonkeyPatch) -> Wiring:
             parts["on_turn"](TURN)
 
     monkeypatch.setattr(local_whisper, "LocalWhisper", FakeWhisper)
+    monkeypatch.setattr(capture, "SystemMicrophone", FakeMicrophone)
     monkeypatch.setattr(core, "Agent", FakeAgent)
     monkeypatch.setattr(app, "Assistant", FakeAssistant)
     return seen
@@ -242,6 +261,38 @@ def test_the_language_that_was_chosen_is_the_one_it_speaks(
     main(["run"])
 
     assert wiring.built[0]["locale"].code == "tr"
+
+
+def test_the_microphone_in_the_settings_is_the_one_opened(configured: Path, wiring: Wiring) -> None:
+    """`[audio] input_device` names it in `sounddevice`'s words - words rather
+    than an index, because the indices shift whenever a Bluetooth device
+    connects."""
+    save_settings(
+        Settings(
+            llm=LLMSettings(primary=f"gemini:{MODEL}"),
+            locale=LocaleSettings(code="tr"),
+            audio=AudioSettings(input_device="Microphone Array WASAPI"),
+        )
+    )
+
+    main(["run"])
+
+    assert wiring.microphones == ["Microphone Array WASAPI"]
+
+
+def test_no_microphone_in_the_settings_means_the_system_default(
+    configured: Path, wiring: Wiring
+) -> None:
+    main(["run"])
+
+    assert wiring.microphones == [None]
+
+
+def test_the_device_flag_outranks_the_settings(configured: Path, wiring: Wiring) -> None:
+    """One evening with a headset should not need the settings file edited."""
+    main(["run", "--device", "9"])
+
+    assert wiring.microphones == [9]
 
 
 def test_the_speech_model_is_ready_before_the_assistant_is(

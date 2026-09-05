@@ -38,6 +38,7 @@ from pydantic_settings import (
 __all__ = [
     "CONFIG_DIR_ENV",
     "KEYRING_SERVICE",
+    "AudioSettings",
     "LLMSettings",
     "LocaleSettings",
     "Settings",
@@ -145,6 +146,22 @@ class LocaleSettings(BaseModel):
     code: str = "en"
 
 
+class AudioSettings(BaseModel):
+    """Which microphone, in `sounddevice`'s own words.
+
+    Empty means the system default. Otherwise an index, or words matched in
+    order against "<device name>, <host API>" - `Microphone Array WASAPI`.
+    Words rather than an index by default: indices shift every time a
+    Bluetooth device connects (measured: the WASAPI array was 12 one day and
+    9 the next), and a setting that points at a different microphone after a
+    headset pairs is worse than none.
+    """
+
+    model_config = ConfigDict(extra="ignore")
+
+    input_device: str = ""
+
+
 class Settings(BaseSettings):
     """Everything phase 1 stores. There is deliberately no field for a key."""
 
@@ -158,6 +175,7 @@ class Settings(BaseSettings):
 
     llm: LLMSettings = LLMSettings()
     locale: LocaleSettings = LocaleSettings()
+    audio: AudioSettings = AudioSettings()
 
     @classmethod
     def settings_customise_sources(

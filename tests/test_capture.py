@@ -37,6 +37,7 @@ from assistant.audio.capture import (
     PushToTalk,
     SystemHotkey,
     SystemMicrophone,
+    device_choice,
 )
 from assistant.stt.base import SAMPLE_RATE, Audio
 
@@ -543,6 +544,25 @@ def test_a_block_that_arrived_whole_is_not_an_overflow(monkeypatch: pytest.Monke
 
     assert microphone.overflows == 0
     assert logged == []
+
+
+@pytest.mark.parametrize(
+    ("text", "expected"),
+    [
+        ("", None),
+        (None, None),
+        ("   ", None),
+        ("9", 9),
+        ("  12 ", 12),
+        ("Microphone Array WASAPI", "Microphone Array WASAPI"),
+        (" Microphone Array 1 ", "Microphone Array 1"),
+    ],
+)
+def test_a_device_choice_is_an_index_a_name_or_nothing(text: str | None, expected: object) -> None:
+    """`sounddevice` takes an int as an index and a str as words to match. A
+    digit string handed to it as a str matches no name and fails - which is
+    exactly how `bench_mic.py --device 12` never worked (2026-09-05)."""
+    assert device_choice(text) == expected
 
 
 def test_the_default_combination_is_three_keys_the_system_knows() -> None:

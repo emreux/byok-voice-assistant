@@ -69,7 +69,16 @@ def build_parser() -> argparse.ArgumentParser:
 
     subparsers = parser.add_subparsers(dest="command", metavar="<command>")
     subparsers.add_parser("setup", help="Choose a provider, store the API key, pick a model.")
-    subparsers.add_parser("run", help="Start the assistant and watch for the hotkeys.")
+    run = subparsers.add_parser("run", help="Start the assistant and watch for the hotkeys.")
+    run.add_argument(
+        "--device",
+        default=None,
+        help=(
+            "Input device: an index, or words from its name as "
+            "'scripts/bench_mic.py --list-devices' prints them. "
+            "Overrides [audio] input_device in config.toml."
+        ),
+    )
 
     return parser
 
@@ -93,7 +102,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         # stand in for it; the wizard itself opens a prompt and would hang.
         return asyncio.run(setup_wizard.run_setup(setup_wizard.TerminalPrompter()))
 
-    return _run()
+    return _run(device=args.device)
 
 
 def use_utf8(stream: object) -> None:
@@ -117,12 +126,16 @@ def use_utf8(stream: object) -> None:
 # --------------------------------------------------------------------------
 
 
-def _run() -> int:
-    """Starts the assistant, or says why it cannot."""
+def _run(*, device: str | None = None) -> int:
+    """Starts the assistant, or says why it cannot.
+
+    `device` is the `--device` flag: a microphone by index or by words from its
+    name, outranking the settings for this one run.
+    """
     from rich.console import Console
 
     from assistant.app import NoVoiceError
-    from assistant.audio.capture import MicrophoneUnavailableError
+    from assistant.audio.capture import MicrophoneUnavailableError, device_choice
     from assistant.llm.registry import RegistryError
     from assistant.logs import setup_logging
     from assistant.stt.local_whisper import ModelUnavailableError
@@ -151,8 +164,11 @@ def _run() -> int:
     # microphone that would not open. Each is one sentence and exit code 1.
     # Anything else is a bug in this project and keeps its traceback.
     fixable = (RegistryError, NoVoiceError, ModelUnavailableError, MicrophoneUnavailableError)
+    # The flag for one evening with a headset; the settings for every other
+    # day; the system default when neither says anything.
+    microphone = device_choice(device if device is not None else settings.audio.input_device)
     try:
-        asyncio.run(_talk(settings, pack))
+        asyncio.run(_talk(settings, pack, device=microphone))
     except KeyboardInterrupt:
         # The only way to stop it in phase 1, so it is an ending rather than a
         # crash - and the microphone and the keyboard hook are already closed
@@ -165,11 +181,11 @@ def _run() -> int:
     return _OK
 
 
-async def _talk(settings: Settings, pack: Locale) -> None:
+async def _talk(settings: Settings, pack: Locale, *, device: int | str | None = None) -> None:
     """Builds the pieces of phase 1 and lets the state machine drive them."""
     from assistant.agent.core import Agent
     from assistant.app import Assistant
-    from assistant.audio.capture import HandsFree
+    from assistant.audio.capture import HandsFree, SystemMicrophone
     from assistant.audio.player import SystemSpeaker
     from assistant.audio.vad import Endpoint, SileroVAD
     from assistant.llm.registry import create_provider
@@ -194,7 +210,11 @@ async def _talk(settings: Settings, pack: Locale) -> None:
         await detector.load()
 
         assistant = Assistant(
-            capture=HandsFree(endpoint=Endpoint(detector), on_mode=screen.hands_free),
+            capture=HandsFree(
+                microphone=SystemMicrophone(device=device),
+                endpoint=Endpoint(detector),
+                on_mode=screen.hands_free,
+            ),
             stt=speech,
             agent=Agent(provider, model=settings.llm.model),
             tts=SapiTTS(),

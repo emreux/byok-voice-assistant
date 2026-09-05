@@ -115,6 +115,13 @@ uv run python scripts/bench_mic.py --at "2 m"     # speaking, from where you sit
 uv run python scripts/bench_mic.py --echo         # what the speakers put back in
 ```
 
+Which microphone all of this listens through is the system default unless you say otherwise.
+`uv run python scripts/bench_mic.py --list-devices` prints every device it can see; name yours
+by words from its line — `--device "Microphone Array WASAPI"` — on `assistant run` for one
+evening with a headset, or as `input_device` under `[audio]` in `config.toml` for good. Words
+rather than the index: the indices shift every time a Bluetooth device connects. The
+benchmark and the assistant read the same setting, so what you measure is what it will use.
+
 ## What a turn costs
 
 Measured end to end on the development machine — a four-core laptop with no discrete GPU —

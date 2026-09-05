@@ -95,6 +95,13 @@ Bilmeye değer üç şey:
 - **Sessizlik cevaplanmıyor.** Konuşma tanıyıcı, boş bir kayda kendinden emin görünen
   kelimeler uyduruyor; o turlar modele gönderilmeden atılıyor.
 
+Hangi mikrofonun dinleneceğini sen söylemedikçe sistem varsayılanı kullanılıyor.
+`uv run python scripts/bench_mic.py --list-devices` gördüğü bütün aygıtları listeliyor;
+seninkini satırındaki kelimelerle adlandır — `--device "Microphone Array WASAPI"` — kulaklıklı
+bir akşam için `assistant run`'a, kalıcı olarak da `config.toml`'daki `[audio]` altına
+`input_device` olarak. İndeks değil kelime: indeksler her Bluetooth aygıtı bağlandığında
+kayıyor. Ölçüm betiği ile asistan aynı ayarı okuyor; ölçtüğün mikrofon, kullanılacak olan.
+
 ## Bir turun bedeli
 
 Geliştirme makinesinde uçtan uca ölçüldü — dört çekirdekli, ayrık ekran kartı olmayan bir

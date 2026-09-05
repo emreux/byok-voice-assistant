@@ -10,17 +10,24 @@ into the microphone loudly enough to be taken for a question.
     uv run python scripts/bench_mic.py --at "2 m" # one distance
     uv run python scripts/bench_mic.py --quiet    # the room alone
     uv run python scripts/bench_mic.py --echo     # what the speakers put back
+    uv run python scripts/bench_mic.py --list-devices   # which microphones there are
 
 `--all` is the one to run. It walks through the room, one distance, another
 distance and the echo, waits for you between them, loads Whisper once, and
 prints the four side by side at the end - which is the only way any of these
 numbers mean anything.
 
+`--device` picks the microphone the way `assistant run --device` does - words
+from its name, or an index, defaulting to `[audio] input_device` in the
+settings - so what is measured here is the microphone the assistant will
+actually listen through. `--list-devices` prints the choices.
+
 **A level is not an answer.** The detector saying "speech" and Whisper reading
 the words are two different claims, and it is the second one that decides
 whether the assistant is usable from across the room. So a take is transcribed
-as well as measured, unless `--no-read` says otherwise, and the transcript is
-judged against the same confidence floor `app.py` keeps.
+as well as measured, unless `--no-read` says otherwise, and the recording is
+judged the way `app.py` judges one: by whether anything was said in it, not by
+how sure the decoder was of the words.
 
 **Nothing heard is not the same as nothing to hear.** `--echo` asks the
 detector, not the average level: an answer is a few seconds of sound inside a
@@ -49,7 +56,7 @@ from typing import TYPE_CHECKING
 import numpy as np
 
 from assistant.app import Heard, hear
-from assistant.audio.capture import ECHO_TAIL_SECONDS, SystemMicrophone
+from assistant.audio.capture import ECHO_TAIL_SECONDS, SystemMicrophone, device_choice
 from assistant.audio.vad import FRAME_SAMPLES, SPEECH_THRESHOLD, SileroVAD
 from assistant.stt.base import NO_SPEECH_CEILING, SAMPLE_RATE, Audio, Transcript
 
@@ -240,6 +247,13 @@ def stt_language() -> str:
     return locales.load(code).stt_language
 
 
+def configured_device() -> str:
+    """The microphone `assistant run` would open, from the settings if any."""
+    from assistant.config import load_settings
+
+    return load_settings().audio.input_device
+
+
 def ready(message: str) -> None:
     """Waits for the user, then lets the room go quiet before recording."""
     input(f"\n{message}\n  Press Enter when you are in place...")
@@ -399,18 +413,43 @@ def main() -> int:
     parser.add_argument("--at", default="", help="What to call this take, e.g. '2 m'.")
     parser.add_argument("--quiet", action="store_true", help="Measure the room, saying nothing.")
     parser.add_argument("--echo", action="store_true", help="Measure what the speakers put back.")
-    parser.add_argument("--device", default=None, help="Input device, by index or name.")
+    parser.add_argument(
+        "--device",
+        default=None,
+        help=(
+            "Input device: an index, or words from its name as --list-devices prints them. "
+            "Default: [audio] input_device from the settings, else the system default."
+        ),
+    )
+    parser.add_argument(
+        "--list-devices",
+        action="store_true",
+        help="Print the devices sounddevice can see, with their indices, and exit.",
+    )
     parser.add_argument(
         "--no-read", action="store_true", help="Skip the transcript, and measure levels only."
     )
     args = parser.parse_args()
 
+    if args.list_devices:
+        import sounddevice  # type: ignore[import-untyped]
+
+        print(sounddevice.query_devices())
+        print()
+        print('Name a device by words from its line, e.g. --device "Microphone Array WASAPI",')
+        print("or by its index. Words survive a Bluetooth headset connecting; an index does not.")
+        return 0
+
+    # The same choice `assistant run` makes, so that what is measured here is
+    # the microphone the assistant will actually listen through.
+    device = device_choice(args.device if args.device is not None else configured_device())
+
     if args.all:
-        asyncio.run(guided(seconds=args.seconds, device=args.device, no_read=args.no_read))
+        asyncio.run(guided(seconds=args.seconds, device=device, no_read=args.no_read))
         return 0
 
     if args.echo:
-        asyncio.run(echo(device=args.device))
+        asyncio.run(echo(device=device))
         return 0
 
     label = args.at or ("the room, with nobody talking" if args.quiet else "speaking")
@@ -420,7 +459,7 @@ def main() -> int:
         print(f"Speak normally for {args.seconds:.0f} seconds, from where you would sit.")
         print(f"Read this out: {SPOKEN}")
 
-    take = measure(record(args.seconds, device=args.device), label=label)
+    take = measure(record(args.seconds, device=device), label=label)
     verdict(take, quiet=args.quiet)
 
     # The levels answered the detector's question. Whisper answers the one the
