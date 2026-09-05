@@ -48,10 +48,10 @@ from typing import TYPE_CHECKING
 
 import numpy as np
 
-from assistant.app import MIN_CONFIDENCE
+from assistant.app import Heard, hear
 from assistant.audio.capture import ECHO_TAIL_SECONDS, SystemMicrophone
 from assistant.audio.vad import FRAME_SAMPLES, SPEECH_THRESHOLD, SileroVAD
-from assistant.stt.base import SAMPLE_RATE, Audio
+from assistant.stt.base import NO_SPEECH_CEILING, SAMPLE_RATE, Audio, Transcript
 
 if TYPE_CHECKING:
     from assistant.stt.local_whisper import LocalWhisper
@@ -76,15 +76,25 @@ class Take:
     frames: int = 0
     transcript: str = ""
     confidence: float | None = None
+    no_speech: float | None = None
     read: bool = False
     heard: list[float] = field(default_factory=list)
 
     @property
+    def verdict(self) -> Heard:
+        """What `app.py` would have made of this take - the same function, not a copy."""
+        return hear(
+            Transcript(
+                text=self.transcript,
+                confidence=self.confidence,
+                no_speech_probability=self.no_speech,
+            )
+        )
+
+    @property
     def answered(self) -> bool:
         """Whether `app.py` would have answered this turn rather than dropping it."""
-        if not self.transcript:
-            return False
-        return self.confidence is None or self.confidence >= MIN_CONFIDENCE
+        return bool(self.verdict.text)
 
 
 def record(seconds: float, *, device: int | str | None = None) -> Audio:
@@ -192,24 +202,28 @@ async def read_back(take: Take, *, language: str, speech: LocalWhisper | None = 
     heard = await speech.transcribe(take.pcm, hint=language)
     take.transcript = heard.text.strip()
     take.confidence = heard.confidence
+    take.no_speech = heard.no_speech_probability
     take.read = True
 
     confidence = "-" if heard.confidence is None else f"{heard.confidence:.2f}"
+    no_speech = "-" if take.no_speech is None else f"{take.no_speech:.2f}"
     print(f'  transcript: "{take.transcript}"' if take.transcript else "  transcript: (nothing)")
-    print(f"  confidence: {confidence}   language heard: {heard.language or '-'}")
+    language_heard = heard.language or "-"
+    print(f"  confidence: {confidence}   no-speech: {no_speech}   language: {language_heard}")
 
-    # The number that decides it, said out loud rather than left for the reader
-    # to know. Below the floor, `app.py` drops the turn and the assistant
-    # answers nothing at all - which from the chair looks like a broken program
-    # rather than a microphone that could not reach.
-    if not take.transcript:
-        print("  The words did not come back. This distance is not usable, whatever")
-        print("  the levels say.")
-    elif not take.answered:
-        print(f"  Under the {MIN_CONFIDENCE} floor `app.py` keeps: this turn would have been")
-        print("  dropped and the assistant would have said nothing. Not usable from here.")
+    # What `app.py` would do, said out loud rather than left for the reader to
+    # work out. The decision is the engine's no-speech estimate against the
+    # ceiling, never the confidence - that number is shown for the microphone
+    # comparison, because a run of low ones is how a bad path is recognised.
+    verdict = take.verdict
+    if verdict.text:
+        print("  The assistant would answer this turn.")
+    elif verdict.missed:
+        print("  Speech was heard and no words came of it: the assistant would say it")
+        print("  did not understand. Not usable from here.")
     else:
-        print(f"  Over the {MIN_CONFIDENCE} floor `app.py` keeps: this turn would be answered.")
+        print(f"  The engine calls this silence (no-speech {no_speech} against the ceiling")
+        print(f"  of {NO_SPEECH_CEILING}): the assistant would say nothing at all.")
 
 
 def stt_language() -> str:
@@ -320,12 +334,15 @@ def summary(takes: list[Take]) -> None:
     read = [take for take in takes if take.read]
     if read:
         print(f"\nWhat was read out: {SPOKEN}")
+        print(f"  {'':<26} {'conf':>5} {'nsp':>5}")
         for take in read:
             confidence = "-" if take.confidence is None else f"{take.confidence:.2f}"
-            print(f'  {take.label:<26} {confidence}  "{take.transcript}"')
+            no_speech = "-" if take.no_speech is None else f"{take.no_speech:.2f}"
+            print(f'  {take.label:<26} {confidence:>5} {no_speech:>5}  "{take.transcript}"')
 
-    print(f"\nThresholds: detector {SPEECH_THRESHOLD}, transcript {MIN_CONFIDENCE}.")
-    print("A take answered NO would have been dropped by app.py without a word.")
+    print(f"\nThresholds: detector {SPEECH_THRESHOLD}, no-speech ceiling {NO_SPEECH_CEILING}.")
+    print("A take answered NO is one app.py would not have sent to the model: silence")
+    print("gets nothing back, speech that made no words gets 'I did not catch that'.")
 
 
 async def guided(*, seconds: float, device: int | str | None, no_read: bool) -> None:

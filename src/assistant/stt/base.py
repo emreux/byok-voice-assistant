@@ -23,29 +23,52 @@ from typing import Protocol, runtime_checkable
 import numpy as np
 from numpy.typing import NDArray
 
-__all__ = ["SAMPLE_RATE", "Audio", "STTProvider", "Transcript", "buffered_stream"]
+__all__ = [
+    "NO_SPEECH_CEILING",
+    "SAMPLE_RATE",
+    "Audio",
+    "STTProvider",
+    "Transcript",
+    "buffered_stream",
+]
 
 # What Whisper is trained on and what every other engine accepts. `audio/`
 # captures at this rate so that nothing in the pipeline has to resample.
 SAMPLE_RATE = 16_000
+
+# At or above this, the engine itself says the audio held no speech. Measured
+# on the target machine (2026-09-05, `small` int8): real sentences 0.01-0.12,
+# the same sentence through a hard noise gate 0.63, silence and noise
+# 0.86-0.92. Both the provider and the state machine read it, which is why it
+# lives here rather than in either of them.
+NO_SPEECH_CEILING = 0.8
 
 Audio = NDArray[np.float32]
 
 
 @dataclass(frozen=True, slots=True)
 class Transcript:
-    """What was heard, and how sure the engine is about it.
+    """What was heard, whether anything was, and how sure the engine is.
 
     `language` is filled in by the provider rather than by the caller. It is
     what the user actually spoke, which is not necessarily the language the
     assistant was configured for - and section 3.12 lets those differ on
     purpose, because the reply mirrors the speaker.
+
+    `no_speech_probability` and `confidence` answer different questions and
+    must not be confused. The first is how likely the engine thinks the audio
+    held no speech at all; `None` is "no opinion" - a hosted engine that
+    answers silence with an empty text - and 1.0 is "there was nothing to
+    decode". The second is how sure the decoder was of its words, which is low
+    for a correct single word as well as for a hallucination, and is therefore
+    kept for the log and never used to decide anything (`app.hear`).
     """
 
     text: str
     is_final: bool = True
     confidence: float | None = None
     language: str = ""
+    no_speech_probability: float | None = None
 
 
 @runtime_checkable

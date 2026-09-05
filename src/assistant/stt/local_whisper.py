@@ -13,11 +13,18 @@ The model is loaded on first use, also in a thread - about a gigabyte of
 weights - and `load()` exists so `app.py` can pay that cost at startup instead
 of inside the user's first sentence.
 
-Two things this deliberately does not do yet. It does not pass
-`initial_prompt`: section 3.4's vocabulary trick needs the locale pack of item
-1.8. And it does not switch on `faster-whisper`'s own VAD filter, which would
-change what the model hears - that is a measured decision for phase 2.8, not a
-default to guess at now.
+**The recording is filtered for speech before it is decoded.** `vad_filter`
+runs the same Silero network `audio/vad.py` uses over the whole recording and
+hands the decoder only what it kept. Measured on this machine (2026-09-05): a
+recording of a quiet room produced a subtitle credit without the filter and no
+segment at all with it, while a real sentence came back unchanged. What is
+left after that is judged by the decoder's own `no_speech_prob` per segment -
+a hallucinated credit over the trailing silence scores 0.9 next to a real
+sentence at 0.05 - and reported to the state machine as one number.
+
+One thing this deliberately does not do yet: it does not pass `initial_prompt`.
+Section 3.4's vocabulary trick arrives with the tools of phase 2, which are
+what put names into it.
 """
 
 from __future__ import annotations
@@ -25,10 +32,10 @@ from __future__ import annotations
 import asyncio
 import math
 import threading
-from collections.abc import AsyncIterator, Callable, Iterable
+from collections.abc import AsyncIterator, Callable, Iterable, Sequence
 from typing import Any
 
-from assistant.stt.base import Audio, Transcript, buffered_stream
+from assistant.stt.base import NO_SPEECH_CEILING, Audio, Transcript, buffered_stream
 
 __all__ = ["LocalWhisper"]
 
@@ -100,11 +107,18 @@ class LocalWhisper:
 
     def _transcribe_now(self, pcm: Audio, hint: str | None) -> Transcript:
         # `language=None` is what asks Whisper to detect the language itself.
-        segments, info = self._model_now().transcribe(pcm, language=hint)
+        # `vad_filter` strips what its own detector calls silence before the
+        # decoder sees it, so a recording of nothing decodes to nothing.
+        segments, info = self._model_now().transcribe(pcm, language=hint, vad_filter=True)
 
         # The generator is lazy: the inference happens here, inside the thread.
         # Handing it back undrained would move the work onto the event loop.
-        heard = list(segments)
+        decoded = list(segments)
+
+        # A segment the decoder itself marks as probably-not-speech is what it
+        # produces over a stretch of noise the filter let through. The words
+        # are dropped; the number is kept, so the caller learns why.
+        heard = [segment for segment in decoded if segment.no_speech_prob < NO_SPEECH_CEILING]
 
         return Transcript(
             # Each segment already begins with its own separating space, so
@@ -113,6 +127,7 @@ class LocalWhisper:
             is_final=True,
             confidence=_confidence(heard),
             language=info.language or "",
+            no_speech_probability=_no_speech(heard, decoded, kept_seconds=info.duration_after_vad),
         )
 
     def _load_whisper(self) -> Model:
@@ -129,14 +144,37 @@ class LocalWhisper:
         )
 
 
+def _no_speech(heard: Sequence[Any], decoded: Sequence[Any], *, kept_seconds: float) -> float:
+    """How likely it is that nothing was said, as one number for the caller.
+
+    The lowest `no_speech_prob` among the segments that survived, because one
+    segment of real speech means somebody spoke. When none survived, the
+    lowest among those that were dropped: still over the ceiling, and the
+    engine's own verdict rather than ours. When the decoder produced nothing
+    at all, the filter decides - it kept no audio, so there was nothing to
+    say, or it kept some and the decoder made nothing of it, which is speech
+    the user deserves to be told was not understood.
+    """
+    if heard:
+        return float(min(segment.no_speech_prob for segment in heard))
+    if decoded:
+        return float(min(segment.no_speech_prob for segment in decoded))
+    return 1.0 if kept_seconds <= 0 else 0.0
+
+
 def _confidence(segments: Iterable[Any]) -> float | None:
     """Turns Whisper's log probabilities into one number between 0 and 1.
 
     `avg_logprob` is the mean log probability of the tokens in a segment, which
     says nothing to the rest of the application on its own. Weighting each
     segment by how many tokens it holds and exponentiating gives the geometric
-    mean probability per token - the same quantity other engines call
-    confidence, so callers can compare providers.
+    mean probability per token.
+
+    It is a measure of the decoder's doubt, not of whether anything was said,
+    and it is biased by length: measured 2026-09-05, a correct "Merhaba." alone
+    scored 0.48 and a recording of silence 0.54. It is reported for the log and
+    the screen and is not what any decision rests on - `Transcript` says which
+    number is.
     """
     weighted = 0.0
     tokens = 0

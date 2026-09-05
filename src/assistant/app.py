@@ -11,12 +11,17 @@ That is also the reason this file is short: each piece already knows how to do
 its own job, and what is left here is the order they do it in, and what happens
 when one of them fails.
 
-**Nothing is transcribed that was not speech.** Whisper answers a recording of
-silence with confident looking words; measured on this machine, an empty
-recording came back as a subtitle credit at 0.49 confidence against 0.75 for a
-real sentence. The guard is the number and the length of the recording, never
-the words themselves: a list of known hallucinations would be a language
-constant in code, which section 3.12 does not allow.
+**A recording is judged by whether it held speech, never by how sure the
+decoder was of its words.** Whisper answers a recording of silence with
+confident looking words, and answers a correct single word with unsure ones:
+measured on this machine (2026-09-05), a subtitle credit over silence scored
+0.54 and "Merhaba." alone 0.48, so no confidence floor can separate them - the
+one at 0.6 that used to live here dropped short sentences and let the owner
+say "merhaba" to a program that did nothing. The engine's own estimate of
+whether anything was said does separate them (0.86 against 0.06), and `hear`
+below rests on that and on nothing else. The words themselves are never
+looked at: a list of known hallucinations would be a language constant in
+code, which section 3.12 does not allow.
 
 **The key going down cuts the answer off.** Not the key coming up: the user is
 speaking from the moment they press, so an assistant still talking is both rude
@@ -55,11 +60,10 @@ from assistant.agent.core import Agent
 from assistant.audio.player import Speaker
 from assistant.llm.base import AuthenticationError, ProviderError, Usage
 from assistant.locales import Locale
-from assistant.stt.base import SAMPLE_RATE, Audio, STTProvider, Transcript
+from assistant.stt.base import NO_SPEECH_CEILING, SAMPLE_RATE, Audio, STTProvider, Transcript
 from assistant.tts.base import TTSProvider, VoiceInfo
 
 __all__ = [
-    "MIN_CONFIDENCE",
     "MIN_UTTERANCE_SECONDS",
     "TEXT",
     "THINKING_TIMEOUT",
@@ -69,6 +73,7 @@ __all__ = [
     "State",
     "Turn",
     "choose_voice",
+    "hear",
 ]
 
 
@@ -90,11 +95,6 @@ THINKING_TIMEOUT = 60.0
 # so nothing anybody meant to say is thrown away.
 MIN_UTTERANCE_SECONDS = 0.35
 
-# Measured on the target machine: a recording of silence came back from Whisper
-# as words at 0.494, a real sentence at 0.752. Halfway is not the point - what
-# matters is that the two are far apart and the line is between them.
-MIN_CONFIDENCE = 0.6
-
 # The last link of the chain of section 3.12: what is said when no locale pack
 # offers a translation. Keys are unique across the whole project - the pack has
 # one table of sentences, and `test_locales.py` checks that no two modules
@@ -113,9 +113,9 @@ class Heard:
 
     Three outcomes rather than two, because "nothing happened" and "you said
     something and I could not read it" are different things to the person in
-    the chair. A tapped key deserves silence; a sentence that did not survive
-    the confidence floor deserves to be told so, or the assistant looks broken
-    at exactly the moment it is working as designed.
+    the chair. A tapped key or a held one over a quiet room deserves silence;
+    speech that came back as no words deserves to be told so, or the assistant
+    looks broken at exactly the moment it is working as designed.
     """
 
     text: str = ""
@@ -291,14 +291,7 @@ class Assistant:
             # there is nothing here to have misheard, so nothing to say about.
             return Heard()
 
-        transcript = await self._stt.transcribe(pcm, hint=self._locale.stt_language)
-        if is_speech(transcript):
-            return Heard(text=transcript.text.strip(), confidence=transcript.confidence)
-
-        # Long enough to have been a sentence, and it was not one this can
-        # stand behind. The number is kept because a run of these is only
-        # diagnosable with it (`logs.py`).
-        return Heard(missed=True, confidence=transcript.confidence)
+        return hear(await self._stt.transcribe(pcm, hint=self._locale.stt_language))
 
     async def _answer(self, heard: str) -> tuple[str, Usage]:
         """The model's answer, or the sentence that explains why there is none.
@@ -398,18 +391,34 @@ def choose_voice(voices: Sequence[VoiceInfo], preferred: str | None) -> str:
     return voices[0].id
 
 
-def is_speech(heard: Transcript) -> bool:
-    """Whether a transcript is worth answering.
+def hear(transcript: Transcript) -> Heard:
+    """What to make of a transcript: nothing, unreadable speech, or words.
 
-    Words with nothing behind them is what a speech recogniser produces from
-    silence, and `confidence` is what tells the two apart in any language.
-    An engine that reports no confidence at all is believed: "no opinion" is
-    not "unsure", and treating it as such would make the assistant deaf the day
-    it moves to a cloud recogniser.
+    The decision rests on whether there was speech, never on how sure the
+    decoder was of its words. Measured on the target machine (2026-09-05): a
+    correct single "Merhaba." scores 0.48 confidence and silence scores up to
+    0.54, so no confidence floor can tell them apart - but the engine's own
+    no-speech estimate can (0.06 against 0.86). Confidence is still carried,
+    for the log and the screen, because a run of low numbers is how a bad
+    microphone is diagnosed afterwards.
+
+    An engine with no opinion is believed about its words, and its silence is
+    read as speech it could not make out: it cannot tell the two apart, and
+    neither can this. Treating "no opinion" as "nothing was said" would make
+    the assistant mute the day it moves to a cloud recogniser.
     """
-    if not heard.text.strip():
-        return False
-    return heard.confidence is None or heard.confidence >= MIN_CONFIDENCE
+    no_speech = transcript.no_speech_probability
+    if no_speech is not None and no_speech >= NO_SPEECH_CEILING:
+        # The engine says nothing was said. Words it produced anyway are what
+        # a recogniser makes of silence, and they are not answered.
+        return Heard()
+
+    text = transcript.text.strip()
+    if text:
+        return Heard(text=text, confidence=transcript.confidence)
+
+    # There was speech, or an engine with no opinion, and no words came of it.
+    return Heard(missed=True, confidence=transcript.confidence)
 
 
 async def _one(said: str) -> AsyncIterator[str]:

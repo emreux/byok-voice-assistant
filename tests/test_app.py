@@ -6,10 +6,12 @@ driven here without a microphone, a model or a sound card.
 
 Four of these tests are the ones worth keeping if the rest were deleted.
 
-**Silence is not a turn.** Whisper answers a silent recording with confident
-looking words - on this machine, an utterance of nothing came back as a
-subtitle credit at 0.49 confidence, against 0.75 for a real sentence. An
-assistant that answers those talks to itself.
+**Silence is not a turn, and a quiet word is.** Whisper answers a silent
+recording with confident looking words, and answers a correct single word with
+low ones - measured on this machine (2026-09-05), a subtitle credit over
+silence scored 0.54 and "Merhaba." alone scored 0.48. No confidence floor tells
+them apart; the engine's own estimate of whether there was speech does (0.86
+against 0.06), and that is what decides.
 
 **A press cuts the answer off.** Not the release: the user is speaking from the
 moment they press, and an assistant still talking is both rude and something
@@ -33,12 +35,13 @@ import pytest
 from assistant import app
 from assistant.agent.core import Agent
 from assistant.app import (
-    MIN_CONFIDENCE,
     THINKING_TIMEOUT,
     Assistant,
+    Heard,
     State,
     Turn,
     choose_voice,
+    hear,
 )
 from assistant.llm.base import AuthenticationError, Delta, ProviderError, Usage
 from assistant.locales import Locale
@@ -323,22 +326,73 @@ async def test_a_stray_press_is_not_a_turn() -> None:
     assert (stt.hints, provider.calls, speaker.played) == ([], [], [])
 
 
-async def test_silence_that_whisper_turned_into_words_is_dropped() -> None:
-    """Measured on this machine: a recording of nothing came back as a subtitle
-    credit at 0.49 confidence, where a real sentence scored 0.75. The words
-    themselves are not something code may look at - a list of them would be a
-    language constant (section 3.12) - so the number is the guard."""
-    stt = FakeSTT(Transcript(text="Altyazı M.K.", confidence=0.494))
-    provider = ScriptedProvider([Delta(text="Buyurun?")])
+async def test_silence_the_engine_recognised_as_silence_is_not_a_turn() -> None:
+    """A held key over a quiet room. The engine says so itself, and nothing
+    was said that could have been misheard - so nothing is said back, and
+    nothing is asked of the model."""
     speaker = FakeSpeaker()
+    provider = ScriptedProvider([Delta(text="Buyurun?")])
+    stt = FakeSTT(Transcript(text="", confidence=None, no_speech_probability=1.0))
 
-    await one_turn(assistant_with(stt=stt, provider=provider, speaker=speaker))
+    turn = await one_turn(assistant_with(stt=stt, provider=provider, speaker=speaker))
+
+    assert provider.calls == []
+    assert (turn.heard, turn.missed, speaker.heard) == ("", False, "")
+
+
+async def test_words_the_engine_does_not_stand_behind_are_not_a_turn_either() -> None:
+    """An engine that filters nothing and reports 0.9 'no speech' next to a
+    subtitle credit: the number wins over the words. The words themselves are
+    not something code may look at - a list of them would be a language
+    constant (section 3.12)."""
+    speaker = FakeSpeaker()
+    provider = ScriptedProvider([Delta(text="Buyurun?")])
+    stt = FakeSTT(Transcript(text="Altyazı M.K.", confidence=0.52, no_speech_probability=0.92))
+
+    turn = await one_turn(assistant_with(stt=stt, provider=provider, speaker=speaker))
 
     assert provider.calls == [], "words nobody said were sent to the model"
-    # Said out loud rather than swallowed: the recording was long enough to
-    # have been a sentence, and silence here is what a broken program sounds
-    # like. What must not happen is the model being asked about it.
+    assert (turn.heard, turn.missed, speaker.heard) == ("", False, "")
+
+
+async def test_a_single_quiet_word_is_answered() -> None:
+    """Measured: "Merhaba." alone scores 0.48 confidence on clean audio. The
+    old floor of 0.6 dropped it, and "merhaba - nothing happened" was the
+    owner's first complaint. The number that matters is 0.06 no-speech."""
+    provider = ScriptedProvider([Delta(text="Merhaba.")])
+    stt = FakeSTT(Transcript(text="Merhaba.", confidence=0.48, no_speech_probability=0.06))
+
+    turn = await one_turn(assistant_with(stt=stt, provider=provider))
+
+    assert len(provider.calls) == 1
+    assert turn.heard == "Merhaba."
+
+
+async def test_speech_the_engine_could_not_read_is_said_out_loud() -> None:
+    """There was speech - the engine says 0.0 no-speech - and no words came of
+    it. That is the one case worth an apology: silence here is what a broken
+    program sounds like. What must not happen is the model being asked."""
+    speaker = FakeSpeaker()
+    provider = ScriptedProvider([Delta(text="Buyurun?")])
+    stt = FakeSTT(Transcript(text="", confidence=None, no_speech_probability=0.0))
+
+    turn = await one_turn(assistant_with(stt=stt, provider=provider, speaker=speaker))
+
+    assert provider.calls == []
     assert speaker.heard == TURKISH.ui["not_understood"]
+    assert turn.missed is True
+
+
+def test_hear_has_exactly_three_outcomes() -> None:
+    assert hear(Transcript(text="x", no_speech_probability=0.9)) == Heard()
+    assert hear(Transcript(text="", no_speech_probability=0.1)) == Heard(missed=True)
+    assert hear(Transcript(text=" Merhaba ", confidence=0.4, no_speech_probability=0.1)) == Heard(
+        text="Merhaba", confidence=0.4
+    )
+    # An engine with no opinion is believed about its words, and its silence
+    # is unreadable speech: it cannot tell the two apart, and neither can we.
+    assert hear(Transcript(text="saat kaç")) == Heard(text="saat kaç")
+    assert hear(Transcript(text="")) == Heard(missed=True)
 
 
 async def test_the_assistant_says_it_is_ready_before_anybody_presses_anything() -> None:
@@ -353,16 +407,19 @@ async def test_the_assistant_says_it_is_ready_before_anybody_presses_anything() 
     assert seen == [State.IDLE]
 
 
-async def test_a_sentence_the_recogniser_could_not_read_is_said_out_loud() -> None:
-    """Silence here is indistinguishable from a broken program, and the user
-    has no way to learn that speaking up would have fixed it."""
-    stt = FakeSTT(Transcript(text="bu cümlemik takılın", confidence=0.55))
-    speaker = FakeSpeaker()
+async def test_a_garbled_sentence_still_goes_to_the_model() -> None:
+    """Measured 2026-08-31 at 1 m in a quiet voice: "bu cümlemik takılın" at
+    0.55, and the old floor dropped it. Section 3.4 says the opposite: hand the
+    raw transcript over, the model is told to expect misheard words and reads
+    through them. The decoder's doubt is kept on the turn for the log."""
+    provider = ScriptedProvider([Delta(text="Anlayamadım, tekrar eder misin?")])
+    garbled = Transcript(text="bu cümlemik takılın", confidence=0.55, no_speech_probability=0.1)
+    stt = FakeSTT(garbled)
 
-    turn = await one_turn(assistant_with(stt=stt, speaker=speaker))
+    turn = await one_turn(assistant_with(stt=stt, provider=provider))
 
-    assert speaker.heard == TURKISH.ui["not_understood"]
-    assert (turn.missed, turn.confidence) == (True, 0.55)
+    assert len(provider.calls) == 1
+    assert (turn.heard, turn.missed) == ("bu cümlemik takılın", False)
 
 
 async def test_a_key_touched_by_accident_is_not_apologised_for() -> None:
@@ -381,7 +438,7 @@ async def test_a_question_the_user_withdrew_is_not_apologised_for_either() -> No
     one was not understood is worse than saying nothing."""
     capture = FakeCapture()
     speaker = FakeSpeaker()
-    stt = FakeSTT(Transcript(text="Altyazı M.K.", confidence=0.494), before=capture.press)
+    stt = FakeSTT(Transcript(text="", no_speech_probability=0.0), before=capture.press)
 
     turn = await one_turn(assistant_with(capture=capture, stt=stt, speaker=speaker))
 
@@ -392,7 +449,7 @@ async def test_a_question_the_user_withdrew_is_not_apologised_for_either() -> No
 async def test_the_microphone_is_deaf_while_the_apology_is_spoken() -> None:
     """It is an answer like any other, and a live microphone would hear it."""
     capture = FakeCapture(speech())
-    stt = FakeSTT(Transcript(text="Altyazı M.K.", confidence=0.494))
+    stt = FakeSTT(Transcript(text="", no_speech_probability=0.0))
     during: list[bool] = []
     speaker = FakeSpeaker(on_play=lambda: during.append(capture.deaf))
 
@@ -408,11 +465,6 @@ async def test_a_transcript_the_recogniser_is_sure_of_is_a_turn() -> None:
     await one_turn(assistant_with(stt=stt, provider=provider))
 
     assert len(provider.calls) == 1
-
-
-async def test_the_confidence_floor_sits_between_the_two_measurements() -> None:
-    """Anything else is a number somebody liked the look of."""
-    assert 0.494 < MIN_CONFIDENCE < 0.752
 
 
 async def test_an_engine_that_reports_no_confidence_at_all_is_believed() -> None:
@@ -716,11 +768,10 @@ async def test_the_tokens_a_turn_spent_leave_the_turn() -> None:
     assert turn.usage == spent
 
 
-async def test_a_recording_that_was_not_speech_is_a_turn_that_came_to_nothing() -> None:
-    """It cost no tokens and left no transcript - but it carries the number
-    that decided it, which is the only thing that makes a run of them
-    diagnosable afterwards (`logs.py`)."""
-    stt = FakeSTT(Transcript(text="Altyazı M.K.", confidence=0.494))
+async def test_speech_that_could_not_be_read_is_a_turn_that_came_to_nothing() -> None:
+    """It cost no tokens and left no transcript, and it is still marked as
+    missed so that the log can count them (`logs.py`)."""
+    stt = FakeSTT(Transcript(text="", confidence=None, no_speech_probability=0.0))
 
     turn = await one_turn(assistant_with(stt=stt))
 
@@ -729,7 +780,7 @@ async def test_a_recording_that_was_not_speech_is_a_turn_that_came_to_nothing() 
         said=TURKISH.ui["not_understood"],
         usage=Usage(),
         missed=True,
-        confidence=0.494,
+        confidence=None,
     )
 
 

@@ -40,12 +40,16 @@ class FakeSegment:
     text: str
     avg_logprob: float = -0.1
     tokens: list[int] = field(default_factory=lambda: [0, 1, 2])
+    no_speech_prob: float = 0.05
 
 
 @dataclass
 class FakeInfo:
     language: str = "tr"
     language_probability: float = 0.99
+    # How much audio the model's own VAD filter kept for decoding. Zero is a
+    # recording it found no speech in at all.
+    duration_after_vad: float = 0.0
 
 
 class FakeModel:
@@ -65,6 +69,7 @@ class FakeModel:
         language: str = "tr",
         avg_logprob: float = -0.1,
         delay: float = 0.0,
+        kept_seconds: float | None = None,
     ) -> None:
         self.heard = (
             segments
@@ -73,11 +78,16 @@ class FakeModel:
         )
         self.language = language
         self.delay = delay
+        # What the VAD filter kept. By default, some audio whenever there are
+        # segments and none when there are not - the shape the real model
+        # produces for speech and for silence respectively.
+        self.kept_seconds = (1.0 if self.heard else 0.0) if kept_seconds is None else kept_seconds
         self.calls: list[tuple[Audio, dict[str, Any]]] = []
 
     def transcribe(self, audio: Audio, **options: Any) -> tuple[Iterator[FakeSegment], FakeInfo]:
         self.calls.append((audio, options))
-        return self._segments(), FakeInfo(language=self.language)
+        info = FakeInfo(language=self.language, duration_after_vad=self.kept_seconds)
+        return self._segments(), info
 
     def _segments(self) -> Iterator[FakeSegment]:
         if self.delay:
@@ -158,6 +168,84 @@ async def test_silence_is_an_empty_transcript_not_an_error() -> None:
 
     assert transcript.text == ""
     assert transcript.confidence is None
+
+
+# --------------------------------------------------------------------------
+# Whether there was speech at all - the question the state machine decides on
+# --------------------------------------------------------------------------
+
+
+async def test_the_model_is_asked_to_skip_silence_before_decoding() -> None:
+    """Silence decoded is a hallucination; silence skipped is nothing. Measured
+    2026-09-05: with the filter on, a recording of a quiet room produced no
+    segment at all instead of a subtitle credit."""
+    stt, model = whisper()
+
+    await stt.transcribe(silence())
+
+    assert model.calls[0][1]["vad_filter"] is True
+
+
+async def test_how_unlikely_speech_was_is_reported() -> None:
+    stt, _ = whisper(segments=(FakeSegment(" Merhaba.", no_speech_prob=0.06),))
+
+    transcript = await stt.transcribe(silence())
+
+    assert transcript.no_speech_probability == pytest.approx(0.06)
+
+
+async def test_a_segment_the_engine_itself_calls_silence_is_dropped() -> None:
+    """A real sentence followed by a hallucinated credit over the trailing
+    silence: the credit goes, the sentence stays, and the number reported is
+    the sentence's."""
+    stt, _ = whisper(
+        segments=(
+            FakeSegment(" Saat kaç?", no_speech_prob=0.05),
+            FakeSegment(" Altyazı M.K.", no_speech_prob=0.91),
+        )
+    )
+
+    transcript = await stt.transcribe(silence())
+
+    assert transcript.text == "Saat kaç?"
+    assert transcript.no_speech_probability == pytest.approx(0.05)
+
+
+async def test_words_that_were_all_hallucination_report_the_engine_s_own_verdict() -> None:
+    """Every segment over the ceiling: no text, and a number that says why -
+    the lowest of them, which is still over the ceiling."""
+    stt, _ = whisper(
+        segments=(
+            FakeSegment(" Altyazı", no_speech_prob=0.91),
+            FakeSegment(" M.K.", no_speech_prob=0.86),
+        )
+    )
+
+    transcript = await stt.transcribe(silence())
+
+    assert (transcript.text, transcript.no_speech_probability) == ("", pytest.approx(0.86))
+
+
+async def test_nothing_left_to_decode_is_certainly_no_speech() -> None:
+    """The filter removed everything. The engine found no speech, and says so
+    with a number rather than with an absence the caller would read as 'no
+    opinion'."""
+    stt, _ = whisper(texts=(), kept_seconds=0.0)
+
+    transcript = await stt.transcribe(silence())
+
+    assert (transcript.text, transcript.no_speech_probability) == ("", 1.0)
+
+
+async def test_speech_the_filter_kept_and_the_decoder_made_nothing_of_is_still_speech() -> None:
+    """Loud speech in heavy noise: the filter keeps two seconds, the decoder
+    produces no segment. Somebody spoke, and that is what the state machine
+    needs to know - it is the one case worth telling the user about."""
+    stt, _ = whisper(texts=(), kept_seconds=2.0)
+
+    transcript = await stt.transcribe(silence())
+
+    assert (transcript.text, transcript.no_speech_probability) == ("", 0.0)
 
 
 async def test_the_confidence_is_the_average_token_probability() -> None:
