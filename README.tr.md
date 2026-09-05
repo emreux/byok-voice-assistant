@@ -92,8 +92,10 @@ Bilmeye değer üç şey:
   yanlışlıkla dokunulmuş bir tuş sayılıyor.
 - **Sözünü kesmek için tekrar bas.** Asistan hâlâ konuşuyorken tuşa basarsan anında susuyor
   ve dinlemeye geçiyor — yoksa senin mikrofonuna konuşuyor olurdu.
-- **Sessizlik cevaplanmıyor.** Konuşma tanıyıcı, boş bir kayda kendinden emin görünen
-  kelimeler uyduruyor; o turlar modele gönderilmeden atılıyor.
+- **Sessizlik cevaplanmıyor.** Tanıyıcıya kelimelerden ne kadar emin olduğu değil, kayıtta
+  konuşma olup olmadığı soruluyor: sessiz odada basılı tutulan tuş hiçbir şey demiyor,
+  okunamayan cümleye "Seni anlayamadım, tekrar söyler misin?" deniyor, kelimeler ise
+  dekoder ne kadar kararsız olursa olsun cevaplanıyor.
 
 Hangi mikrofonun dinleneceğini sen söylemedikçe sistem varsayılanı kullanılıyor.
 `uv run python scripts/bench_mic.py --list-devices` gördüğü bütün aygıtları listeliyor;

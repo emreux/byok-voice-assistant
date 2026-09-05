@@ -103,8 +103,10 @@ Five things worth knowing:
   A wake word that answers only to its name is v0.5.0.
 - **It does not hear itself.** The microphone is deaf for as long as the answer lasts, plus
   a quarter of a second for the room to stop repeating it.
-- **Silence is not answered.** A speech recogniser hands back confident-looking words for a
-  recording of nothing; those turns are dropped rather than sent to a model.
+- **Silence is not answered.** The recogniser is asked whether the recording held speech at
+  all, never how sure it is of the words: a held key over a quiet room says nothing back, a
+  sentence it could not read gets "I did not catch that", and words are answered however
+  unsure the decoder was of them.
 
 Before relying on hands-free from across the room, measure what your microphone actually
 picks up from there:
