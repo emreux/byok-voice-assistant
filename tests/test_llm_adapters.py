@@ -361,6 +361,31 @@ async def test_a_key_refused_while_listing_models_is_the_same_refusal(adapter: A
         await adapter.build(refuses=Refuses.THE_KEY).list_models()
 
 
+async def test_a_network_that_cannot_be_reached_is_a_refusal_not_an_sdk_exception(
+    adapter: Adapter,
+) -> None:
+    """Wi-Fi off, VPN down, DNS gone. The SDK raises its transport library's
+    own exception, and `app.py` catches neither that nor `OSError` - measured
+    2026-09-05, the program ended with a traceback. Translating it is the
+    adapter's job, exactly as for a 503."""
+    with pytest.raises(ProviderError) as raised:
+        await spoken(adapter.build(refuses=Refuses.THE_NETWORK))
+
+    assert not isinstance(raised.value, AuthenticationError)
+
+
+async def test_a_network_lost_mid_stream_is_a_refusal_too(adapter: Adapter) -> None:
+    provider = adapter.build(Says("Türkiye'nin"), refuses=Refuses.THE_NETWORK, after=1)
+
+    with pytest.raises(ProviderError):
+        await spoken(provider)
+
+
+async def test_a_network_lost_while_listing_models_is_the_same_refusal(adapter: Adapter) -> None:
+    with pytest.raises(ProviderError):
+        await adapter.build(refuses=Refuses.THE_NETWORK).list_models()
+
+
 # --------------------------------------------------------------------------
 # Which key, and which models it reaches
 # --------------------------------------------------------------------------

@@ -18,6 +18,7 @@ from __future__ import annotations
 from collections.abc import AsyncIterator, Sequence
 from typing import Any
 
+import httpx
 import pytest
 from google.genai import errors, types
 
@@ -367,6 +368,10 @@ def _how_it_refuses(refuses: Refuses | None) -> Exception | None:
     if refuses is Refuses.THE_KEY:
         # The shape it really uses, rather than the 401 everybody expects.
         return refusal(400, "API key not valid. Please pass a valid API key.", "INVALID_ARGUMENT")
+    if refuses is Refuses.THE_NETWORK:
+        # The SDK's transport is httpx, and this is what it raises when the
+        # network is not there - verbatim from the machine, 2026-09-05.
+        return httpx.ConnectError("[Errno 11001] getaddrinfo failed")
     return refusal(503, COMPLAINT, "UNAVAILABLE")
 
 

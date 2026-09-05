@@ -22,6 +22,7 @@ from __future__ import annotations
 from collections.abc import AsyncIterator
 from typing import Any
 
+import httpx
 from google import genai
 from google.genai import errors, types
 
@@ -74,6 +75,8 @@ class GeminiAdapter:
             pager = await self._client.aio.models.list()
         except errors.APIError as refusal:
             raise _refused(refusal) from refusal
+        except httpx.HTTPError as failure:
+            raise _unreachable(failure) from failure
 
         models: list[ModelInfo] = []
 
@@ -122,6 +125,8 @@ class GeminiAdapter:
             )
         except errors.APIError as refusal:
             raise _refused(refusal) from refusal
+        except httpx.HTTPError as failure:
+            raise _unreachable(failure) from failure
 
         # Gemini repeats a running token total on every chunk and the count
         # only grows, so the last one seen is the total for the request. They
@@ -145,9 +150,25 @@ class GeminiAdapter:
             # Half an answer had already been yielded. The turn is abandoned
             # either way, and `agent/core.py` throws the half away with it.
             raise _refused(refusal) from refusal
+        except httpx.HTTPError as failure:
+            raise _unreachable(failure) from failure
 
         if finish_reason is not None or usage is not None:
             yield Delta(finish_reason=finish_reason, usage=usage)
+
+
+def _unreachable(failure: httpx.HTTPError) -> ProviderError:
+    """The transport failed before Gemini could refuse anything.
+
+    `httpx` is the SDK's own transport, so its exceptions are the shape a
+    dropped network takes here: a socket refused, a name that did not resolve,
+    a stream that timed out. They derive from neither `ProviderError` nor
+    `OSError`, so nothing above this layer would catch them - measured
+    2026-09-05, one ended the program with a traceback. The class name is kept
+    in the message because it is the only part that says what kind of failure
+    it was.
+    """
+    return ProviderError(f"gemini could not be reached ({type(failure).__name__}): {failure}")
 
 
 def _refused(error: errors.APIError) -> ProviderError:

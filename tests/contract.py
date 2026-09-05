@@ -106,14 +106,21 @@ Step = Says | Nothing | Calls | Starts | Spends | Stops
 
 
 class Refuses(StrEnum):
-    """The two refusals the application tells apart (section 3.2).
+    """The refusals the application tells apart (section 3.2).
 
     Each adapter answers these in whatever shape its own provider uses: Gemini
     refuses a key with a 400 whose message says so, others with a 401.
+
+    `THE_NETWORK` is not a refusal by the provider at all - a socket that was
+    refused, a name that did not resolve, a stream that timed out - and that
+    is exactly why it is here: the SDK raises its transport library's own
+    exception for it, which derives from neither `ProviderError` nor `OSError`.
+    Measured 2026-09-05, one of those ended the program with a traceback.
     """
 
     THE_KEY = "the key"
     THE_REQUEST = "the request"
+    THE_NETWORK = "the network"
 
 
 # What a provider is made to say when it refuses the request, so that a test
