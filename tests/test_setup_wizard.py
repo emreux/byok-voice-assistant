@@ -35,12 +35,15 @@ from assistant.config import (
     save_settings,
     store_api_key,
 )
-from assistant.llm.base import Delta, Message, ModelInfo, ToolSpec
+from assistant.llm.base import Delta, Message, ModelInfo, ProviderError, ToolSpec
 from assistant.llm.registry import ADAPTERS, ProviderEntry
 from assistant.setup_wizard import TEXT, Option, TerminalPrompter, run_setup, wording
 from tests.conftest import MemoryKeyring
 
 GOOD_KEY = "good-key"
+# A key checked while the network is down: the provider cannot say whether it
+# works, and the adapter reports that as a refusal of the request, not the key.
+OFFLINE_KEY = "offline"
 
 
 class FakeProvider:
@@ -56,6 +59,8 @@ class FakeProvider:
         self.api_key = api_key
 
     async def validate_credentials(self) -> bool:
+        if self.api_key == OFFLINE_KEY:
+            raise ProviderError("fake could not be reached (ConnectError)")
         return self.api_key == GOOD_KEY
 
     async def list_models(self) -> list[ModelInfo]:
@@ -244,6 +249,23 @@ async def test_a_key_that_does_not_work_is_never_stored(
 
     assert exit_code != 0
     assert vault.vault == {}
+
+
+async def test_a_provider_that_cannot_be_reached_is_not_called_a_bad_key(
+    config_home: Path, vault: MemoryKeyring
+) -> None:
+    """Offline during setup. "That key did not work" would send the user to
+    the provider's console to replace a key that is fine; the wizard says
+    what actually happened and asks again."""
+    prompter = complete_run(api_key=[OFFLINE_KEY, GOOD_KEY])
+
+    exit_code = await run_setup(prompter, catalog=fake_catalog())
+
+    said = [key for key, _ in prompter.said]
+    assert exit_code == 0
+    assert "provider_unreachable" in said
+    assert "bad_key" not in said
+    assert vault.vault == {(KEYRING_SERVICE, "gemini"): GOOD_KEY}
 
 
 async def test_an_empty_answer_is_not_a_key(config_home: Path, vault: MemoryKeyring) -> None:

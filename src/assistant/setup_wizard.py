@@ -44,7 +44,7 @@ from assistant.config import (
     save_settings,
     store_api_key,
 )
-from assistant.llm.base import LLMProvider, ModelInfo
+from assistant.llm.base import LLMProvider, ModelInfo, ProviderError
 from assistant.llm.registry import ADAPTERS, ProviderEntry, create_provider, load_catalog
 
 __all__ = ["TEXT", "Option", "Prompter", "TerminalPrompter", "run_setup", "wording"]
@@ -100,6 +100,9 @@ TEXT: dict[str, str] = {
     "key_needed": "This provider needs a key before it will answer.",
     "checking_key": "Checking the key...",
     "bad_key": "That key did not work - mistyped, revoked, or out of credit.",
+    "provider_unreachable": (
+        "The provider could not be reached. Check the connection and try again."
+    ),
     "loading_models": "Asking which models the key can reach...",
     "no_models": "The key works, but it reaches no model. Check the provider's console.",
     "model": "Which model should answer?",
@@ -211,6 +214,11 @@ async def _working_key(
     A key that fails is not stored, not retried and not silently swapped for a
     fallback: mistyped, revoked and out of credit all mean the same thing to
     the user, and all three are fixed by pasting a different key.
+
+    A provider that could not be reached is a different sentence. The key has
+    not been proved dead - nothing has been proved - so a stored one is still
+    offered on the next round, and the user is told to look at the connection
+    rather than at the provider's console.
     """
     stored = load_api_key(provider_id)
 
@@ -223,7 +231,12 @@ async def _working_key(
 
         prompter.say("checking_key")
         provider = create_provider(provider_id, api_key=api_key, catalog=entries)
-        if await provider.validate_credentials():
+        try:
+            accepted = await provider.validate_credentials()
+        except ProviderError:
+            prompter.say("provider_unreachable")
+            continue
+        if accepted:
             return provider, api_key
 
         prompter.say("bad_key")

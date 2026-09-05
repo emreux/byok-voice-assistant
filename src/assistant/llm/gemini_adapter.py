@@ -60,13 +60,16 @@ class GeminiAdapter:
         self._client = client if client is not None else genai.Client(api_key=api_key)
 
     async def validate_credentials(self) -> bool:
-        """Asks for the model list; a key that cannot list models cannot chat either."""
+        """Asks for the model list; a key that cannot list models cannot chat either.
+
+        Only a refused key is `False`. A provider that could not be reached,
+        or that refused the request for reasons of its own, raises instead:
+        the answer to that is "check the connection and try again", not
+        "paste another key", and the setup command says each in its own words.
+        """
         try:
             await self.list_models()
-        except Exception:
-            # Providers reject a bad key in several shapes - a 400, a 403, a
-            # transport error. The caller only needs to know it did not work,
-            # and the setup command says so in the user's language.
+        except AuthenticationError:
             return False
         return True
 

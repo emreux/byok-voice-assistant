@@ -27,6 +27,7 @@ api_key_keep = "API anahtarını yapıştır, ya da kayıtlı olanı korumak iç
 key_needed = "Bu sağlayıcı, cevap vermeden önce bir anahtar istiyor."
 checking_key = "Anahtar kontrol ediliyor..."
 bad_key = "Bu anahtar çalışmadı — yanlış yazılmış, iptal edilmiş ya da kredisi bitmiş olabilir."
+provider_unreachable = "Sağlayıcıya ulaşılamadı. Bağlantını kontrol edip tekrar dene."
 loading_models = "Anahtarın erişebildiği modeller soruluyor..."
 no_models = "Anahtar çalışıyor ama hiçbir modele erişemiyor. Sağlayıcının konsolunu kontrol et."
 model = "Hangi model cevap versin?"

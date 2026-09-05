@@ -397,6 +397,14 @@ async def test_a_key_that_was_refused_does_not_validate(adapter: Adapter) -> Non
     assert await adapter.build(refuses=Refuses.THE_KEY).validate_credentials() is False
 
 
+async def test_an_unreachable_provider_does_not_pass_for_a_refused_key(adapter: Adapter) -> None:
+    """`False` means "this key is dead, ask for another". Offline is not that,
+    and answering `False` sends the user to renew a key that works. The setup
+    command has its own sentence for a provider it cannot reach."""
+    with pytest.raises(ProviderError):
+        await adapter.build(refuses=Refuses.THE_NETWORK).validate_credentials()
+
+
 async def test_a_working_key_validates(adapter: Adapter) -> None:
     assert await adapter.build(models=[("m-1", "Model One")]).validate_credentials() is True
 
