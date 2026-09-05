@@ -18,6 +18,13 @@ answer is *aborted* rather than stopped: a sound card holds up to a second of
 audio, and draining it politely would mean talking over the user for a second
 after being told not to.
 
+**The device failing is the device's problem, not the program's.** A Bluetooth
+headset switched off between two answers raises out of PortAudio; here that
+becomes `PlaybackError`, which `app.py` writes down and moves on from - the
+words are already on the screen. Only the device's own calls are wrapped: an
+engine that fails while producing the audio is a bug or an outage, and keeps
+its own traceback.
+
 The device itself is injected, so the tests are about what was written rather
 than about what was heard.
 """
@@ -29,7 +36,14 @@ import threading
 from collections.abc import AsyncIterator, Callable
 from typing import Any, Protocol, runtime_checkable
 
-__all__ = ["BLOCK_FRAMES", "BYTES_PER_FRAME", "CHANNELS", "Speaker", "SystemSpeaker"]
+__all__ = [
+    "BLOCK_FRAMES",
+    "BYTES_PER_FRAME",
+    "CHANNELS",
+    "PlaybackError",
+    "Speaker",
+    "SystemSpeaker",
+]
 
 # Sixteen bit signed mono, the format `tts/base.py` promises.
 BYTES_PER_FRAME = 2
@@ -57,6 +71,14 @@ class OutputStream(Protocol):
 
 
 StreamFactory = Callable[[int], Any]
+
+
+class PlaybackError(RuntimeError):
+    """The output device failed: gone, busy, or refusing the format.
+
+    Raised for the device and for nothing else. A failure in the engine that
+    produces the audio is a different thing and is not dressed up as this.
+    """
 
 
 @runtime_checkable
@@ -103,11 +125,11 @@ class SystemSpeaker:
                 if stream is None:
                     # Opened on the first sound there is to make: an answer of
                     # nothing should not cost a tenth of a second and a click.
-                    stream = await asyncio.to_thread(self._open, sample_rate)
-                await asyncio.to_thread(self._write, stream, buffer)
+                    stream = await asyncio.to_thread(self._open_device, sample_rate)
+                await asyncio.to_thread(self._write_device, stream, buffer)
         finally:
             if stream is not None:
-                await asyncio.to_thread(self._finish, stream)
+                await asyncio.to_thread(self._finish_device, stream)
 
     def stop(self) -> None:
         self._stopped.set()
@@ -116,20 +138,36 @@ class SystemSpeaker:
     # In a worker thread, where blocking is allowed.
     # ----------------------------------------------------------------------
 
-    def _write(self, stream: Any, buffer: bytes) -> None:
+    def _open_device(self, sample_rate: int) -> Any:
+        try:
+            return self._open(sample_rate)
+        except Exception as failure:
+            raise PlaybackError(f"the sound device could not be opened: {failure}") from failure
+
+    def _write_device(self, stream: Any, buffer: bytes) -> None:
         block = BLOCK_FRAMES * BYTES_PER_FRAME
+        try:
+            for start in range(0, len(buffer), block):
+                if self._stopped.is_set():
+                    return
+                stream.write(buffer[start : start + block])
+        except Exception as failure:
+            raise PlaybackError(f"the sound device failed while playing: {failure}") from failure
 
-        for start in range(0, len(buffer), block):
-            if self._stopped.is_set():
-                return
-            stream.write(buffer[start : start + block])
-
-    def _finish(self, stream: Any) -> None:
-        if self._stopped.is_set():
-            stream.abort()
-        else:
-            stream.stop()
-        stream.close()
+    def _finish_device(self, stream: Any) -> None:
+        # Whatever happens, the handle goes back; whatever was raised, it was
+        # the device's. Interrupted answers are aborted rather than drained -
+        # see the module docstring.
+        try:
+            try:
+                if self._stopped.is_set():
+                    stream.abort()
+                else:
+                    stream.stop()
+            finally:
+                stream.close()
+        except Exception as failure:
+            raise PlaybackError(f"the sound device failed while finishing: {failure}") from failure
 
 
 def _open_output(sample_rate: int) -> Any:

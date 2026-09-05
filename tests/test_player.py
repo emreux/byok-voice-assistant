@@ -20,7 +20,15 @@ import asyncio
 import time
 from collections.abc import AsyncIterator, Callable
 
-from assistant.audio.player import BLOCK_FRAMES, BYTES_PER_FRAME, Speaker, SystemSpeaker
+import pytest
+
+from assistant.audio.player import (
+    BLOCK_FRAMES,
+    BYTES_PER_FRAME,
+    PlaybackError,
+    Speaker,
+    SystemSpeaker,
+)
 
 RATE = 16_000
 BLOCK = BLOCK_FRAMES * BYTES_PER_FRAME
@@ -227,3 +235,75 @@ async def test_a_stop_from_a_previous_answer_does_not_silence_the_next_one() -> 
     await player.play(spoken(b"answer"), sample_rate=RATE)
 
     assert device.stream.heard == b"answer"
+
+
+# --------------------------------------------------------------------------
+# A device that fails
+# --------------------------------------------------------------------------
+
+
+def _dies() -> None:
+    raise RuntimeError("stream closed")
+
+
+class DiesWhileDraining(FakeStream):
+    """A device that goes away while the end of the answer is still queued."""
+
+    def stop(self) -> None:
+        _dies()
+
+
+async def test_a_device_that_cannot_be_opened_is_a_playback_error() -> None:
+    """A Bluetooth headset switched off between two answers. The answer is
+    lost; the program is not."""
+
+    def refuses(sample_rate: int) -> FakeStream:
+        raise RuntimeError("Error opening RawOutputStream: Device unavailable")
+
+    with pytest.raises(PlaybackError, match="unavailable"):
+        await SystemSpeaker(open_stream=refuses).play(spoken(silence()), sample_rate=RATE)
+
+
+async def test_a_device_that_dies_while_writing_is_a_playback_error() -> None:
+    """The same headset, switched off in the middle of a sentence."""
+    device = FakeDevice()
+    device.stream.on_write = _dies
+
+    with pytest.raises(PlaybackError, match="stream closed"):
+        await speaker_on(device).play(spoken(silence()), sample_rate=RATE)
+
+
+async def test_a_device_that_died_while_writing_is_still_closed() -> None:
+    """Whatever PortAudio thinks of the stream now, its handle is given back."""
+    device = FakeDevice()
+    device.stream.on_write = _dies
+
+    with pytest.raises(PlaybackError):
+        await speaker_on(device).play(spoken(silence()), sample_rate=RATE)
+
+    assert device.stream.closed
+
+
+async def test_a_device_that_dies_while_draining_is_a_playback_error_and_closed() -> None:
+    device = FakeDevice(DiesWhileDraining())
+
+    with pytest.raises(PlaybackError, match="stream closed"):
+        await speaker_on(device).play(spoken(silence()), sample_rate=RATE)
+
+    assert device.stream.closed
+
+
+async def test_a_failure_in_the_engine_is_not_dressed_up_as_the_device() -> None:
+    """A voice that raises while synthesising is a bug in an adapter or a
+    cloud that went away - each worth its own traceback, neither the sound
+    card's fault. The device is still closed on the way out."""
+    device = FakeDevice()
+
+    async def breaks() -> AsyncIterator[bytes]:
+        yield silence()
+        raise ValueError("the engine broke")
+
+    with pytest.raises(ValueError, match="engine"):
+        await speaker_on(device).play(breaks(), sample_rate=RATE)
+
+    assert device.stream.closed

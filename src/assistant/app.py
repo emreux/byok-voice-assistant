@@ -41,7 +41,10 @@ mute does nothing.
 user has to go and renew it (section 3.2), a provider that cannot be reached
 means try again, and a minute of thinking means the same. Anything else is a
 bug in this project, and swallowing it into "I could not connect" is how it
-would never get fixed.
+would never get fixed. A sound device that fails while the answer is being
+played is the one exception, and it is not said out loud either - there is
+nothing left to say it with. The words are already on the screen and in the
+turn; the failure goes to the log, and the turn ends the way any other does.
 
 **No user-facing sentence is written here.** The pack answers first and the
 English constants below are the end of the chain, exactly as in the wizard
@@ -56,8 +59,10 @@ from dataclasses import dataclass, field
 from enum import StrEnum
 from typing import Protocol
 
+from loguru import logger
+
 from assistant.agent.core import Agent
-from assistant.audio.player import Speaker
+from assistant.audio.player import PlaybackError, Speaker
 from assistant.llm.base import AuthenticationError, ProviderError, Usage
 from assistant.locales import Locale
 from assistant.stt.base import NO_SPEECH_CEILING, SAMPLE_RATE, Audio, STTProvider, Transcript
@@ -347,6 +352,11 @@ class Assistant:
                 self._tts.stream(_one(said), voice=self._voice),
                 sample_rate=self._tts.sample_rate,
             )
+        except PlaybackError as failure:
+            # The answer is on the screen and in the turn; only the sound of
+            # it was lost. A headset switched off between two questions is
+            # not a bug, so it is a line in the log rather than the program.
+            logger.warning("playback failed: {problem}", problem=failure)
         finally:
             self._capture.unmute()
 

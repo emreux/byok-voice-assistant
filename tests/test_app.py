@@ -31,6 +31,7 @@ from collections.abc import AsyncIterator, Callable
 
 import numpy as np
 import pytest
+from loguru import logger
 
 from assistant import app
 from assistant.agent.core import Agent
@@ -44,6 +45,7 @@ from assistant.app import (
     choose_voice,
     hear,
 )
+from assistant.audio.player import PlaybackError
 from assistant.llm.base import AuthenticationError, Delta, ProviderError, Usage
 from assistant.locales import Locale
 from assistant.stt.base import SAMPLE_RATE, Audio, Transcript
@@ -536,6 +538,41 @@ async def test_an_answer_that_failed_halfway_still_leaves_the_microphone_listeni
         await one_turn(assistant_with(capture=capture, speaker=speaker))
 
     assert capture.deaf is False
+
+
+class DeafSpeaker(FakeSpeaker):
+    """A sound card that is not there any more: a headset switched off."""
+
+    async def play(self, buffers: AsyncIterator[bytes], *, sample_rate: int) -> None:
+        raise PlaybackError("the sound device could not be opened: Device unavailable")
+
+
+async def test_an_answer_the_sound_card_refused_still_ends_the_turn() -> None:
+    """A Bluetooth headset switched off between two questions. The words are
+    on the screen and in the turn; only the sound of them was lost, and that
+    is not worth the program."""
+    capture = FakeCapture(speech())
+    states: list[State] = []
+    assistant = assistant_with(capture=capture, speaker=DeafSpeaker(), on_state=states.append)
+
+    turn = await one_turn(assistant)
+
+    assert turn.said == "Üç."
+    assert states[-1] is State.IDLE
+    assert capture.deaf is False
+
+
+async def test_an_answer_the_sound_card_refused_is_written_down() -> None:
+    """Not said out loud - there is nothing to say it with - but a user who
+    reports that the assistant "went quiet" deserves a log that says why."""
+    lines: list[str] = []
+    handle = logger.add(lines.append, format="{message}")
+    try:
+        await one_turn(assistant_with(speaker=DeafSpeaker()))
+    finally:
+        logger.remove(handle)
+
+    assert any("playback failed" in line and "unavailable" in line for line in lines)
 
 
 async def test_a_turn_with_nothing_to_say_never_deafens_the_microphone() -> None:
