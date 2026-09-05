@@ -280,13 +280,16 @@ async def test_only_models_that_can_generate_text_are_offered() -> None:
     assert listed[0].context_window == 1000
 
 
-async def test_a_key_that_fails_in_an_unexpected_way_is_still_just_a_no() -> None:
-    """Not every refusal arrives as an SDK error - a proxy, a DNS failure and a
-    closed socket all reach this as something else entirely. The setup command
-    needs one answer, and it is the same answer."""
-    adapter = adapter_for(FakeModels(error=RuntimeError("API key not valid")))
+async def test_a_failure_of_an_unexpected_shape_is_not_dressed_up_as_a_bad_key() -> None:
+    """A proxy, a DNS failure and a closed socket used to reach this as
+    "something else" and were all answered `False` - which sent the user to
+    replace a key that was fine. Since 2026-09-05 the transport's own errors
+    are translated into `ProviderError` (`test_llm_adapters.py`); whatever is
+    left is a bug, and a bug dressed up as a bad key is one nobody fixes."""
+    adapter = adapter_for(FakeModels(error=RuntimeError("something nobody foresaw")))
 
-    assert await adapter.validate_credentials() is False
+    with pytest.raises(RuntimeError):
+        await adapter.validate_credentials()
 
 
 @pytest.mark.parametrize("role", ["user", "assistant"])
