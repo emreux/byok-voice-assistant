@@ -169,9 +169,22 @@ def test_a_missed_turn_with_no_number_still_gets_its_line(log: Path) -> None:
 def test_a_turn_that_failed_is_still_a_turn(log: Path) -> None:
     """It spent no tokens anybody can account for, and it is exactly the turn
     worth finding in the log afterwards."""
-    log_turn(Turn(heard="saat kaç", said="Sağlayıcıya bağlanamadım."))
+    log_turn(Turn(heard="saat kaç", said="Sağlayıcıya bağlanamadım.", failure="unreachable"))
 
     assert read(log).strip()
+
+
+def test_a_turn_that_failed_says_why_and_claims_no_tokens(log: Path) -> None:
+    """`turn: 0 in, 0 out` reads as a free success - the log of 2026-09-04 had
+    one, and nothing said which of the three failures it was. The line names
+    the kind, and only the kind: the provider's own words are where a key
+    could travel, and they stay out of the file."""
+    log_turn(Turn(heard="saat kaç", said="Sağlayıcıya bağlanamadım.", failure="unreachable"))
+
+    line = read(log)
+    assert "failed: unreachable" in line
+    assert " in, " not in line, "a failed turn must not be written as a token count"
+    assert "Sağlayıcıya" not in line
 
 
 # --------------------------------------------------------------------------

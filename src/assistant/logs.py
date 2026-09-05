@@ -83,19 +83,29 @@ def log_turn(finished: Turn) -> None:
 
     A turn that heard nothing never happened - a tapped key, or a recording of
     silence - and logging those buries the turns that cost something under the
-    ones that cost nothing. A turn that *failed* is kept: it reports no tokens,
-    and it is the line worth finding afterwards.
+    ones that cost nothing.
 
-    So is a turn that was *missed*. It cost nothing, which is exactly why the
-    line matters: a user reporting that the assistant "does nothing" and a log
-    full of missed turns at 0.5 have already answered each other, and the
-    number is the whole of the answer. The words are still not written down -
-    a transcript nothing stood behind is no more worth keeping than one that
-    was.
+    A turn that *failed* is kept, by the kind of failure and nothing else. It
+    reports no tokens, and written as `turn: 0 in, 0 out` it read as a free
+    success - the log of 2026-09-04 had one and nothing said which of the
+    three sentences the user had heard. The provider's own words stay out: they
+    are where a key could travel, and the masking filter of section 5 is not
+    written yet.
+
+    So is a turn that was *missed*: speech the recogniser could not turn into
+    words. It cost nothing, which is exactly why the line matters - a user
+    reporting that the assistant "does nothing" and a log full of these have
+    already answered each other. The decoder's doubt goes with it when there
+    was one. The words are still not written down: a transcript nothing stood
+    behind is no more worth keeping than one that was.
     """
     if finished.missed:
         confidence = "-" if finished.confidence is None else f"{finished.confidence:.2f}"
         logger.info("missed: nothing worth answering, confidence {value}", value=confidence)
+        return
+
+    if finished.failure is not None:
+        logger.warning("failed: {kind}", kind=finished.failure)
         return
 
     if not finished.heard:

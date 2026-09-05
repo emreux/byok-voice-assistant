@@ -681,18 +681,20 @@ async def test_a_refused_key_is_said_out_loud_in_words_that_help() -> None:
     speaker = FakeSpeaker()
     provider = ScriptedProvider([AuthenticationError("gemini refused the request (403)")])
 
-    await one_turn(assistant_with(provider=provider, speaker=speaker))
+    turn = await one_turn(assistant_with(provider=provider, speaker=speaker))
 
     assert speaker.heard == TURKISH.ui["key_invalid"]
+    assert turn.failure == "key_invalid"
 
 
 async def test_a_provider_that_cannot_be_reached_is_said_out_loud() -> None:
     speaker = FakeSpeaker()
     provider = ScriptedProvider([ProviderError("gemini refused the request (503)")])
 
-    await one_turn(assistant_with(provider=provider, speaker=speaker))
+    turn = await one_turn(assistant_with(provider=provider, speaker=speaker))
 
     assert speaker.heard == TURKISH.ui["unreachable"]
+    assert turn.failure == "unreachable"
 
 
 async def test_a_network_that_is_not_there_is_said_out_loud_too() -> None:
@@ -710,9 +712,10 @@ async def test_a_turn_that_takes_too_long_is_given_up_on() -> None:
     provider = ScriptedProvider([3600.0, Delta(text="eventually")])
     speaker = FakeSpeaker()
 
-    await one_turn(assistant_with(provider=provider, speaker=speaker, thinking_timeout=0.01))
+    turn = await one_turn(assistant_with(provider=provider, speaker=speaker, thinking_timeout=0.01))
 
     assert speaker.heard == TURKISH.ui["took_too_long"]
+    assert turn.failure == "took_too_long"
 
 
 def test_thinking_gives_up_after_the_minute_section_3_1_allows() -> None:
@@ -755,6 +758,8 @@ async def test_a_turn_reports_what_was_heard_and_what_was_said() -> None:
     turn = await one_turn(assistant_with(stt=stt, provider=provider))
 
     assert (turn.heard, turn.said) == ("saat kaç", "Saat üç.")
+    # A turn the model answered failed in no way, and says so by saying nothing.
+    assert turn.failure is None
 
 
 async def test_the_tokens_a_turn_spent_leave_the_turn() -> None:

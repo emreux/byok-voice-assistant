@@ -134,9 +134,15 @@ class Turn:
     hide the ones that cost tokens and still failed.
 
     A turn that was *missed* carries no `heard` on purpose: there is no
-    transcript this application is willing to stand behind. What it carries
-    instead is the number that decided it, which is the only thing that makes
-    a run of them diagnosable afterwards.
+    transcript this application is willing to stand behind. It carries the
+    decoder's doubt when there was one, for whoever reads the log later.
+
+    A turn that *failed* carries the key of the sentence that was said instead
+    of an answer - `unreachable`, `key_invalid`, `took_too_long` - and nothing
+    else about the failure. The log needs the kind (a line of zero tokens
+    reads as a free success, and the log of 2026-09-04 had one nobody could
+    explain); the provider's own words are where a key could travel and stay
+    in the exception.
     """
 
     heard: str = ""
@@ -144,6 +150,7 @@ class Turn:
     usage: Usage = field(default_factory=Usage)
     missed: bool = False
     confidence: float | None = None
+    failure: str | None = None
 
 
 class Capture(Protocol):
@@ -256,10 +263,10 @@ class Assistant:
             return await self._missed(heard)
 
         self._enter(State.THINKING)
-        said, usage = await self._answer(heard.text)
+        said, usage, failure = await self._answer(heard.text)
         await self._speak(said)
         self._rest()
-        return Turn(heard=heard.text, said=said, usage=usage)
+        return Turn(heard=heard.text, said=said, usage=usage, failure=failure)
 
     async def _missed(self, heard: Heard) -> Turn:
         """Nothing usable came back. Whether that is worth saying depends.
@@ -293,28 +300,29 @@ class Assistant:
 
         return hear(await self._stt.transcribe(pcm, hint=self._locale.stt_language))
 
-    async def _answer(self, heard: str) -> tuple[str, Usage]:
+    async def _answer(self, heard: str) -> tuple[str, Usage, str | None]:
         """The model's answer, or the sentence that explains why there is none.
 
         A turn that failed spent no tokens anybody can account for: what the
         provider counted before it refused is not reported to us, and guessing
-        would put a number in the cost report that nothing backs.
+        would put a number in the cost report that nothing backs. The third
+        value is the key of the sentence that was said instead, for the log.
         """
         try:
             answer = await asyncio.wait_for(self._agent.reply(heard), self._thinking_timeout)
         except TimeoutError:
-            return self._said["took_too_long"], Usage()
+            return self._said["took_too_long"], Usage(), "took_too_long"
         except AuthenticationError:
             # Never retried and never failed over: the key will not start
             # working on its own, and quietly using another model would put the
             # user on a bill they did not agree to (section 3.2).
-            return self._said["key_invalid"], Usage()
+            return self._said["key_invalid"], Usage(), "key_invalid"
         except (ProviderError, OSError):
-            # OSError as well as our own: a socket that was refused never
-            # reaches an adapter to be translated.
-            return self._said["unreachable"], Usage()
+            # OSError as well as our own: a socket that was refused below the
+            # adapter's transport never reaches it to be translated.
+            return self._said["unreachable"], Usage(), "unreachable"
 
-        return answer.text, answer.usage
+        return answer.text, answer.usage, None
 
     async def _speak(self, said: str) -> None:
         if not said or self._withdrawn():
