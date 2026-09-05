@@ -36,7 +36,13 @@ import pytest
 
 from assistant.agent import prompts
 from assistant.agent.core import WINDOW_TURNS, Agent, window
-from assistant.agent.prompts import BREVITY, LANGUAGE_RULE, PERSONALITY, SYSTEM_PROMPT
+from assistant.agent.prompts import (
+    BREVITY,
+    LANGUAGE_FALLBACK,
+    LANGUAGE_RULE,
+    PERSONALITY,
+    SYSTEM_PROMPT,
+)
 from assistant.llm.base import Delta, Message, ModelInfo, ToolCall, ToolSpec, Usage
 
 MODEL = "scripted-1"
@@ -320,8 +326,8 @@ async def test_a_model_that_said_nothing_is_not_remembered_as_having_spoken() ->
 
 def test_the_prompt_is_made_of_the_rules_it_names() -> None:
     """Each rule is a separate constant so that it can be read, argued with and
-    replaced on its own; the prompt is the three of them and nothing else."""
-    assert "\n\n".join((PERSONALITY, BREVITY, LANGUAGE_RULE)) == SYSTEM_PROMPT
+    replaced on its own; the prompt is the four of them and nothing else."""
+    assert "\n\n".join((PERSONALITY, BREVITY, LANGUAGE_RULE, LANGUAGE_FALLBACK)) == SYSTEM_PROMPT
 
 
 def test_the_prompt_pins_no_language() -> None:
@@ -330,6 +336,17 @@ def test_the_prompt_pins_no_language() -> None:
     said = SYSTEM_PROMPT.casefold()
 
     assert not [name for name in ("turkish", "türkçe", "english", "german") if name in said]
+
+
+def test_a_message_with_no_language_in_it_keeps_the_last_one() -> None:
+    """Measured 2026-08-31: a transcript of digits alone was answered in
+    English. There was no language to mirror, so the rule has to say what to
+    do when there is none - without naming one."""
+    said = LANGUAGE_FALLBACK.casefold()
+
+    assert "digits" in said
+    assert "last" in said
+    assert not [character for character in LANGUAGE_FALLBACK if character.isdigit()]
 
 
 def test_the_prompt_carries_no_clock_and_no_calendar() -> None:

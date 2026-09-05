@@ -101,9 +101,9 @@ class StatusLine:
         self._console = console if console is not None else Console()
 
         keys = {"hotkey": spell(hotkey), "toggle": spell(toggle)}
-        # Both are built up front. Which one is shown is the only thing that
-        # changes when the mode does, and a hint assembled at that moment would
-        # be assembled on the keyboard's own thread.
+        # Both are built up front; only which one is shown changes when the
+        # mode does. `hands_free` runs on the event loop between two other
+        # things, and should cost a lookup rather than a format.
         self._hints = {
             False: self._said["hold_to_talk"].format(**keys),
             True: self._said["hands_free"].format(**keys),

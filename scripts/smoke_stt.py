@@ -52,7 +52,10 @@ def transcribe(path: Path, language: str) -> tuple[str, float]:
     segments, _info = model.transcribe(str(path), language=language)
     # The generator is lazy: inference happens while it is consumed, so the
     # timer has to wrap the consumption, not the call above.
-    text = " ".join(segment.text for segment in segments).strip()
+    # Each segment already begins with its own separating space, so joining
+    # with another one would double every gap (the same rule `local_whisper.py`
+    # follows).
+    text = "".join(segment.text for segment in segments).strip()
     return text, time.perf_counter() - started
 
 

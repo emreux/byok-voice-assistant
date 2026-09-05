@@ -17,13 +17,17 @@ changed.
 
 Two traps sit behind the COM calls. Synthesis blocks, so it runs in a worker
 thread (rule 4 of section 3.1); and a thread that has not initialised COM
-cannot create a SAPI object at all, which is why every worker does so first.
+cannot create a SAPI object at all, which is why every worker does so once,
+the first time it is handed a sentence, and keeps the `SpVoice` it made for
+the sentences after that. The pool has a handful of threads and an answer has
+a handful of sentences; making a fresh engine for each was work for nothing.
 """
 
 from __future__ import annotations
 
 import asyncio
 import locale
+import threading
 from collections.abc import AsyncIterator, Iterator
 from typing import Any, Protocol
 
@@ -44,6 +48,11 @@ VOICE_CATEGORIES = (
     r"HKEY_LOCAL_MACHINE\SOFTWARE\Microsoft\Speech\Voices",
     r"HKEY_LOCAL_MACHINE\SOFTWARE\Microsoft\Speech_OneCore\Voices",
 )
+
+# What each worker thread keeps between sentences: whether it has initialised
+# COM, and the `SpVoice` it made. COM objects belong to the thread that made
+# them, which is why this is thread-local rather than a module attribute.
+_local = threading.local()
 
 
 class SpeechEngine(Protocol):
@@ -103,12 +112,15 @@ class WindowsSpeech:
         # in this file is `Any`.
         import win32com.client  # type: ignore[import-untyped]
 
-        _initialise_com()
+        # This thread's own engine, first: making it initialises COM when this
+        # is the thread's first sentence, and no other COM object can be made
+        # before that.
+        engine = _engine()
 
+        # A fresh stream per sentence: it is the sentence's buffer.
         stream = win32com.client.Dispatch("SAPI.SpMemoryStream")
         stream.Format.Type = AUDIO_FORMAT
 
-        engine = win32com.client.Dispatch("SAPI.SpVoice")
         engine.Voice = _token(voice)
         engine.AudioOutputStream = stream
         engine.Speak(text)
@@ -176,12 +188,30 @@ def _token(voice_id: str) -> Any:
 
 
 def _initialise_com() -> None:
-    """COM has to be initialised on the thread that uses it.
+    """COM has to be initialised on the thread that uses it, once.
 
     `asyncio.to_thread` hands the work to whichever pool thread is free, and a
-    thread that has not done this cannot create a SAPI object at all. Calling
-    it again on a thread that already has is harmless - it is counted.
+    thread that has not done this cannot create a SAPI object at all. Done
+    once per thread and remembered: `CoInitialize` counts its calls and
+    expects each to be paired with an uninitialise that nothing here makes.
     """
+    if getattr(_local, "com_ready", False):
+        return
+
     import pythoncom  # type: ignore[import-untyped]
 
     pythoncom.CoInitialize()
+    _local.com_ready = True
+
+
+def _engine() -> Any:
+    """This thread's `SpVoice`, made on the first sentence it is handed."""
+    import win32com.client
+
+    _initialise_com()
+
+    engine = getattr(_local, "engine", None)
+    if engine is None:
+        engine = win32com.client.Dispatch("SAPI.SpVoice")
+        _local.engine = engine
+    return engine

@@ -1,7 +1,8 @@
 """What the assistant is told about itself, once, and never again (item 1.9).
 
-Three rules, kept as three constants so each can be read and argued with on its
-own: who is speaking, how long an answer may be, and which language it is in.
+Four rules, kept as four constants so each can be read and argued with on its
+own: who is speaking, how long an answer may be, which language it is in, and
+what to do when the last message had no language in it at all.
 
 **The prompt is frozen.** No clock, no date, no name of the user, nothing this
 module computes - and that is why there is not a single import below. A
@@ -19,7 +20,7 @@ multilingual, it only has to be told to follow rather than lead.
 
 from __future__ import annotations
 
-__all__ = ["BREVITY", "LANGUAGE_RULE", "PERSONALITY", "SYSTEM_PROMPT"]
+__all__ = ["BREVITY", "LANGUAGE_FALLBACK", "LANGUAGE_RULE", "PERSONALITY", "SYSTEM_PROMPT"]
 
 PERSONALITY = (
     "You are a voice assistant running on the user's own computer. What reaches you is "
@@ -51,4 +52,14 @@ LANGUAGE_RULE = (
     "new language until they switch again. Never announce or comment on the switch."
 )
 
-SYSTEM_PROMPT = "\n\n".join((PERSONALITY, BREVITY, LANGUAGE_RULE))
+# Added 2026-09-05. A transcript of digits alone - a list of numbers read out -
+# has no language to mirror, and the model fell back to English (measured
+# 2026-08-31). Kept apart from `LANGUAGE_RULE`, which is verbatim from section
+# 3.12, and still naming no language: "the one you used last" is a pointer,
+# not a constant.
+LANGUAGE_FALLBACK = (
+    "If the most recent message has no words in any language - digits alone, for "
+    "instance - keep replying in the language you used last."
+)
+
+SYSTEM_PROMPT = "\n\n".join((PERSONALITY, BREVITY, LANGUAGE_RULE, LANGUAGE_FALLBACK))

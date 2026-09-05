@@ -88,7 +88,8 @@ def check_speech_voices() -> bool:
 
     Windows installs newer voices under Speech_OneCore. `SAPI.SpVoice` does not
     list those, so a language pack can be installed and still be invisible to
-    the application - worth reporting separately.
+    `GetVoices()`. The assistant enumerates both hives itself (`tts/sapi.py`),
+    so these are listed for information rather than as a problem.
     """
     try:
         import win32com.client
@@ -109,7 +110,7 @@ def check_speech_voices() -> bool:
     one_core = _registry_voices(r"SOFTWARE\Microsoft\Speech_OneCore\Voices\Tokens")
     hidden = [name for name in one_core if name not in sapi_voices]
     for name in hidden:
-        _line(WARN, f"installed but hidden from SAPI: {name}")
+        _line(OK, f"Speech_OneCore voice, read directly by the assistant: {name}")
 
     turkish = [
         name
@@ -123,11 +124,11 @@ def check_speech_voices() -> bool:
     turkish_hidden = [name for name in hidden if "turk" in name.lower()]
     if turkish_hidden:
         _line(
-            WARN,
-            f"Turkish voice {turkish_hidden[0]!r} is installed but SAPI cannot see it "
-            f"- copy its registry token into Speech\\Voices\\Tokens, or use Azure TTS",
+            OK,
+            f"Turkish voice {turkish_hidden[0]!r} is installed under Speech_OneCore; the "
+            f"assistant reads that hive itself (tts/sapi.py), so nothing needs copying",
         )
-        return False
+        return True
 
     _line(
         WARN,

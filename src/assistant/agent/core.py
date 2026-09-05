@@ -53,8 +53,10 @@ class Answer:
     """What one turn produced: the words, what they cost, and why it ended.
 
     `usage` is what item 1.11 writes to the log and section 6 later bills from.
-    `finish_reason` is the difference between an answer that ended and one that
-    was cut off at the token limit, which is a thing the user is told.
+    `finish_reason` is kept so that an answer that ended can be told apart from
+    one cut off at the token limit. Nothing reads it yet: the sentence by
+    sentence speech of phase 2 is where a cut-off answer has to be said out
+    loud, and the loop limits of section 3.11 are where the cap is enforced.
     """
 
     text: str
