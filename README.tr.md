@@ -103,6 +103,7 @@ seninkini satırındaki kelimelerle adlandır — `--device "Microphone Array WA
 bir akşam için `assistant run`'a, kalıcı olarak da `config.toml`'daki `[audio]` altına
 `input_device` olarak. İndeks değil kelime: indeksler her Bluetooth aygıtı bağlandığında
 kayıyor. Ölçüm betiği ile asistan aynı ayarı okuyor; ölçtüğün mikrofon, kullanılacak olan.
+16 kHz'de çalışmayan bir aygıt kendi hızında açılıyor ve girişte yeniden örnekleniyor.
 
 ## Bir turun bedeli
 

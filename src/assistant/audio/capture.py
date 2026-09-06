@@ -40,6 +40,7 @@ from typing import Any, Protocol, Self, runtime_checkable
 import numpy as np
 from loguru import logger
 
+from assistant.audio.resample import Resampler
 from assistant.audio.vad import Endpoint, Segmenter
 from assistant.stt.base import SAMPLE_RATE, Audio
 
@@ -475,12 +476,26 @@ _REPORT_OVERFLOWS_EVERY = 1000
 
 
 class SystemMicrophone:
-    """The real microphone, through `sounddevice`."""
+    """The real microphone, through `sounddevice`.
+
+    Asked for 16 kHz mono, which is what everything downstream expects. Not
+    every path to a microphone will give it: PortAudio's WASAPI runs a shared
+    stream at the mixer's rate unless told to convert, and kernel streaming
+    has no converter at all - measured 2026-09-05, the internal array's two
+    rawer entries refused 16 kHz while its MME entry, with Windows resampling
+    in between, accepted it. So a WASAPI device is told to convert, and a
+    device that still refuses is opened at its own rate and brought to 16 kHz
+    here, block by block (`audio/resample.py`). `rate` says which happened.
+    """
 
     def __init__(self, *, device: int | str | None = None) -> None:
         self._device = device
         self._stream: Any = None
         self._on_chunk: OnChunk | None = None
+        self._resampler: Resampler | None = None
+        # The rate the device actually runs at once opened: `SAMPLE_RATE`
+        # unless it would not, in which case the blocks are resampled.
+        self.rate: int | None = None
         # Blocks the driver dropped before this saw them. In hands-free mode
         # each is a hole in a sentence that nothing else would notice.
         self.overflows = 0
@@ -493,14 +508,7 @@ class SystemMicrophone:
 
         self._on_chunk = on_chunk
         try:
-            self._stream = sounddevice.InputStream(
-                samplerate=SAMPLE_RATE,
-                channels=1,
-                dtype="float32",
-                blocksize=CHUNK_FRAMES,
-                device=self._device,
-                callback=self._block,
-            )
+            self._stream = self._open_stream(sounddevice)
             self._stream.start()
         except (ValueError, sounddevice.PortAudioError) as failure:
             # `ValueError` is a name that matched no device. `PortAudioError`
@@ -520,6 +528,50 @@ class SystemMicrophone:
             self._stream.close()
             self._stream = None
 
+    def _open_stream(self, sounddevice: Any) -> Any:
+        """16 kHz if the device will run at it; its own rate, resampled, if not."""
+        facts = sounddevice.query_devices(self._device, "input")
+        host = str(sounddevice.query_hostapis(facts["hostapi"])["name"])
+        native = round(float(facts["default_samplerate"]))
+        # Only WASAPI understands this, and PortAudio refuses a stream whose
+        # host-specific settings belong to another host API.
+        extra = sounddevice.WasapiSettings(auto_convert=True) if "WASAPI" in host else None
+
+        try:
+            stream = self._stream_at(sounddevice, SAMPLE_RATE, extra)
+        except sounddevice.PortAudioError:
+            if native == SAMPLE_RATE:
+                raise
+            # Whatever the refusal was, the one thing left to try is the rate
+            # the device says it runs at. If that fails too, that error is
+            # the one worth reading, and it is the one that propagates.
+            stream = self._stream_at(sounddevice, native, extra)
+            self._resampler = Resampler(native, SAMPLE_RATE)
+            self.rate = native
+            logger.info(
+                "microphone {device!r} runs at {rate} Hz; resampling to {target}",
+                device=self._device,
+                rate=native,
+                target=SAMPLE_RATE,
+            )
+        else:
+            self._resampler = None
+            self.rate = SAMPLE_RATE
+        return stream
+
+    def _stream_at(self, sounddevice: Any, rate: int, extra: Any) -> Any:
+        return sounddevice.InputStream(
+            samplerate=rate,
+            channels=1,
+            dtype="float32",
+            # Twenty milliseconds at whatever rate the device runs at, so a
+            # resampled block is still the block size everything else counts on.
+            blocksize=round(CHUNK_FRAMES * rate / SAMPLE_RATE),
+            device=self._device,
+            callback=self._block,
+            extra_settings=extra,
+        )
+
     def _block(self, indata: Any, frames: int, time_info: Any, status: Any) -> None:
         """PortAudio's callback thread. Whatever this does, it does it quickly."""
         if status and status.input_overflow:
@@ -532,4 +584,7 @@ class SystemMicrophone:
         if self._on_chunk is not None:
             # One channel, and a copy: `indata` is PortAudio's own buffer and
             # holds the next block by the time anyone reads this one.
-            self._on_chunk(indata[:, 0].copy())
+            chunk = indata[:, 0].copy()
+            if self._resampler is not None:
+                chunk = self._resampler.push(chunk)
+            self._on_chunk(chunk)

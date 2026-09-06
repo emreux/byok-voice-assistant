@@ -123,6 +123,7 @@ by words from its line — `--device "Microphone Array WASAPI"` — on `assistan
 evening with a headset, or as `input_device` under `[audio]` in `config.toml` for good. Words
 rather than the index: the indices shift every time a Bluetooth device connects. The
 benchmark and the assistant read the same setting, so what you measure is what it will use.
+A device that will not run at 16 kHz is opened at its own rate and resampled on the way in.
 
 ## What a turn costs
 

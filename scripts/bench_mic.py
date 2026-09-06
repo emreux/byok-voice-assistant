@@ -56,7 +56,12 @@ from typing import TYPE_CHECKING
 import numpy as np
 
 from assistant.app import Heard, hear
-from assistant.audio.capture import ECHO_TAIL_SECONDS, SystemMicrophone, device_choice
+from assistant.audio.capture import (
+    ECHO_TAIL_SECONDS,
+    MicrophoneUnavailableError,
+    SystemMicrophone,
+    device_choice,
+)
 from assistant.audio.vad import FRAME_SAMPLES, SPEECH_THRESHOLD, SileroVAD
 from assistant.stt.base import NO_SPEECH_CEILING, SAMPLE_RATE, Audio, Transcript
 
@@ -109,6 +114,10 @@ def record(seconds: float, *, device: int | str | None = None) -> Audio:
     blocks: list[Audio] = []
     microphone = SystemMicrophone(device=device)
     microphone.open(blocks.append)
+    if microphone.rate != SAMPLE_RATE:
+        # Worth knowing when reading the numbers: this path has no Windows
+        # resampler in front of it, which is usually why it was chosen.
+        print(f"  (the device runs at {microphone.rate} Hz; resampled to {SAMPLE_RATE} here)")
     try:
         time.sleep(seconds)
     finally:
@@ -444,6 +453,17 @@ def main() -> int:
     # the microphone the assistant will actually listen through.
     device = device_choice(args.device if args.device is not None else configured_device())
 
+    try:
+        return _measure(args, device)
+    except MicrophoneUnavailableError as problem:
+        # The same sentence `assistant run` would print, for the same reason:
+        # a name that matched nothing, or a device that would not open, is the
+        # user's to fix, and a traceback says nothing about how.
+        print(f"Cannot record: {problem}")
+        return 1
+
+
+def _measure(args: argparse.Namespace, device: int | str | None) -> int:
     if args.all:
         asyncio.run(guided(seconds=args.seconds, device=device, no_read=args.no_read))
         return 0

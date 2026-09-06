@@ -92,20 +92,51 @@ class FakeMicrophone:
         self._on_chunk(chunk)
 
 
-def fake_sounddevice() -> tuple[SimpleNamespace, list[SimpleNamespace]]:
+def fake_sounddevice(
+    *,
+    host_api: str = "MME",
+    native_rate: int = SAMPLE_RATE,
+    accepts: set[int] | None = None,
+) -> tuple[SimpleNamespace, list[SimpleNamespace]]:
     """Stands in for the module, and records how the stream was opened.
 
-    A device called `nope` is refused the way `sounddevice` refuses a name
-    that matches nothing: a `ValueError` that quotes the name.
+    One input device, behind `host_api`, whose own rate is `native_rate`.
+    `accepts` is the set of rates it opens at - `None` for any, the way MME
+    behaves; `{48_000}` for a device that refuses 16 kHz, the way WASAPI and
+    kernel streaming did on 2026-09-05. A WASAPI device told to convert opens
+    at any rate. A device called `nope` is refused the way `sounddevice`
+    refuses a name that matches nothing: a `ValueError` that quotes the name.
     """
     streams: list[SimpleNamespace] = []
 
     class PortAudioError(Exception):
         pass
 
+    class WasapiSettings:
+        def __init__(self, *, auto_convert: bool = False) -> None:
+            self.auto_convert = auto_convert
+
+    def query_devices(device: Any = None, kind: str | None = None) -> dict[str, Any]:
+        if device == "nope":
+            raise ValueError("No input device matching 'nope'")
+        return {
+            "index": 0,
+            "name": "Microphone Array",
+            "hostapi": 0,
+            "max_input_channels": 2,
+            "default_samplerate": float(native_rate),
+        }
+
+    def query_hostapis(index: int | None = None) -> dict[str, Any]:
+        return {"name": host_api}
+
     def input_stream(**options: Any) -> SimpleNamespace:
         if options.get("device") == "nope":
             raise ValueError("No input device matching 'nope'")
+        extra = options.get("extra_settings")
+        converts = isinstance(extra, WasapiSettings) and extra.auto_convert
+        if accepts is not None and options["samplerate"] not in accepts and not converts:
+            raise PortAudioError("Error opening InputStream: Invalid sample rate", -9997)
         stream = SimpleNamespace(options=options, started=False, stopped=False, closed=False)
         stream.start = lambda: setattr(stream, "started", True)
         stream.stop = lambda: setattr(stream, "stopped", True)
@@ -113,7 +144,14 @@ def fake_sounddevice() -> tuple[SimpleNamespace, list[SimpleNamespace]]:
         streams.append(stream)
         return stream
 
-    return SimpleNamespace(InputStream=input_stream, PortAudioError=PortAudioError), streams
+    module = SimpleNamespace(
+        InputStream=input_stream,
+        PortAudioError=PortAudioError,
+        WasapiSettings=WasapiSettings,
+        query_devices=query_devices,
+        query_hostapis=query_hostapis,
+    )
+    return module, streams
 
 
 # --------------------------------------------------------------------------
@@ -461,6 +499,95 @@ def test_a_microphone_that_cannot_be_opened_fails_by_name(
 
     with pytest.raises(MicrophoneUnavailableError, match="nope"):
         SystemMicrophone(device="nope").open(lambda chunk: None)
+
+
+def test_a_wasapi_device_is_asked_to_convert_the_rate_itself(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """PortAudio runs a shared WASAPI stream at the mixer's rate - 48 kHz on
+    the target machine - and refuses 16 kHz unless told to convert. Measured
+    2026-09-05: `--device "Microphone Array WASAPI"` died on exactly this."""
+    module, streams = fake_sounddevice(
+        host_api="Windows WASAPI", native_rate=48_000, accepts={48_000}
+    )
+    monkeypatch.setitem(sys.modules, "sounddevice", module)
+
+    microphone = SystemMicrophone(device="Microphone Array WASAPI")
+    microphone.open(lambda chunk: None)
+
+    assert streams[0].options["samplerate"] == SAMPLE_RATE
+    assert streams[0].options["extra_settings"].auto_convert is True
+    assert microphone.rate == SAMPLE_RATE
+
+
+def test_other_host_apis_are_not_handed_wasapi_settings(monkeypatch: pytest.MonkeyPatch) -> None:
+    """PortAudio rejects a stream whose host-specific settings belong to
+    another host API, so the setting goes only where it is understood."""
+    module, streams = fake_sounddevice(host_api="MME")
+    monkeypatch.setitem(sys.modules, "sounddevice", module)
+
+    SystemMicrophone().open(lambda chunk: None)
+
+    assert streams[0].options.get("extra_settings") is None
+
+
+def test_a_device_that_will_not_run_at_16_khz_is_opened_at_its_own_rate(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Kernel streaming has no converter: `Microphone Array 1` runs at 48 kHz
+    or not at all (2026-09-05, "Invalid device"). The stream is opened at the
+    rate the device offers, still in 20 ms blocks, and brought to 16 kHz here."""
+    module, streams = fake_sounddevice(
+        host_api="Windows WDM-KS", native_rate=48_000, accepts={48_000}
+    )
+    monkeypatch.setitem(sys.modules, "sounddevice", module)
+
+    microphone = SystemMicrophone(device="Microphone Array 1")
+    microphone.open(lambda chunk: None)
+
+    assert streams[0].options["samplerate"] == 48_000
+    assert streams[0].options["blocksize"] == 960
+    assert microphone.rate == 48_000
+
+
+def test_blocks_from_a_48_khz_device_arrive_at_16_khz(monkeypatch: pytest.MonkeyPatch) -> None:
+    """What the state machine receives is what it always received: 16 kHz,
+    mono, twenty milliseconds at a time."""
+    module, streams = fake_sounddevice(
+        host_api="Windows WDM-KS", native_rate=48_000, accepts={48_000}
+    )
+    monkeypatch.setitem(sys.modules, "sounddevice", module)
+    heard: list[Audio] = []
+
+    SystemMicrophone(device="Microphone Array 1").open(heard.append)
+    callback = streams[0].options["callback"]
+    block = np.full((960, 1), 0.25, dtype=np.float32)
+    for _ in range(10):
+        callback(block, 960, None, None)
+
+    assert [len(chunk) for chunk in heard] == [CHUNK_FRAMES] * 10
+    assert float(heard[-1].mean()) == pytest.approx(0.25, abs=0.01)
+
+
+def test_a_device_that_runs_at_16_khz_is_left_alone(monkeypatch: pytest.MonkeyPatch) -> None:
+    module, streams = fake_sounddevice()
+    monkeypatch.setitem(sys.modules, "sounddevice", module)
+
+    microphone = SystemMicrophone()
+    microphone.open(lambda chunk: None)
+
+    assert microphone.rate == SAMPLE_RATE
+    assert streams[0].options["samplerate"] == SAMPLE_RATE
+
+
+def test_a_device_that_refuses_every_rate_is_still_a_sentence(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module, _ = fake_sounddevice(host_api="Windows WDM-KS", native_rate=48_000, accepts=set())
+    monkeypatch.setitem(sys.modules, "sounddevice", module)
+
+    with pytest.raises(MicrophoneUnavailableError, match="could not be opened"):
+        SystemMicrophone(device="Microphone Array 1").open(lambda chunk: None)
 
 
 def test_the_buffer_portaudio_hands_over_is_copied(monkeypatch: pytest.MonkeyPatch) -> None:
