@@ -24,9 +24,13 @@ left after that is judged by the decoder's own `no_speech_prob` per segment -
 a hallucinated credit over the trailing silence scores 0.9 next to a real
 sentence at 0.05 - and reported to the state machine as one number.
 
-One thing this deliberately does not do yet: it does not pass `initial_prompt`.
-Section 3.4's vocabulary trick arrives with the tools of phase 2, which are
-what put names into it.
+**The recogniser is told what to expect.** Section 3.4's free trick:
+`initial_prompt` is context for the decoder, and a list of the names it is
+likely to hear - the words of the locale pack's `[stt] vocabulary_hint`, then
+the shortest names in the app catalogue - makes "krom" come out as "Chrome"
+more often than not. The prompt window is about 224 tokens, so whoever builds
+the list keeps it short (`tools/system.py`, `PROMPT_NAMES`); the right length
+is measured in 2.8.
 """
 
 from __future__ import annotations
@@ -76,12 +80,17 @@ class LocalWhisper:
         device: str = "cpu",
         compute_type: str = "int8",
         cpu_threads: int = DEFAULT_CPU_THREADS,
+        vocabulary: Iterable[str] = (),
         build: ModelFactory | None = None,
     ) -> None:
         self._model_size = model_size
         self._device = device
         self._compute_type = compute_type
         self._cpu_threads = cpu_threads
+        # The words and names the decoder is told to expect, as one prompt.
+        # `None` rather than "" when there are none: that is the library's
+        # own way of saying "no prompt".
+        self._prompt = ", ".join(term.strip() for term in vocabulary if term.strip()) or None
         self._build = build if build is not None else self._load_whisper
         self._model: Model | None = None
         # Held while the model is built. Two turns starting at once would
@@ -123,7 +132,10 @@ class LocalWhisper:
         # `language=None` is what asks Whisper to detect the language itself.
         # `vad_filter` strips what its own detector calls silence before the
         # decoder sees it, so a recording of nothing decodes to nothing.
-        segments, info = self._model_now().transcribe(pcm, language=hint, vad_filter=True)
+        # `initial_prompt` is the vocabulary, or `None`.
+        segments, info = self._model_now().transcribe(
+            pcm, language=hint, vad_filter=True, initial_prompt=self._prompt
+        )
 
         # The generator is lazy: the inference happens here, inside the thread.
         # Handing it back undrained would move the work onto the event loop.

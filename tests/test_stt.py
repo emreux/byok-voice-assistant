@@ -462,3 +462,28 @@ def test_the_local_model_is_an_stt_provider() -> None:
 
     assert isinstance(stt, STTProvider)
     assert stt.supports_streaming is False
+
+
+# --------------------------------------------------------------------------
+# The vocabulary (2.2)
+# --------------------------------------------------------------------------
+
+
+async def test_the_vocabulary_reaches_the_model_as_one_prompt() -> None:
+    """Section 3.4's free trick: the names the decoder is told to expect,
+    joined into the one string the library takes. Blank terms are dropped."""
+    model = FakeModel()
+    stt = LocalWhisper(build=lambda: model, vocabulary=["aç, ayarlar", "Spotify", "  ", "Chrome"])
+
+    await stt.transcribe(silence())
+
+    assert model.calls[0][1]["initial_prompt"] == "aç, ayarlar, Spotify, Chrome"
+
+
+async def test_without_a_vocabulary_the_model_is_given_no_prompt() -> None:
+    """`None`, not an empty string: the library's own way of saying so."""
+    stt, model = whisper()
+
+    await stt.transcribe(silence())
+
+    assert model.calls[0][1]["initial_prompt"] is None

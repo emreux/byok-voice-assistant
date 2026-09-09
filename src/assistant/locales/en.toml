@@ -15,6 +15,9 @@ name = "English"
 # What the recogniser is told to expect. Usually `code`, but not always: this
 # is the language people *speak* to the assistant, not the one it shows them.
 language = "en"
+# Words the recogniser is told to expect before each sentence (design.md 3.4):
+# the commands people say most. The app names are added by the program.
+vocabulary_hint = "open, settings, music, next, previous, time, Bluetooth, Spotify"
 
 [tts.voice]
 # The preferred voice, matched against the names Windows actually lists. It is

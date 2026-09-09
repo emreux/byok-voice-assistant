@@ -9,6 +9,9 @@ name = "Türkçe"
 
 [stt]
 language = "tr"
+# Words the recogniser is told to expect before each sentence (design.md 3.4):
+# the commands people say most. The app names are added by the program.
+vocabulary_hint = "aç, ayarlar, müzik, sonraki, önceki, saat, Bluetooth, Spotify"
 
 [tts.voice]
 # Tolga is the voice Windows itself ships for Turkish. It lives in the

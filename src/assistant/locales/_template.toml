@@ -25,6 +25,13 @@ name = "Your language"
 # assistant, not the one it shows them.
 language = "xx"
 
+# A few words the recogniser is told to expect before each sentence: the
+# commands people say most, in your language, separated by commas. It helps
+# the recogniser hear "open" as open rather than as something that sounds
+# like it. Keep it short - the program adds the names of the installed apps
+# after it, and the recogniser reads only so much. Leave it empty if unsure.
+vocabulary_hint = "open, settings, music, next, previous, time"
+
 [tts.voice]
 # The preferred voice per speech engine, matched against the voices actually
 # installed on the machine. It is a preference, not an identifier: when it is

@@ -289,3 +289,27 @@ def test_a_language_windows_will_not_name_is_read_as_the_fallback() -> None:
 def test_the_language_windows_is_in_can_be_asked_for() -> None:
     assert system_code().isalpha()
     assert system_code() == system_code().casefold()
+
+
+# --------------------------------------------------------------------------
+# The vocabulary (2.2)
+# --------------------------------------------------------------------------
+
+
+def test_every_shipped_pack_gives_the_recogniser_words_to_expect() -> None:
+    """The commands people say most, for Whisper's `initial_prompt` (3.4)."""
+    for pack in available():
+        assert pack.stt_vocabulary, f"{pack.code} gives the recogniser no vocabulary"
+
+
+def test_the_vocabulary_comes_from_the_pack_that_was_asked_for(tmp_path: Path) -> None:
+    write(tmp_path, "de", '[stt]\nlanguage = "de"\nvocabulary_hint = " öffnen, Einstellungen "\n')
+
+    assert load("de", directory=tmp_path).stt_vocabulary == "öffnen, Einstellungen"
+
+
+def test_english_does_not_lend_its_vocabulary_either(tmp_path: Path) -> None:
+    """English command words would not help a German be understood."""
+    write(tmp_path, "en", '[stt]\nlanguage = "en"\nvocabulary_hint = "open, settings"\n')
+
+    assert load("de", directory=tmp_path).stt_vocabulary == ""
