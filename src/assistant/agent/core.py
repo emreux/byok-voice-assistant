@@ -36,10 +36,11 @@ request instead of living in the history, which keeps it out of reach of the
 window and byte-identical from turn to turn - the one thing prompt caching
 needs (architecture guide section 2).
 
-The limit on tool calls below is the first of the limits of section 3.11 and
-moves to `limits.py` with the rest of them in 2.4. It belongs beside this file
-rather than inside an adapter: written in an adapter it would be written three
-times, and one of the three would be forgotten.
+The loop has no exit of its own, so it does not count for itself: the limits
+of section 3.11 live beside this file in `limits.py`, and a `TurnGuard` is
+asked before every call. Beside this file rather than inside an adapter,
+because written in an adapter they would be written three times, and one of
+the three would be forgotten (invariant 3).
 """
 
 from __future__ import annotations
@@ -48,13 +49,12 @@ from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import dataclass
 from typing import Protocol
 
+from assistant.agent.limits import Limits, TurnGuard
 from assistant.agent.prompts import SYSTEM_PROMPT
-from assistant.llm.base import LLMProvider, Message, ToolCall, ToolSpec, Usage
+from assistant.llm.base import LLMProvider, Message, ToolCall, ToolSpec, Usage, was_cut_off
 from assistant.tools.registry import ToolRegistry
 
 __all__ = [
-    "MAX_TOOL_CALLS",
-    "TOOL_LIMIT_REACHED",
     "WINDOW_TURNS",
     "Agent",
     "Answer",
@@ -68,15 +68,6 @@ __all__ = [
 # roughly with the square of a conversation's length, because every turn resends
 # every turn before it; this is the ceiling that stops it.
 WINDOW_TURNS = 12
-
-# How many tool calls one turn may make before the model is made to answer with
-# what it has (section 3.11). A model that keeps asking is a model in a loop,
-# and every round is a request paid for. Moves to `limits.py` in 2.4.
-MAX_TOOL_CALLS = 8
-
-# What a call over the limit is answered with - as a tool result, in the
-# model's own channel, rather than as a user message it might argue with.
-TOOL_LIMIT_REACHED = "Tool limit reached; answer with what you have."
 
 
 # Asks the user a question out loud and answers yes or no. Who actually asks
@@ -103,19 +94,23 @@ class Dispatch(Protocol):
 
 @dataclass(frozen=True, slots=True)
 class Answer:
-    """What one turn produced: the words, what they cost, and why it ended.
+    """What one turn produced: the words, what they cost, and how it ended.
 
     `usage` is the total over every request the turn made - a turn that ran
-    a tool made at least two - and is what item 1.11 writes to the log and
-    section 6 later bills from. `finish_reason` is that of the last request,
-    kept so that an answer that ended can be told apart from one cut off at
-    the token limit. Nothing reads it yet: the sentence by sentence speech of
-    2.8 is where a cut-off answer has to be said out loud.
+    a tool made at least two - and is what `usage_log` bills from (section
+    6). `finish_reason` is that of the last request, in the provider's own
+    word; `cut_off` is what that word means when it means "the token limit
+    of section 3.11 ended the answer", so that `app.py` can say so out loud
+    - a sentence that stops halfway with nothing said about it is a bug
+    nobody can find. `tool_calls` is how many calls the gate ran, for the
+    log.
     """
 
     text: str
     usage: Usage
     finish_reason: str | None
+    cut_off: bool = False
+    tool_calls: int = 0
 
 
 @dataclass(frozen=True, slots=True)
@@ -144,6 +139,7 @@ class Agent:
         system_prompt: str = SYSTEM_PROMPT,
         tools: ToolRegistry | None = None,
         dispatch: Dispatch | None = None,
+        limits: Limits | None = None,
     ) -> None:
         if tools is not None and dispatch is None:
             # A tool offered without a gate is a tool that would run without
@@ -154,6 +150,7 @@ class Agent:
         self._system = Message.system(system_prompt)
         self._tools = tools
         self._dispatch = dispatch
+        self._limits = limits if limits is not None else Limits()
         self._history: list[Message] = []
 
     async def reply(self, said: str, *, turn_id: str = "", confirm: Confirm = decline) -> Answer:
@@ -166,12 +163,13 @@ class Agent:
         """
         conversation = window([*self._history, Message.user(said)])
         spent = Usage()
-        dispatched = 0
+        ran = 0
+        guard = TurnGuard(self._limits)
 
         while True:
             # Past the limit the model is offered nothing, so the only thing
             # left for it to do is answer.
-            offered = self._offered() if dispatched < MAX_TOOL_CALLS else []
+            offered = [] if guard.exhausted else self._offered()
             got = await self._ask(conversation, offered)
             spent = spent + got.usage
 
@@ -182,11 +180,15 @@ class Agent:
 
             conversation.append(Message.assistant(got.text, got.tool_calls))
             for call in got.tool_calls:
-                if dispatched < MAX_TOOL_CALLS:
+                # The guard answers first: a call over the limit, or the same
+                # call once too often in a row, gets its sentence instead of
+                # a run (section 3.11).
+                refused = guard.allow(call)
+                if refused is None:
                     result = await self._dispatch(call, turn_id=turn_id, confirm=confirm)
-                    dispatched += 1
+                    ran += 1
                 else:
-                    result = TOOL_LIMIT_REACHED
+                    result = refused
                 conversation.append(Message.tool_result(call, result))
 
         # A model that produced no text said nothing, and a message with no
@@ -196,7 +198,13 @@ class Agent:
         # results - is remembered with it, so the model knows what it did.
         if got.text:
             self._history = [*conversation, Message.assistant(got.text)]
-        return Answer(text=got.text, usage=spent, finish_reason=got.finish_reason)
+        return Answer(
+            text=got.text,
+            usage=spent,
+            finish_reason=got.finish_reason,
+            cut_off=was_cut_off(got.finish_reason),
+            tool_calls=ran,
+        )
 
     def _offered(self) -> list[ToolSpec]:
         return [] if self._tools is None else self._tools.specs()
@@ -206,7 +214,9 @@ class Agent:
 
         The whole reply is waited for before anything is spoken (section 4
         says so and budgets for it); sentence-by-sentence speech is 2.8, and
-        `tts.base` already has the regrouping it needs.
+        `tts.base` already has the regrouping it needs. The output token
+        limit of section 3.11 goes to the provider here, which is where an
+        answer can actually be stopped.
         """
         spoken: list[str] = []
         calls: list[ToolCall] = []
@@ -214,7 +224,10 @@ class Agent:
         finish_reason: str | None = None
 
         async for delta in self._provider.stream(
-            [self._system, *conversation], tools, model=self._model
+            [self._system, *conversation],
+            tools,
+            model=self._model,
+            max_tokens=self._limits.output_tokens,
         ):
             if delta.text:
                 spoken.append(delta.text)

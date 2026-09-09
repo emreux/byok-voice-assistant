@@ -36,6 +36,7 @@ __all__ = [
     "ToolCall",
     "ToolSpec",
     "Usage",
+    "was_cut_off",
 ]
 
 Role = Literal["system", "user", "assistant", "tool"]
@@ -215,6 +216,21 @@ class Delta:
     tool_call: ToolCall | None = None
     finish_reason: str | None = None
     usage: Usage | None = None
+
+
+# The word each vendor uses when the output token limit ended the answer
+# rather than the model: Anthropic `max_tokens`, OpenAI `length`, Gemini
+# `MAX_TOKENS`. An adapter passes its vendor's word through untouched in
+# `Delta.finish_reason`; this is the one place the three are read as one.
+_CUT_OFF = frozenset({"max_tokens", "length"})
+
+
+def was_cut_off(finish_reason: str | None) -> bool:
+    """Whether `finish_reason` says the token limit ended the answer (section 3.11).
+
+    The case is the vendor's own and is not held against it.
+    """
+    return finish_reason is not None and finish_reason.casefold() in _CUT_OFF
 
 
 @runtime_checkable

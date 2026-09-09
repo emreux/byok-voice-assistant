@@ -18,9 +18,11 @@ from pathlib import Path
 
 import pytest
 
+from assistant.agent.limits import Limits
 from assistant.config import (
     KEYRING_SERVICE,
     AudioSettings,
+    LimitSettings,
     LLMSettings,
     LocaleSettings,
     Settings,
@@ -165,6 +167,38 @@ def test_a_primary_without_a_provider_is_refused() -> None:
     """Left unchecked this reads as a provider named after the model, with no model."""
     with pytest.raises(ValueError, match="provider:model"):
         LLMSettings(primary="gemini-3.5-flash-lite")
+
+
+def test_the_limits_round_trip_through_the_file(config_home: Path) -> None:
+    save_settings(
+        Settings(limits=LimitSettings(daily_usd=5.0, hard_stop=True, tool_calls_per_turn=3))
+    )
+
+    limits = load_settings().limits
+
+    assert (limits.daily_usd, limits.hard_stop, limits.tool_calls_per_turn) == (5.0, True, 3)
+
+
+def test_the_limits_default_to_the_table_of_section_3_11(config_home: Path) -> None:
+    """Written once, in `agent/limits.py`; the file's defaults are read off it."""
+    assert Limits.from_settings(load_settings().limits) == Limits()
+
+
+def test_a_file_written_before_there_was_a_limits_table_still_loads(config_home: Path) -> None:
+    config_path().parent.mkdir(parents=True, exist_ok=True)
+    config_path().write_text('[llm]\nprimary = "gemini:x"\n', encoding="utf-8")
+
+    assert load_settings().limits == LimitSettings()
+
+
+def test_one_limit_in_the_file_leaves_the_others_at_their_defaults(config_home: Path) -> None:
+    config_path().parent.mkdir(parents=True, exist_ok=True)
+    config_path().write_text("[limits]\nhard_stop = true\n", encoding="utf-8")
+
+    limits = load_settings().limits
+
+    assert limits.hard_stop is True
+    assert limits.daily_usd == LimitSettings().daily_usd
 
 
 def test_the_locale_defaults_to_english(config_home: Path) -> None:

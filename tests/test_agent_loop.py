@@ -23,6 +23,11 @@ just costs more.
 **A turn that failed did not happen.** History is written once the answer is
 whole, so a dropped connection, the sixty second `THINKING` timeout of section
 3.1 or a cancelled turn leaves the conversation exactly as it was.
+
+**The loop does not count for itself.** The limits of section 3.11 come in
+through `Limits` and are kept by a guard the loop asks before every call;
+what the guard decides is `test_limits.py`'s, what the loop does with the
+decision is here.
 """
 
 from __future__ import annotations
@@ -37,15 +42,8 @@ from pathlib import Path
 import pytest
 
 from assistant.agent import prompts
-from assistant.agent.core import (
-    MAX_TOOL_CALLS,
-    TOOL_LIMIT_REACHED,
-    WINDOW_TURNS,
-    Agent,
-    Confirm,
-    decline,
-    window,
-)
+from assistant.agent.core import WINDOW_TURNS, Agent, Confirm, decline, window
+from assistant.agent.limits import DUPLICATE_CALL, TOOL_LIMIT_REACHED, Limits
 from assistant.agent.prompts import (
     BREVITY,
     LANGUAGE_FALLBACK,
@@ -66,6 +64,7 @@ class Request:
     messages: list[Message]
     tools: list[ToolSpec]
     model: str
+    max_tokens: int
 
     @property
     def turns(self) -> list[Message]:
@@ -107,7 +106,9 @@ class ScriptedProvider:
         temperature: float | None = None,
         max_tokens: int = 4096,
     ) -> AsyncIterator[Delta]:
-        self.calls.append(Request(messages=list(messages), tools=list(tools), model=model))
+        self.calls.append(
+            Request(messages=list(messages), tools=list(tools), model=model, max_tokens=max_tokens)
+        )
         turn = self._turns.pop(0) if self._turns else [Delta(text="Tamam.")]
 
         for item in turn:
@@ -398,6 +399,7 @@ async def calendar() -> str:
 
 
 TOOLS = ToolRegistry([clock, calendar])
+LIMIT = Limits().tool_calls_per_turn
 
 
 class FakeGate:
@@ -420,9 +422,15 @@ class FakeGate:
         return f"{call.name}: done"
 
 
-def asks(name: str, call_id: str = "c1") -> Delta:
+def asks(name: str, call_id: str = "c1", **arguments: object) -> Delta:
     """The model asking for `name`, as a provider streams it."""
-    return Delta(tool_call=ToolCall(id=call_id, name=name, arguments={}))
+    return Delta(tool_call=ToolCall(id=call_id, name=name, arguments=arguments))
+
+
+def rounds(count: int) -> list[list[Delta]]:
+    """`count` rounds of one call each, every one with an argument of its own,
+    so that the repeat check of 2.4 stays out of a test about the ceiling."""
+    return [[asks("clock", f"c{n}", n=n)] for n in range(count)]
 
 
 def with_tools(provider: ScriptedProvider, gate: FakeGate | None = None) -> Agent:
@@ -503,12 +511,12 @@ async def test_at_the_limit_the_model_is_offered_nothing_and_left_to_answer() ->
     round is a request paid for. After the eighth call the ninth request
     offers no tools, so the only thing left to do is answer."""
     gate = FakeGate()
-    provider = ScriptedProvider(*([[asks("clock")]] * MAX_TOOL_CALLS), [Delta(text="Yeter.")])
+    provider = ScriptedProvider(*rounds(LIMIT), [Delta(text="Yeter.")])
 
     answer = await with_tools(provider, gate).reply("dön dur")
 
-    assert len(gate.calls) == MAX_TOOL_CALLS
-    assert len(provider.calls) == MAX_TOOL_CALLS + 1
+    assert len(gate.calls) == LIMIT
+    assert len(provider.calls) == LIMIT + 1
     assert all(request.tools == TOOLS.specs() for request in provider.calls[:-1])
     assert provider.calls[-1].tools == []
     assert answer.text == "Yeter."
@@ -518,12 +526,12 @@ async def test_a_call_made_after_being_offered_nothing_ends_the_turn() -> None:
     """A model that ignores an empty tool list is not argued with: the turn
     ends with whatever words there are, rather than going round for ever."""
     gate = FakeGate()
-    provider = ScriptedProvider(*([[asks("clock")]] * (MAX_TOOL_CALLS + 5)))
+    provider = ScriptedProvider(*rounds(LIMIT + 5))
 
     answer = await with_tools(provider, gate).reply("dön dur")
 
-    assert len(gate.calls) == MAX_TOOL_CALLS
-    assert len(provider.calls) == MAX_TOOL_CALLS + 1
+    assert len(gate.calls) == LIMIT
+    assert len(provider.calls) == LIMIT + 1
     assert answer.text == ""
 
 
@@ -532,14 +540,14 @@ async def test_a_call_over_the_limit_is_answered_with_the_limit_and_not_run() ->
     and the model is told so in the one channel it has to read."""
     gate = FakeGate()
     provider = ScriptedProvider(
-        *([[asks("clock")]] * (MAX_TOOL_CALLS - 1)),
-        [asks("clock", "c8"), asks("calendar", "c9")],
+        *rounds(LIMIT - 1),
+        [asks("clock", "c8", n=8), asks("calendar", "c9")],
         [Delta(text="Tamam.")],
     )
 
     answer = await with_tools(provider, gate).reply("dön dur")
 
-    assert len(gate.calls) == MAX_TOOL_CALLS
+    assert len(gate.calls) == LIMIT
     assert [call.name for call in gate.calls][-1] == "clock"
     refused = provider.calls[-1].turns[-1]
     assert (refused.tool_name, refused.content) == ("calendar", TOOL_LIMIT_REACHED)
@@ -548,7 +556,7 @@ async def test_a_call_over_the_limit_is_answered_with_the_limit_and_not_run() ->
 
 
 async def test_the_limit_is_the_eight_calls_section_3_11_asks_for() -> None:
-    assert MAX_TOOL_CALLS == 8
+    assert LIMIT == 8
 
 
 async def test_a_turn_that_ran_a_tool_is_remembered_whole() -> None:
@@ -625,3 +633,117 @@ async def test_with_nobody_to_ask_the_answer_is_no() -> None:
     [confirm] = gate.confirms
     assert confirm is decline
     assert await confirm("Spotify will be opened.") is False
+
+
+# --------------------------------------------------------------------------
+# The limits of section 3.11 (2.4): the loop asks the guard and tells the provider
+# --------------------------------------------------------------------------
+
+
+async def test_the_same_call_once_too_often_is_refused_in_the_tool_s_channel_and_not_run() -> None:
+    """Architecture guide section 12: the model reads the refusal as the
+    tool's answer and changes course."""
+    gate = FakeGate()
+    provider = ScriptedProvider(
+        [asks("clock", "c1")], [asks("clock", "c2")], [asks("clock", "c3")], [Delta(text="Peki.")]
+    )
+
+    answer = await with_tools(provider, gate).reply("saat kaç, emin misin?")
+
+    assert len(gate.calls) == 2
+    refused = provider.calls[-1].turns[-1]
+    assert (refused.tool_name, refused.content) == ("clock", DUPLICATE_CALL.format(times=2))
+    assert answer.text == "Peki."
+
+
+async def test_a_different_call_in_between_starts_the_count_again() -> None:
+    gate = FakeGate()
+    provider = ScriptedProvider(
+        [asks("clock", "c1")],
+        [asks("clock", "c2")],
+        [asks("calendar", "c3")],
+        [asks("clock", "c4")],
+        [asks("clock", "c5")],
+        [Delta(text="Peki.")],
+    )
+
+    await with_tools(provider, gate).reply("dön dur")
+
+    assert len(gate.calls) == 5
+
+
+async def test_a_model_repeating_itself_is_not_given_unlimited_rounds() -> None:
+    """Every refused repeat counts towards the turn's calls: with three calls
+    allowed and one repeat, the fourth request offers no tools."""
+    gate = FakeGate()
+    provider = ScriptedProvider(*([[asks("clock")]] * 6))
+    limits = Limits(tool_calls_per_turn=3, duplicate_calls=1)
+    agent = Agent(provider, model=MODEL, tools=TOOLS, dispatch=gate, limits=limits)
+
+    await agent.reply("dön dur")
+
+    assert len(gate.calls) == 1
+    assert len(provider.calls) == 4
+    assert provider.calls[-1].tools == []
+
+
+async def test_the_limits_are_the_agent_s_to_be_given() -> None:
+    """From `config.toml`, through the composition root. A test that says
+    nothing gets the defaults of section 3.11."""
+    gate = FakeGate()
+    provider = ScriptedProvider(*rounds(5))
+    agent = Agent(
+        provider, model=MODEL, tools=TOOLS, dispatch=gate, limits=Limits(tool_calls_per_turn=2)
+    )
+
+    await agent.reply("dön dur")
+
+    assert len(gate.calls) == 2
+
+
+async def test_the_output_token_limit_goes_to_the_provider_with_every_request() -> None:
+    """The provider is where an answer can actually be stopped: the number
+    is ours, the stopping is theirs (invariant 3)."""
+    provider = ScriptedProvider([asks("clock")], [Delta(text="Üç.")])
+    limits = Limits(output_tokens=1234)
+    agent = Agent(provider, model=MODEL, tools=TOOLS, dispatch=FakeGate(), limits=limits)
+
+    await agent.reply("saat kaç?")
+
+    assert [request.max_tokens for request in provider.calls] == [1234, 1234]
+
+
+async def test_the_default_output_limit_is_the_four_thousand_tokens_of_section_3_11() -> None:
+    provider = ScriptedProvider([Delta(text="Tamam.")])
+
+    await Agent(provider, model=MODEL).reply("selam")
+
+    assert provider.calls[-1].max_tokens == 4000
+
+
+@pytest.mark.parametrize(
+    ("reason", "cut_off"),
+    [("MAX_TOKENS", True), ("length", True), ("max_tokens", True), ("STOP", False), (None, False)],
+)
+async def test_an_answer_the_token_limit_ended_is_marked_as_cut_off(
+    reason: str | None, cut_off: bool
+) -> None:
+    """In each vendor's own word - Gemini's, OpenAI's, Anthropic's - read as
+    one, so that `app.py` can say so without knowing which answered."""
+    provider = ScriptedProvider([Delta(text="Uzun cevabın başı"), Delta(finish_reason=reason)])
+
+    answer = await Agent(provider, model=MODEL).reply("anlat")
+
+    assert answer.cut_off is cut_off
+
+
+async def test_the_calls_the_gate_ran_are_counted_for_the_log() -> None:
+    """Ran, not asked for: a refused repeat is not a call that ran."""
+    gate = FakeGate()
+    provider = ScriptedProvider(
+        [asks("clock", "c1")], [asks("clock", "c2")], [asks("clock", "c3")], [Delta(text="Peki.")]
+    )
+
+    answer = await with_tools(provider, gate).reply("dön dur")
+
+    assert answer.tool_calls == 2

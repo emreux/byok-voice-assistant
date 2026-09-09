@@ -35,11 +35,14 @@ from pydantic_settings import (
     TomlConfigSettingsSource,
 )
 
+from assistant.agent.limits import Limits
+
 __all__ = [
     "CONFIG_DIR_ENV",
     "KEYRING_SERVICE",
     "AudioSettings",
     "LLMSettings",
+    "LimitSettings",
     "LocaleSettings",
     "Settings",
     "ToolSettings",
@@ -177,6 +180,32 @@ class ToolSettings(BaseModel):
     unblocked: list[str] = []
 
 
+# The numbers of section 3.11 are written once, in `agent/limits.py`; the
+# file's defaults are read off them so that the two cannot drift apart.
+_LIMITS = Limits()
+
+
+class LimitSettings(BaseModel):
+    """The `[limits]` table: what a turn may do and what a day may cost (section 3.11).
+
+    A table left out, or a key left out, means the default - so a
+    `config.toml` written before 2.4 keeps its meaning. `hard_stop` is the
+    one that changes what the assistant does rather than what it says:
+    with it on, a limit passed means the model is not asked at all.
+    """
+
+    model_config = ConfigDict(extra="ignore")
+
+    tool_calls_per_turn: int = _LIMITS.tool_calls_per_turn
+    output_tokens: int = _LIMITS.output_tokens
+    duplicate_calls: int = _LIMITS.duplicate_calls
+    turn_seconds: float = _LIMITS.turn_seconds
+    daily_usd: float = _LIMITS.daily_usd
+    monthly_usd: float = _LIMITS.monthly_usd
+    hard_stop: bool = _LIMITS.hard_stop
+    duplicate_window_sec: int = _LIMITS.duplicate_window_sec
+
+
 class Settings(BaseSettings):
     """Everything phase 1 stores. There is deliberately no field for a key."""
 
@@ -192,6 +221,7 @@ class Settings(BaseSettings):
     locale: LocaleSettings = LocaleSettings()
     audio: AudioSettings = AudioSettings()
     tools: ToolSettings = ToolSettings()
+    limits: LimitSettings = LimitSettings()
 
     @classmethod
     def settings_customise_sources(
