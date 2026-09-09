@@ -8,10 +8,12 @@ half-built table nor a version claiming it was built. Nothing is ever edited
 in place: a change to a table is a new entry at the end, because a database
 on somebody's machine has already run the old one.
 
-Phase 2.1d opens the list with `tool_audit` alone. The columns other steps
-need come as their own entries when those steps arrive - `args_hash` for the
-duplicate check of 2.4, `source` for MCP in phase 5 - and `usage_log` and
-`settings` with the steps that first read them (2.4 and 2.6).
+Phase 2.1d opened the list with `tool_audit` alone. Phase 2.4 is the second
+entry, and the first real use of the mechanism: the owner's database was at
+version 1 with rows in it, and came up to version 2 with those rows intact
+and a new column beside them. The columns other steps need come the same way
+when those steps arrive - `source` for MCP in phase 5 - and `settings` with
+the probe of 2.6.
 """
 
 from __future__ import annotations
@@ -40,6 +42,29 @@ MIGRATIONS: tuple[str, ...] = (
         finished_at    INTEGER
     );
     CREATE INDEX tool_audit_turn ON tool_audit(turn_id);
+    """,
+    # 2 - the repeat check and the bill (section 3.11, section 6).
+    # `args_hash` is the fingerprint of a call's arguments, so that "the same
+    # call a minute ago" is one indexed lookup; rows from before this
+    # migration have none and are never "the same call" again, which is the
+    # honest reading of them. `usage_log` is one row per turn that reached
+    # the model; `cost_usd` is NULL for a model with no known price, never a
+    # made-up zero.
+    """
+    ALTER TABLE tool_audit ADD COLUMN args_hash TEXT;
+    CREATE INDEX tool_audit_repeat ON tool_audit(tool, args_hash, ts);
+    CREATE TABLE usage_log (
+        id            INTEGER PRIMARY KEY,
+        ts            INTEGER NOT NULL,
+        provider      TEXT    NOT NULL,
+        model         TEXT    NOT NULL,
+        in_tokens     INTEGER NOT NULL,
+        out_tokens    INTEGER NOT NULL,
+        cached_tokens INTEGER NOT NULL,
+        cost_usd      REAL,
+        turn_id       TEXT    NOT NULL
+    );
+    CREATE INDEX usage_log_ts ON usage_log(ts);
     """,
 )
 
