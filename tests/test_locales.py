@@ -24,6 +24,7 @@ from typing import Any
 from assistant import __main__ as cli
 from assistant import app, locales, setup_wizard
 from assistant.agent import policy
+from assistant.agent.intents import INTENTS
 from assistant.locales import FALLBACK_CODE, available, iso_code, load, system_code
 from assistant.ui import status
 
@@ -98,9 +99,11 @@ def test_a_pack_is_filed_under_the_name_of_its_own_file() -> None:
 def test_english_is_not_written_down_twice() -> None:
     """`en.toml` carries no sentences: English is already the constant the
     chain ends at, and a second copy is a second thing to keep in step. The
-    same goes for the yes and no words the window listens for."""
+    same goes for the yes and no words the window listens for, and for the
+    short commands the fast path answers."""
     assert "ui" not in read(PACKAGED / "en.toml")
     assert "speech" not in read(PACKAGED / "en.toml")
+    assert "intents" not in read(PACKAGED / "en.toml")
 
 
 def test_the_template_offers_every_sentence_a_translator_has_to_write() -> None:
@@ -361,3 +364,56 @@ def test_words_of_the_wrong_shape_are_read_as_far_as_they_make_sense(tmp_path: P
     pack = load("de", directory=tmp_path)
 
     assert (pack.yes_words, pack.no_words) == ((), ("nein",))
+
+
+# --------------------------------------------------------------------------
+# The short commands (2.5)
+# --------------------------------------------------------------------------
+
+
+def test_turkish_knows_its_short_commands() -> None:
+    """The fast path of section 4 listens for these; a pack without them
+    would send "saat kaç" to the model like any other sentence."""
+    pack = load("tr")
+
+    assert set(pack.intents) == set(INTENTS)
+    assert all(pack.intents[name] for name in INTENTS)
+
+
+def test_the_template_offers_the_commands_a_translator_has_to_fill() -> None:
+    assert set(read(PACKAGED / "_template.toml")["intents"]) == set(INTENTS)
+
+
+def test_a_pack_lists_only_commands_the_product_can_answer() -> None:
+    """An intent nothing in the code answers is a phrase nobody will hear."""
+    for path in shipped():
+        offered = set(read(path).get("intents", {}))
+        assert offered <= set(INTENTS), f"{path.name} lists {offered - set(INTENTS)}"
+
+
+def test_the_short_commands_come_from_the_pack(tmp_path: Path) -> None:
+    write(
+        tmp_path,
+        "de",
+        '[intents]\nget_time = ["wie spät ist es", " wieviel uhr "]\nstop = ["halt"]\n',
+    )
+
+    pack = load("de", directory=tmp_path)
+
+    assert pack.intents == {"get_time": ("wie spät ist es", "wieviel uhr"), "stop": ("halt",)}
+
+
+def test_a_pack_without_them_leaves_the_commands_to_the_code(tmp_path: Path) -> None:
+    """Like the yes and no words: the English phrases live beside the code
+    that answers them (`agent/intents.py`), and English lends none."""
+    write(tmp_path, "en", '[intents]\nstop = ["stop"]\n')
+
+    assert load("de", directory=tmp_path).intents == {}
+
+
+def test_commands_of_the_wrong_shape_are_read_as_far_as_they_make_sense(tmp_path: Path) -> None:
+    """A list that is not a list, a word that is not a word, a list of
+    nothing: each falls back on its own to the English beside the code."""
+    write(tmp_path, "de", '[intents]\nget_time = "wie spät"\nstop = ["halt", 3, ""]\ncancel = []\n')
+
+    assert load("de", directory=tmp_path).intents == {"stop": ("halt",)}

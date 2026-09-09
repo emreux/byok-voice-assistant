@@ -25,7 +25,7 @@ import ctypes
 import locale as windows
 import tomllib
 from collections.abc import Iterator, Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from importlib import resources
 from pathlib import Path
 from typing import Any
@@ -80,6 +80,14 @@ class Locale:
     yes_words: tuple[str, ...] = ()
     no_words: tuple[str, ...] = ()
 
+    # The short commands answered without the model, from `[intents]`
+    # (design.md section 4): the English name of the intent, to the phrases
+    # that mean it in this language. They fall back like the yes and no
+    # words, intent by intent - a pack that lists none for an intent gets
+    # the English phrases beside the code that answers it
+    # (`agent/intents.py`), and `en.toml` carries none for that reason.
+    intents: Mapping[str, tuple[str, ...]] = field(default_factory=dict)
+
     def voice(self, engine: str) -> str | None:
         """The voice this locale prefers for `engine`, if it names one."""
         return self.voices.get(engine) or None
@@ -114,6 +122,7 @@ def load(code: str | None = None, *, directory: Path | None = None) -> Locale:
         stt_vocabulary=_text(_table(pack, "stt"), "vocabulary_hint").strip(),
         yes_words=_words(_table(pack, "speech"), "yes_words"),
         no_words=_words(_table(pack, "speech"), "no_words"),
+        intents=_word_lists(_table(pack, "intents")),
     )
 
 
@@ -228,6 +237,13 @@ def _words(values: Mapping[str, Any], key: str) -> tuple[str, ...]:
     if not isinstance(found, list):
         return ()
     return tuple(word.strip() for word in found if isinstance(word, str) and word.strip())
+
+
+def _word_lists(values: Mapping[str, Any]) -> dict[str, tuple[str, ...]]:
+    """Every list of words in a table, by key; a key with nothing usable
+    under it is left out, so that the code's own list answers for it."""
+    lists = {key: _words(values, key) for key in values}
+    return {key: words for key, words in lists.items() if words}
 
 
 def _ui_language_id() -> int:

@@ -19,6 +19,14 @@ vocabulary_hint = "aç, ayarlar, müzik, sonraki, önceki, saat, Bluetooth, Spot
 yes_words = ["evet", "onaylıyorum", "tamam", "olur"]
 no_words = ["hayır", "iptal", "vazgeç", "olmaz"]
 
+[intents]
+# Short commands answered without asking the model (design.md 4): the name
+# of the intent, then the phrases that mean it, each matched whole. "saat
+# kaçta toplantım var" is not "saat kaçta" and goes to the model.
+get_time = ["saat kaç", "saat kaçta"]
+stop = ["dur", "sus", "kes"]
+cancel = ["iptal", "vazgeç", "boş ver"]
+
 [tts.voice]
 # Tolga is the voice Windows itself ships for Turkish. It lives in the
 # Speech_OneCore registry hive, which `tts/sapi.py` reads on purpose.

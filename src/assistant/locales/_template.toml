@@ -40,6 +40,19 @@ vocabulary_hint = "open, settings, music, next, previous, time"
 yes_words = ["yes", "ok", "okay", "confirm"]
 no_words = ["no", "cancel", "stop"]
 
+[intents]
+# The short commands the assistant answers on its own, without asking the
+# model (design.md 4): the time, stop, cancel. The key on the left is the
+# name of the intent and stays as it is; the list holds the phrases people
+# say for it in your language, as the speech recogniser would write them.
+# A phrase is matched whole - a sentence that merely contains it goes to
+# the model - so list the short forms people actually say. Case, accents
+# and punctuation do not matter. Leave the table out and the English
+# phrases are used.
+get_time = ["what time is it"]
+stop = ["stop"]
+cancel = ["cancel"]
+
 [tts.voice]
 # The preferred voice per speech engine, matched against the voices actually
 # installed on the machine. It is a preference, not an identifier: when it is
