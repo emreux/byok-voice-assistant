@@ -20,7 +20,7 @@ from __future__ import annotations
 import asyncio
 import sqlite3
 import sys
-from collections.abc import Iterator
+from collections.abc import Iterable, Iterator
 from dataclasses import dataclass, field
 from io import StringIO
 from pathlib import Path
@@ -46,6 +46,8 @@ from assistant.config import (
 from assistant.llm.base import ToolCall, Usage
 from assistant.store import db
 from assistant.stt import local_whisper
+from assistant.tools import system
+from assistant.tools.system import AppCatalog, AppEntry
 from assistant.ui import status
 from tests.conftest import MemoryKeyring
 
@@ -87,6 +89,8 @@ class Wiring:
     gates: list[Any] = field(default_factory=list)
     microphones: list[Any] = field(default_factory=list)
     databases: list[sqlite3.Connection] = field(default_factory=list)
+    # What the speech model was told to expect (2.2).
+    vocabularies: list[list[str]] = field(default_factory=list)
     stop: BaseException | None = None
 
 
@@ -105,8 +109,15 @@ def wiring(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Wiring:
         return connection
 
     class FakeWhisper:
+        def __init__(self, *, vocabulary: Iterable[str] = ()) -> None:
+            seen.vocabularies.append(list(vocabulary))
+
         async def load(self) -> None:
             seen.happened.append("speech model")
+
+    async def catalogue_here(**_: Any) -> AppCatalog:
+        seen.happened.append("app catalogue")
+        return AppCatalog(INSTALLED)
 
     class FakeAgent:
         def __init__(self, provider: Any, *, model: str, **rest: Any) -> None:
@@ -137,12 +148,20 @@ def wiring(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Wiring:
             parts["on_turn"](TURN)
 
     monkeypatch.setattr(local_whisper, "LocalWhisper", FakeWhisper)
+    monkeypatch.setattr(system.AppCatalog, "load", catalogue_here)
     monkeypatch.setattr(capture, "SystemMicrophone", FakeMicrophone)
     monkeypatch.setattr(core, "Agent", FakeAgent)
     monkeypatch.setattr(app, "Assistant", FakeAssistant)
     monkeypatch.setattr(db, "database_path", lambda: tmp_path / "data" / "assistant.db")
     monkeypatch.setattr(db, "open_database", open_here)
     return seen
+
+
+# What the machine is pretended to have, so that no test scans the real one.
+INSTALLED = [
+    AppEntry("Spotify", r"shell:AppsFolder\SpotifyAB.SpotifyMusic_zpdnekdrzrea0!Spotify"),
+    AppEntry("Google Chrome", r"C:\Programs\Google Chrome.lnk"),
+]
 
 
 def said(key: str, code: str = "tr") -> str:
@@ -322,21 +341,33 @@ def test_the_speech_model_is_ready_before_the_assistant_is(
 ) -> None:
     """Loading Whisper at the first press would swallow the first sentence.
     The database comes first of all: cheap, and a disk that refuses is
-    better found out about before two seconds of four cores are spent."""
+    better found out about before two seconds of four cores are spent. The
+    app catalogue comes before the speech model, which is told its names."""
     main(["run"])
 
-    assert wiring.happened == ["database", "speech model", "assistant"]
+    assert wiring.happened == ["database", "app catalogue", "speech model", "assistant"]
 
 
 # --------------------------------------------------------------------------
-# run: the tools, the gate and the database (2.1c, 2.1d)
+# run: the tools, the gate and the database (2.1c, 2.1d, 2.2)
 # --------------------------------------------------------------------------
 
 
-def test_the_first_tool_is_on_offer(configured: Path, wiring: Wiring) -> None:
+def test_every_tool_of_phase_two_is_on_offer(configured: Path, wiring: Wiring) -> None:
     main(["run"])
 
-    assert wiring.tools == [["get_current_time"]]
+    assert wiring.tools == [
+        ["get_current_time", "open_app", "open_url", "open_settings", "media_control"]
+    ]
+
+
+def test_the_speech_model_is_told_the_locales_words_and_the_apps_names(
+    configured: Path, wiring: Wiring
+) -> None:
+    """Section 3.4: the pack's `vocabulary_hint` first, then the catalogue."""
+    main(["run"])
+
+    assert wiring.vocabularies == [[locales.load("tr").stt_vocabulary, "Spotify", "Google Chrome"]]
 
 
 def test_the_gate_the_agent_is_handed_is_the_permission_gate(

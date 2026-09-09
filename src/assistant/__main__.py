@@ -204,8 +204,16 @@ async def _talk(settings: Settings, pack: Locale, *, device: int | str | None = 
     from assistant.store.db import open_database
     from assistant.store.repos import AuditRepo
     from assistant.stt.local_whisper import LocalWhisper
+    from assistant.tools.media import media_control
     from assistant.tools.registry import ToolRegistry
-    from assistant.tools.system import get_current_time
+    from assistant.tools.system import (
+        PROMPT_NAMES,
+        AppCatalog,
+        get_current_time,
+        open_app_for,
+        open_settings,
+        open_url,
+    )
     from assistant.tts.sapi import SapiTTS
     from assistant.ui.status import StatusLine
 
@@ -216,14 +224,22 @@ async def _talk(settings: Settings, pack: Locale, *, device: int | str | None = 
     provider = create_provider(settings.llm.provider)
     database = open_database()
     try:
-        speech = LocalWhisper()
         detector = SileroVAD()
-        # The tools on offer, by name, in one place. Every one of them runs
-        # through the gate below and nowhere else (section 3.9).
-        tools = ToolRegistry([get_current_time])
 
         with StatusLine(pack) as screen:
             screen.starting()
+            # The apps this machine can open, read once: a few seconds of
+            # files and a PowerShell process, on a thread (2.2). Before the
+            # speech model, because the model is told the names it will hear.
+            catalog = await AppCatalog.load()
+            speech = LocalWhisper(
+                vocabulary=[pack.stt_vocabulary, *catalog.vocabulary(limit=PROMPT_NAMES)]
+            )
+            # The tools on offer, by name, in one place. Every one of them
+            # runs through the gate below and nowhere else (section 3.9).
+            tools = ToolRegistry(
+                [get_current_time, open_app_for(catalog), open_url, open_settings, media_control]
+            )
             # Loading Whisper takes seconds of four cores. Doing it now rather
             # than at the first press is what keeps the first sentence from
             # waiting for it (item 1.6). The detector is a tenth of a second
