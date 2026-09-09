@@ -46,9 +46,10 @@ from assistant.app import (
     hear,
 )
 from assistant.audio.player import PlaybackError
-from assistant.llm.base import AuthenticationError, Delta, ProviderError, Usage
+from assistant.llm.base import AuthenticationError, Delta, ProviderError, ToolCall, Usage
 from assistant.locales import Locale
 from assistant.stt.base import SAMPLE_RATE, Audio, Transcript
+from assistant.tools.registry import ToolRegistry, tool
 from assistant.tts.base import VoiceInfo
 from tests.test_agent_loop import ScriptedProvider
 
@@ -207,11 +208,14 @@ def assistant_with(
     thinking_timeout: float = THINKING_TIMEOUT,
     on_state: Callable[[State], None] | None = None,
     on_turn: Callable[[Turn], None] | None = None,
+    agent: Agent | None = None,
 ) -> Assistant:
     return Assistant(
         capture=capture if capture is not None else FakeCapture(),
         stt=stt if stt is not None else FakeSTT(),
-        agent=Agent(
+        agent=agent
+        if agent is not None
+        else Agent(
             provider if provider is not None else ScriptedProvider([Delta(text="Üç.")]),
             model="fake-1",
         ),
@@ -810,6 +814,78 @@ async def test_the_tokens_a_turn_spent_leave_the_turn() -> None:
     turn = await one_turn(assistant_with(provider=provider))
 
     assert turn.usage == spent
+
+
+# --------------------------------------------------------------------------
+# The name a turn goes by (2.1d)
+# --------------------------------------------------------------------------
+
+
+@tool(risk="safe")
+async def clock() -> str:
+    """Tells the time."""
+    return "15:04"
+
+
+class FakeGate:
+    """Lets every call through and keeps the turn id each came with."""
+
+    def __init__(self) -> None:
+        self.turn_ids: list[str] = []
+
+    async def __call__(self, call: ToolCall, *, turn_id: str) -> str:
+        self.turn_ids.append(turn_id)
+        return "15:04"
+
+
+async def test_a_turn_that_reached_the_model_has_a_name_of_its_own() -> None:
+    """The name `tool_audit` files the turn's calls under (section 3.9)."""
+    turn = await one_turn(assistant_with())
+
+    assert len(turn.turn_id) == 32
+    assert set(turn.turn_id) <= set("0123456789abcdef")
+
+
+async def test_two_turns_have_two_names() -> None:
+    assistant = assistant_with(
+        provider=ScriptedProvider([Delta(text="Bir.")], [Delta(text="İki.")])
+    )
+    await assistant.begin()
+
+    first = await assistant.turn(speech())
+    second = await assistant.turn(speech())
+
+    assert first.turn_id != second.turn_id
+
+
+async def test_every_call_a_turn_makes_is_filed_under_the_turn_s_name() -> None:
+    """The id minted here is the one the gate is handed, so a row in the
+    audit table and the turn's line in the log can be read together."""
+    gate = FakeGate()
+    provider = ScriptedProvider(
+        [Delta(tool_call=ToolCall(id="c1", name="clock", arguments={}))], [Delta(text="Üç.")]
+    )
+    agent = Agent(provider, model="fake-1", tools=ToolRegistry([clock]), dispatch=gate)
+
+    turn = await one_turn(assistant_with(agent=agent))
+
+    assert turn.turn_id
+    assert gate.turn_ids == [turn.turn_id]
+
+
+async def test_a_turn_that_failed_keeps_its_name() -> None:
+    """The calls it made before failing are in the audit table under it."""
+    turn = await one_turn(assistant_with(provider=ScriptedProvider([ProviderError("503")])))
+
+    assert turn.failure == "unreachable"
+    assert turn.turn_id
+
+
+async def test_a_turn_that_never_reached_the_model_has_no_name() -> None:
+    """A tapped key made no call and has nothing to be filed under."""
+    turn = await one_turn(assistant_with(), speech(0.1))
+
+    assert turn.turn_id == ""
 
 
 async def test_speech_that_could_not_be_read_is_a_turn_that_came_to_nothing() -> None:

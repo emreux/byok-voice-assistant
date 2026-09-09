@@ -1,10 +1,12 @@
-"""The agent loop, with no tools in it yet (design.md section 8, item 1.9).
+"""The agent loop (design.md section 8, items 1.9 and 2.1c).
 
-Phase 1 proves the loop end to end: what the user said goes to the model with
+Phase 1 proved the loop end to end: what the user said goes to the model with
 the last twelve turns for company, and the text that comes back is the answer.
-The tool branch - the `while` of the architecture guide, the permission gate of
-section 3.9 - arrives in phase 2, and these tests are written so that adding it
-changes none of them.
+Phase 2.1c gave it the other branch - the `while` of the architecture guide:
+the model asks for a tool, the call goes through a gate the loop was handed,
+the result goes back in, and the loop goes round again until the model
+answers in words. The gate here is a fake that lets everything through and
+remembers what came; the real one has its own suite in `test_policy.py`.
 
 Three claims here are worth the file on their own.
 
@@ -35,7 +37,7 @@ from pathlib import Path
 import pytest
 
 from assistant.agent import prompts
-from assistant.agent.core import WINDOW_TURNS, Agent, window
+from assistant.agent.core import MAX_TOOL_CALLS, TOOL_LIMIT_REACHED, WINDOW_TURNS, Agent, window
 from assistant.agent.prompts import (
     BREVITY,
     LANGUAGE_FALLBACK,
@@ -44,6 +46,7 @@ from assistant.agent.prompts import (
     SYSTEM_PROMPT,
 )
 from assistant.llm.base import Delta, Message, ModelInfo, ToolCall, ToolSpec, Usage
+from assistant.tools.registry import ToolRegistry, tool
 
 MODEL = "scripted-1"
 
@@ -171,9 +174,8 @@ async def test_the_reason_the_model_stopped_survives_the_turn() -> None:
     assert answer.finish_reason == "MAX_TOKENS"
 
 
-async def test_phase_one_offers_the_model_no_tools() -> None:
-    """The permission gate of section 3.9 does not exist yet, and a tool
-    offered before the gate is a tool that would run without one."""
+async def test_an_agent_given_no_tools_offers_none() -> None:
+    """The phase 1 shape, still legal: a loop with nothing to go round for."""
     provider = ScriptedProvider([Delta(text="Tamam.")])
 
     await Agent(provider, model=MODEL).reply("not al")
@@ -229,7 +231,7 @@ def test_a_turn_is_not_a_message() -> None:
     conversation = [
         Message.user("saat kaç?"),
         Message.assistant(tool_calls=(call,)),
-        Message.tool_result("c1", "15:04"),
+        Message.tool_result(call, "15:04"),
         Message.assistant("Üçü dört geçiyor."),
         Message.user("teşekkürler"),
         Message.assistant("Rica ederim."),
@@ -368,3 +370,216 @@ def test_nothing_in_the_prompt_module_can_change_between_requests() -> None:
             imported.add(node.module.split(".")[0])
 
     assert imported <= {"__future__"}
+
+
+# --------------------------------------------------------------------------
+# The tool branch (2.1c): the model asks, the gate decides, the result goes back
+# --------------------------------------------------------------------------
+
+
+@tool(risk="safe")
+async def clock() -> str:
+    """Tells the time."""
+    return "15:04"
+
+
+@tool(risk="safe")
+async def calendar() -> str:
+    """Tells the date."""
+    return "Monday"
+
+
+TOOLS = ToolRegistry([clock, calendar])
+
+
+class FakeGate:
+    """A gate that lets everything through and remembers what came, and when.
+
+    The tools' own bodies are never run here: what the loop does with a call
+    is hand it over, and what it does with the answer is put it back. Both
+    are visible from outside without running anything.
+    """
+
+    def __init__(self) -> None:
+        self.calls: list[ToolCall] = []
+        self.turn_ids: list[str] = []
+
+    async def __call__(self, call: ToolCall, *, turn_id: str) -> str:
+        self.calls.append(call)
+        self.turn_ids.append(turn_id)
+        return f"{call.name}: done"
+
+
+def asks(name: str, call_id: str = "c1") -> Delta:
+    """The model asking for `name`, as a provider streams it."""
+    return Delta(tool_call=ToolCall(id=call_id, name=name, arguments={}))
+
+
+def with_tools(provider: ScriptedProvider, gate: FakeGate | None = None) -> Agent:
+    return Agent(provider, model=MODEL, tools=TOOLS, dispatch=gate if gate else FakeGate())
+
+
+async def test_the_tools_in_the_registry_are_what_the_model_is_offered() -> None:
+    provider = ScriptedProvider([Delta(text="Tamam.")])
+
+    await with_tools(provider).reply("not al")
+
+    assert provider.calls[-1].tools == TOOLS.specs()
+
+
+def test_tools_cannot_be_offered_without_a_gate_to_run_them_through() -> None:
+    """Invariant 1 at the composition root: a tool offered without a gate is
+    a tool that would run without one."""
+    with pytest.raises(ValueError, match="gate"):
+        Agent(ScriptedProvider(), model=MODEL, tools=TOOLS)
+
+
+async def test_a_call_goes_through_the_gate_and_its_result_goes_back_to_the_model() -> None:
+    """The fifteen lines of architecture guide section 1, end to end: the
+    request is kept in the conversation, the result answers it, and the
+    words come from the request after."""
+    gate = FakeGate()
+    provider = ScriptedProvider([asks("clock")], [Delta(text="Üçü dört geçiyor.")])
+
+    answer = await with_tools(provider, gate).reply("saat kaç?")
+
+    [call] = gate.calls
+    assert call.name == "clock"
+    assert answer.text == "Üçü dört geçiyor."
+    assert provider.calls[-1].turns == [
+        Message.user("saat kaç?"),
+        Message.assistant("", (call,)),
+        Message.tool_result(call, "clock: done"),
+    ]
+
+
+async def test_the_words_said_alongside_a_call_stay_with_it() -> None:
+    gate = FakeGate()
+    provider = ScriptedProvider([Delta(text="Bakıyorum."), asks("clock")], [Delta(text="Üç.")])
+
+    await with_tools(provider, gate).reply("saat kaç?")
+
+    assert provider.calls[-1].turns[1] == Message.assistant("Bakıyorum.", (gate.calls[0],))
+
+
+async def test_two_calls_in_one_reply_are_answered_in_the_order_they_came() -> None:
+    gate = FakeGate()
+    provider = ScriptedProvider(
+        [asks("clock", "c1"), asks("calendar", "c2")], [Delta(text="Pazartesi, üç.")]
+    )
+
+    await with_tools(provider, gate).reply("bugün ne, saat kaç?")
+
+    assert [call.name for call in gate.calls] == ["clock", "calendar"]
+    assert provider.calls[-1].turns[2:] == [
+        Message.tool_result(gate.calls[0], "clock: done"),
+        Message.tool_result(gate.calls[1], "calendar: done"),
+    ]
+
+
+async def test_the_turn_id_reaches_the_gate_with_every_call() -> None:
+    """It is what `tool_audit` files the calls under (section 3.9); the loop
+    carries it and never reads it."""
+    gate = FakeGate()
+    provider = ScriptedProvider([asks("clock", "c1"), asks("calendar", "c2")], [Delta(text="Üç.")])
+
+    await with_tools(provider, gate).reply("saat kaç?", turn_id="turn-7")
+
+    assert gate.turn_ids == ["turn-7", "turn-7"]
+
+
+async def test_at_the_limit_the_model_is_offered_nothing_and_left_to_answer() -> None:
+    """Section 3.11: a model that keeps asking is a model in a loop, and every
+    round is a request paid for. After the eighth call the ninth request
+    offers no tools, so the only thing left to do is answer."""
+    gate = FakeGate()
+    provider = ScriptedProvider(*([[asks("clock")]] * MAX_TOOL_CALLS), [Delta(text="Yeter.")])
+
+    answer = await with_tools(provider, gate).reply("dön dur")
+
+    assert len(gate.calls) == MAX_TOOL_CALLS
+    assert len(provider.calls) == MAX_TOOL_CALLS + 1
+    assert all(request.tools == TOOLS.specs() for request in provider.calls[:-1])
+    assert provider.calls[-1].tools == []
+    assert answer.text == "Yeter."
+
+
+async def test_a_call_made_after_being_offered_nothing_ends_the_turn() -> None:
+    """A model that ignores an empty tool list is not argued with: the turn
+    ends with whatever words there are, rather than going round for ever."""
+    gate = FakeGate()
+    provider = ScriptedProvider(*([[asks("clock")]] * (MAX_TOOL_CALLS + 5)))
+
+    answer = await with_tools(provider, gate).reply("dön dur")
+
+    assert len(gate.calls) == MAX_TOOL_CALLS
+    assert len(provider.calls) == MAX_TOOL_CALLS + 1
+    assert answer.text == ""
+
+
+async def test_a_call_over_the_limit_is_answered_with_the_limit_and_not_run() -> None:
+    """Two calls in one reply when only one is left: the second is not run,
+    and the model is told so in the one channel it has to read."""
+    gate = FakeGate()
+    provider = ScriptedProvider(
+        *([[asks("clock")]] * (MAX_TOOL_CALLS - 1)),
+        [asks("clock", "c8"), asks("calendar", "c9")],
+        [Delta(text="Tamam.")],
+    )
+
+    answer = await with_tools(provider, gate).reply("dön dur")
+
+    assert len(gate.calls) == MAX_TOOL_CALLS
+    assert [call.name for call in gate.calls][-1] == "clock"
+    refused = provider.calls[-1].turns[-1]
+    assert (refused.tool_name, refused.content) == ("calendar", TOOL_LIMIT_REACHED)
+    assert provider.calls[-1].tools == []
+    assert answer.text == "Tamam."
+
+
+async def test_the_limit_is_the_eight_calls_section_3_11_asks_for() -> None:
+    assert MAX_TOOL_CALLS == 8
+
+
+async def test_a_turn_that_ran_a_tool_is_remembered_whole() -> None:
+    """Architecture guide section 1, consequence (a): the model knows what it
+    did only because the call and the result are still in the conversation
+    next time. Drop them and "bir saat sonra kaç olur" has nothing to
+    count from."""
+    provider = ScriptedProvider([asks("clock")], [Delta(text="Üç.")], [Delta(text="Dört.")])
+    conversation = with_tools(provider)
+
+    await conversation.reply("saat kaç?")
+    await conversation.reply("bir saat sonra?")
+
+    assert [message.role for message in provider.calls[-1].turns] == [
+        "user",
+        "assistant",
+        "tool",
+        "assistant",
+        "user",
+    ]
+
+
+async def test_the_cost_of_a_turn_is_the_sum_of_every_request_it_made() -> None:
+    """Two requests, two counts. The log line and the bill are per turn."""
+    provider = ScriptedProvider(
+        [asks("clock"), Delta(usage=Usage(100, 5))],
+        [Delta(text="Üç."), Delta(usage=Usage(150, 20, 64))],
+    )
+
+    answer = await with_tools(provider).reply("saat kaç?")
+
+    assert answer.usage == Usage(250, 25, 64)
+
+
+async def test_without_a_gate_a_call_the_model_makes_anyway_is_not_acted_on() -> None:
+    """The phase 1 shape. No tools were offered, so a call is a model's
+    slip; the words are kept and nothing is run, because there is nothing
+    to run it through."""
+    provider = ScriptedProvider([asks("clock"), Delta(text="Saat üç.")])
+
+    answer = await Agent(provider, model=MODEL).reply("saat kaç?")
+
+    assert answer.text == "Saat üç."
+    assert len(provider.calls) == 1

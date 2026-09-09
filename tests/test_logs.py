@@ -126,6 +126,20 @@ def test_a_turn_writes_down_what_it_spent(log: Path) -> None:
     assert "300 in, 10 out, 256 cached" in read(log)
 
 
+def test_a_turn_is_filed_under_the_name_it_has_in_the_audit_table(log: Path) -> None:
+    """`tool_audit.turn_id` and this line are the two halves of one story;
+    the id is what lets them be read together."""
+    log_turn(Turn(heard="saat kaç", said="Üç.", usage=Usage(300, 10), turn_id="9f2a"))
+
+    assert "turn 9f2a: 300 in, 10 out" in read(log)
+
+
+def test_a_failed_turn_is_filed_under_its_name_too(log: Path) -> None:
+    log_turn(Turn(heard="saat kaç", said="...", failure="took_too_long", turn_id="9f2a"))
+
+    assert "turn 9f2a failed: took_too_long" in read(log)
+
+
 def test_what_was_said_out_loud_is_not_written_to_disk(log: Path) -> None:
     log_turn(Turn(heard="kapıyı kilitledim mi", said="Bilmiyorum.", usage=Usage(300, 10)))
 

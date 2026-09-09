@@ -17,6 +17,8 @@ are a sentence and an exit code, and neither of them costs a model load.
 
 from __future__ import annotations
 
+import asyncio
+import sqlite3
 import sys
 from collections.abc import Iterator
 from dataclasses import dataclass, field
@@ -28,8 +30,9 @@ import pytest
 from loguru import logger
 
 from assistant import app, locales, logs, setup_wizard
-from assistant.__main__ import TEXT, build_parser, main, use_utf8
+from assistant.__main__ import TEXT, _declines_until_phase_2_3, build_parser, main, use_utf8
 from assistant.agent import core
+from assistant.agent.policy import NO_SUCH_TOOL
 from assistant.app import State, Turn
 from assistant.audio import capture
 from assistant.config import (
@@ -40,7 +43,8 @@ from assistant.config import (
     save_settings,
     store_api_key,
 )
-from assistant.llm.base import Usage
+from assistant.llm.base import ToolCall, Usage
+from assistant.store import db
 from assistant.stt import local_whisper
 from assistant.ui import status
 from tests.conftest import MemoryKeyring
@@ -77,14 +81,28 @@ class Wiring:
     happened: list[str] = field(default_factory=list)
     built: list[dict[str, Any]] = field(default_factory=list)
     agents: list[tuple[str, str]] = field(default_factory=list)
+    # What the agent was handed to work with: the names of the tools on
+    # offer, and the gate they run through.
+    tools: list[list[str]] = field(default_factory=list)
+    gates: list[Any] = field(default_factory=list)
     microphones: list[Any] = field(default_factory=list)
+    databases: list[sqlite3.Connection] = field(default_factory=list)
     stop: BaseException | None = None
 
 
 @pytest.fixture
-def wiring(monkeypatch: pytest.MonkeyPatch) -> Wiring:
-    """Replaces the speech model, the agent and the state machine."""
+def wiring(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Wiring:
+    """Replaces the speech model, the agent and the state machine, and points
+    the database at this test's directory - the real `open_database` runs,
+    so that the schema is built the way it is built in life."""
     seen = Wiring()
+    really_open = db.open_database
+
+    def open_here(path: Path | str | None = None) -> sqlite3.Connection:
+        seen.happened.append("database")
+        connection = really_open(path)
+        seen.databases.append(connection)
+        return connection
 
     class FakeWhisper:
         async def load(self) -> None:
@@ -93,6 +111,8 @@ def wiring(monkeypatch: pytest.MonkeyPatch) -> Wiring:
     class FakeAgent:
         def __init__(self, provider: Any, *, model: str, **rest: Any) -> None:
             seen.agents.append((provider.id, model))
+            seen.tools.append([spec.name for spec in rest["tools"].specs()])
+            seen.gates.append(rest["dispatch"])
 
     class FakeMicrophone:
         def __init__(self, *, device: Any = None) -> None:
@@ -120,6 +140,8 @@ def wiring(monkeypatch: pytest.MonkeyPatch) -> Wiring:
     monkeypatch.setattr(capture, "SystemMicrophone", FakeMicrophone)
     monkeypatch.setattr(core, "Agent", FakeAgent)
     monkeypatch.setattr(app, "Assistant", FakeAssistant)
+    monkeypatch.setattr(db, "database_path", lambda: tmp_path / "data" / "assistant.db")
+    monkeypatch.setattr(db, "open_database", open_here)
     return seen
 
 
@@ -298,10 +320,66 @@ def test_the_device_flag_outranks_the_settings(configured: Path, wiring: Wiring)
 def test_the_speech_model_is_ready_before_the_assistant_is(
     configured: Path, wiring: Wiring
 ) -> None:
-    """Loading Whisper at the first press would swallow the first sentence."""
+    """Loading Whisper at the first press would swallow the first sentence.
+    The database comes first of all: cheap, and a disk that refuses is
+    better found out about before two seconds of four cores are spent."""
     main(["run"])
 
-    assert wiring.happened == ["speech model", "assistant"]
+    assert wiring.happened == ["database", "speech model", "assistant"]
+
+
+# --------------------------------------------------------------------------
+# run: the tools, the gate and the database (2.1c, 2.1d)
+# --------------------------------------------------------------------------
+
+
+def test_the_first_tool_is_on_offer(configured: Path, wiring: Wiring) -> None:
+    main(["run"])
+
+    assert wiring.tools == [["get_current_time"]]
+
+
+def test_the_gate_the_agent_is_handed_is_the_permission_gate(
+    configured: Path, wiring: Wiring
+) -> None:
+    """Not any callable: the one that refuses what it was not offered, which
+    is the one thing a fake gate would not do."""
+    main(["run"])
+
+    [gate] = wiring.gates
+    made_up = ToolCall(id="c1", name="format_disk", arguments={})
+
+    assert asyncio.run(gate(made_up, turn_id="t1")) == NO_SUCH_TOOL.format(name="format_disk")
+
+
+def test_a_tool_that_asks_is_refused_until_there_is_someone_to_ask() -> None:
+    """The `CONFIRMING` state of 2.3 opens the microphone for a yes or no.
+    Until then the answer is no - and never a quiet yes."""
+    assert asyncio.run(_declines_until_phase_2_3("Spotify will be opened.")) is False
+
+
+def test_the_database_is_built_where_the_data_lives(configured: Path, wiring: Wiring) -> None:
+    main(["run"])
+
+    path = db.database_path()
+    assert path.is_file()
+    connection = sqlite3.connect(path)
+    try:
+        tables = {row[0] for row in connection.execute("SELECT name FROM sqlite_master")}
+        assert "tool_audit" in tables
+    finally:
+        connection.close()
+
+
+def test_the_database_is_closed_when_the_assistant_stops(configured: Path, wiring: Wiring) -> None:
+    """However it stops - here, the way Ctrl+C stops it."""
+    wiring.stop = KeyboardInterrupt()
+
+    main(["run"])
+
+    [connection] = wiring.databases
+    with pytest.raises(sqlite3.ProgrammingError):
+        connection.execute("SELECT 1")
 
 
 def test_a_finished_turn_is_written_to_the_log(configured: Path, wiring: Wiring) -> None:

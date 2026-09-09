@@ -9,10 +9,14 @@ So the application sees only this module: five value types and one protocol.
 An adapter translates its vendor's shapes into these on the way in and out, and
 that is the only place vendor knowledge is allowed to live.
 
-Phase 1 ships a single adapter and calls `stream` with `tools=[]`. The tool
-types are defined here from the start anyway - the phase 2 permission gate and
-the agent loop are written against them, and retrofitting a type this central
-breaks every call site (design.md section 8).
+Phase 1 shipped a single adapter and called `stream` with `tools=[]`. The tool
+types were defined here from the start anyway - the permission gate and the
+agent loop of phase 2 are written against them, and retrofitting a type this
+central breaks every call site (design.md section 8). Phase 2.1 turned them
+on, and two things the first real round trip taught are recorded on the types
+themselves: a tool result carries the name of the tool as well as the id of
+the call, and a call carries back whatever opaque token the provider attached
+to it.
 """
 
 from __future__ import annotations
@@ -80,11 +84,19 @@ class ToolCall:
     those fragments and emits this object only once the arguments parse, so a
     `ToolCall` is never half-built. The permission gate of section 3.9 depends
     on that: it cannot judge an action it can only see the beginning of.
+
+    `signature` is whatever the provider attached to the call and wants back
+    with it, byte for byte, when the call is resent as history. Nothing above
+    the adapter reads it; the loop only carries it. Gemini 3 attaches one to
+    every function call it makes - a "thought signature", the encrypted trace
+    of the reasoning behind the call - and refuses the conversation without
+    it (measured 2026-09-09: a 400 on the second round of "saat kaç?").
     """
 
     id: str
     name: str
     arguments: Mapping[str, Any]
+    signature: bytes | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -99,6 +111,20 @@ class Usage:
     input_tokens: int = 0
     output_tokens: int = 0
     cached_tokens: int = 0
+
+    def __add__(self, other: Usage) -> Usage:
+        """What two requests cost together.
+
+        A turn that went round the tool loop made more than one request, and
+        the turn's cost is their sum. This is the one place counts are added:
+        within a request `Delta.usage` is already the total, and adding
+        *those* up is the mistake its docstring warns about.
+        """
+        return Usage(
+            input_tokens=self.input_tokens + other.input_tokens,
+            output_tokens=self.output_tokens + other.output_tokens,
+            cached_tokens=self.cached_tokens + other.cached_tokens,
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -132,10 +158,13 @@ class Message:
     content: str = ""
     tool_calls: tuple[ToolCall, ...] = field(default_factory=tuple)
     tool_call_id: str | None = None
+    tool_name: str | None = None
 
     def __post_init__(self) -> None:
-        if self.role == "tool" and self.tool_call_id is None:
-            raise ValueError("a tool result needs the tool_call_id it answers")
+        if self.role == "tool" and (self.tool_call_id is None or self.tool_name is None):
+            raise ValueError(
+                "a tool result needs the tool_call_id and the tool_name of the call it answers"
+            )
         if self.tool_calls and self.role != "assistant":
             raise ValueError(f"only an assistant message carries tool calls, not {self.role!r}")
 
@@ -152,8 +181,17 @@ class Message:
         return cls(role="assistant", content=content, tool_calls=tool_calls)
 
     @classmethod
-    def tool_result(cls, tool_call_id: str, content: str) -> Message:
-        return cls(role="tool", content=content, tool_call_id=tool_call_id)
+    def tool_result(cls, answering: ToolCall, content: str) -> Message:
+        """What a tool said back, tied to the call that asked for it.
+
+        Both the id and the name travel: OpenAI and Anthropic match a result
+        to its call by id, Gemini by name - and Gemini refuses a result that
+        has none (measured 2026-09-09, "Name cannot be empty"). Built from the
+        call itself, a result cannot carry a mismatched pair.
+        """
+        return cls(
+            role="tool", content=content, tool_call_id=answering.id, tool_name=answering.name
+        )
 
 
 @dataclass(frozen=True, slots=True)

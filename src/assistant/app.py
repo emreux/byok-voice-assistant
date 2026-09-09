@@ -54,6 +54,7 @@ English constants below are the end of the chain, exactly as in the wizard
 from __future__ import annotations
 
 import asyncio
+import uuid
 from collections.abc import AsyncIterator, Callable, Sequence
 from dataclasses import dataclass, field
 from enum import StrEnum
@@ -157,6 +158,10 @@ class Turn:
     reads as a free success, and the log of 2026-09-04 had one nobody could
     explain); the provider's own words are where a key could travel and stay
     in the exception.
+
+    `turn_id` is the name the turn goes by in `tool_audit` (section 3.9),
+    so that a row there and a line in the log can be read together. A turn
+    that never reached the model has none.
     """
 
     heard: str = ""
@@ -165,6 +170,7 @@ class Turn:
     missed: bool = False
     confidence: float | None = None
     failure: str | None = None
+    turn_id: str = ""
 
 
 class Capture(Protocol):
@@ -277,10 +283,13 @@ class Assistant:
             return await self._missed(heard)
 
         self._enter(State.THINKING)
-        said, usage, failure = await self._answer(heard.text)
+        # Minted here, where the turn becomes something the model may act on:
+        # every tool call the turn makes is written down under this name.
+        turn_id = uuid.uuid4().hex
+        said, usage, failure = await self._answer(heard.text, turn_id)
         await self._speak(said)
         self._rest()
-        return Turn(heard=heard.text, said=said, usage=usage, failure=failure)
+        return Turn(heard=heard.text, said=said, usage=usage, failure=failure, turn_id=turn_id)
 
     async def _missed(self, heard: Heard) -> Turn:
         """Nothing usable came back. Whether that is worth saying depends.
@@ -314,7 +323,7 @@ class Assistant:
 
         return hear(await self._stt.transcribe(pcm, hint=self._locale.stt_language))
 
-    async def _answer(self, heard: str) -> tuple[str, Usage, str | None]:
+    async def _answer(self, heard: str, turn_id: str) -> tuple[str, Usage, str | None]:
         """The model's answer, or the sentence that explains why there is none.
 
         A turn that failed spent no tokens anybody can account for: what the
@@ -323,7 +332,9 @@ class Assistant:
         value is the key of the sentence that was said instead, for the log.
         """
         try:
-            answer = await asyncio.wait_for(self._agent.reply(heard), self._thinking_timeout)
+            answer = await asyncio.wait_for(
+                self._agent.reply(heard, turn_id=turn_id), self._thinking_timeout
+            )
         except TimeoutError:
             return self._said["took_too_long"], Usage(), "took_too_long"
         except AuthenticationError:

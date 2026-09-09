@@ -141,6 +141,24 @@ def test_a_tool_result_needs_the_call_it_answers() -> None:
         Message(role="tool", content="42")
 
 
+def test_a_tool_result_carries_the_name_of_the_tool_as_well_as_the_id() -> None:
+    """Two providers match a result to its call by id, one by name (Gemini,
+    which refuses a result without one). The protocol carries both, taken
+    from the call itself so they cannot disagree."""
+    call = ToolCall(id="c1", name="open_app", arguments={"name": "notepad"})
+
+    result = Message.tool_result(call, "opened")
+
+    assert (result.role, result.tool_call_id, result.tool_name) == ("tool", "c1", "open_app")
+    assert result.content == "opened"
+
+
+def test_the_cost_of_two_requests_adds_up() -> None:
+    """A turn that ran a tool made more than one request; the turn's cost is
+    their sum, and this is the one place counts are ever added."""
+    assert Usage(1, 2, 3) + Usage(10, 20, 30) == Usage(11, 22, 33)
+
+
 def test_only_an_assistant_message_carries_tool_calls() -> None:
     call = ToolCall(id="1", name="open_app", arguments={"name": "notepad"})
 

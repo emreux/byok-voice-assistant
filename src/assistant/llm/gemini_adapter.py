@@ -12,9 +12,14 @@ marks an unfinished call with `will_continue`, and the protocol promises a
 judge an action it can only see the beginning of. So unfinished calls are
 dropped and only the completed one is emitted.
 
-Phase 1 calls this with an empty tool list and no tool ever comes back. The
-translation is written now anyway, because phase 2 turns tools on and a
-protocol that was only ever exercised without them would not be a protocol.
+Two more of Gemini's ways were learned the day tools were first turned on
+(2026-09-09, against the real API), and both are absorbed here. A function
+response must name the function - the id alone is refused - so the protocol's
+tool result carries the name and this file passes it on. And Gemini 3 signs
+every function call it makes with an opaque *thought signature* that has to
+travel back on the very same part when the call is resent as history, or the
+request is refused; the signature rides on `ToolCall.signature` and nothing
+between here and the loop looks at it.
 """
 
 from __future__ import annotations
@@ -203,7 +208,12 @@ def _to_content(message: Message) -> types.Content:
             parts=[
                 types.Part(
                     function_response=types.FunctionResponse(
-                        id=message.tool_call_id,
+                        # Matched to its call by name: a response without one
+                        # is refused outright ("Name cannot be empty"). The id
+                        # is optional to Gemini, and one a model never issued
+                        # is left out rather than sent empty.
+                        id=message.tool_call_id or None,
+                        name=message.tool_name,
                         # Gemini wants an object here; the protocol carries the
                         # result as text, so it travels under a single key.
                         response={"result": message.content},
@@ -217,7 +227,12 @@ def _to_content(message: Message) -> types.Content:
         parts.append(types.Part(text=message.content))
     parts.extend(
         types.Part(
-            function_call=types.FunctionCall(id=call.id, name=call.name, args=dict(call.arguments))
+            function_call=types.FunctionCall(
+                id=call.id or None, name=call.name, args=dict(call.arguments)
+            ),
+            # Back exactly as `_translate` received it. Gemini 3 refuses a
+            # function call resent without the signature it came with.
+            thought_signature=call.signature,
         )
         for call in message.tool_calls
     )
@@ -238,26 +253,47 @@ def _translate(chunk: types.GenerateContentResponse) -> list[Delta]:
 
     Text and tool calls only. The finish reason and the token counts are
     summarised once at the end of the stream, in `stream` itself.
+
+    Read part by part rather than through `chunk.text`: that property joins
+    the text parts and, the moment a function call sits among them, logs a
+    warning through the standard library - which, on this project, would be
+    drawn through the middle of the status line. A part marked `thought` is
+    the model's summary of its own reasoning, not the answer, and is not
+    passed on to be spoken.
     """
     deltas: list[Delta] = []
 
-    if chunk.text:
-        deltas.append(Delta(text=chunk.text))
+    for part in _parts(chunk):
+        if part.text and not part.thought:
+            deltas.append(Delta(text=part.text))
 
-    for call in chunk.function_calls or []:
-        if call.will_continue:
-            # Arguments are still arriving. Emitting now would hand the gate an
-            # action with half its arguments.
+        call = part.function_call
+        if call is None or call.will_continue:
+            # No call here, or its arguments are still arriving. Emitting the
+            # latter now would hand the gate an action with half its arguments.
             continue
         deltas.append(
             Delta(
                 tool_call=ToolCall(
-                    id=call.id or "", name=call.name or "", arguments=call.args or {}
+                    id=call.id or "",
+                    name=call.name or "",
+                    arguments=call.args or {},
+                    # The signature lives on the part, not on the call, and
+                    # goes back on the part (`_to_content`).
+                    signature=part.thought_signature,
                 )
             )
         )
 
     return deltas
+
+
+def _parts(chunk: types.GenerateContentResponse) -> list[types.Part]:
+    """The parts of the first candidate, or none - a keep-alive has no candidate."""
+    candidates = chunk.candidates or []
+    if not candidates or candidates[0].content is None:
+        return []
+    return candidates[0].content.parts or []
 
 
 def _usage(metadata: types.GenerateContentResponseUsageMetadata | None) -> Usage | None:

@@ -1,0 +1,130 @@
+"""The one path from a model-produced `ToolCall` to a running tool (design.md section 3.9).
+
+The model cannot tell an instruction of the user's from text it read somewhere
+- both are tokens in the same window - so the only defence that holds is
+outside the model: code between the model's request and the action. This
+module is that code, and there is deliberately no second way to run a tool.
+
+`dispatch` is a referee. It looks the tool up, reads the risk the tool
+declared for itself, and either refuses, asks, or runs. Whatever happens it
+answers in words, because the answer goes back to the model as the tool's
+result: a refusal the model can read is a turn that continues, an exception
+that escapes is a turn that dies.
+
+**It writes before it runs.** With an `AuditRepo` in hand the gate opens a
+`tool_audit` row *before* the tool's body starts and closes it afterwards;
+a refusal is one row that is closed as it is written. A crash between the
+two leaves a row that says `started` and nothing more - which is the truth,
+and is what section 3.11 builds "I tried, and I do not know whether it
+worked" on. The order is the whole point; do not move the write after the
+call to save a millisecond.
+
+The answers are English constants and stay that way. They are addressed to
+the model, not the user, so the locale chain of section 3.12 does not apply.
+"""
+
+from __future__ import annotations
+
+from collections.abc import Awaitable, Callable, Iterable
+
+from loguru import logger
+
+from assistant.llm.base import ToolCall
+from assistant.store.repos import AuditRepo
+from assistant.tools.registry import ToolRegistry
+
+__all__ = [
+    "DECLINED",
+    "DISABLED",
+    "FAILED",
+    "MISSING_ARGUMENT",
+    "NO_SUCH_TOOL",
+    "Confirm",
+    "dispatch",
+]
+
+# Asks the user a question and answers yes or no. Who actually asks is decided
+# by whoever calls `dispatch`: phase 2.3 hands over the microphone, a test
+# hands over a fake, and the gate never learns the difference.
+Confirm = Callable[[str], Awaitable[bool]]
+
+NO_SUCH_TOOL = "There is no tool named {name!r}."
+DISABLED = "This tool is disabled in the current configuration."
+DECLINED = "The user declined this action."
+MISSING_ARGUMENT = "The call is missing the argument {name!r}."
+FAILED = "The tool failed: {kind}"
+
+
+async def dispatch(
+    call: ToolCall,
+    *,
+    turn_id: str,
+    registry: ToolRegistry,
+    confirm: Confirm,
+    unblocked: Iterable[str] = (),
+    audit: AuditRepo | None = None,
+) -> str:
+    """Runs one tool call the way its risk allows, and reports back in words.
+
+    `unblocked` names the `blocked` tools the user switched on in `config.toml`.
+    A tool named there is treated as `confirm`, never as `safe`: opening it
+    was a decision made in a file, running it is still a decision made aloud.
+
+    `turn_id` groups the rows of one turn in `tool_audit`, and `audit` is
+    where they go. Without one - most tests - nothing is written.
+    """
+    tool = registry.get(call.name)
+    if tool is None:
+        # The model asked for a tool it was never offered. Nothing to run,
+        # and nothing to write down: no tool was judged.
+        return NO_SUCH_TOOL.format(name=call.name)
+
+    if tool.risk == "blocked" and call.name not in unblocked:
+        return _refused(DISABLED, call, tool.risk, turn_id=turn_id, audit=audit)
+
+    if tool.risk != "safe":
+        if tool.confirm_prompt is None:
+            # `tool()` refuses to build one of these, but a `Tool` made by hand
+            # could exist. A question that cannot be asked is a tool that
+            # cannot run - failing closed is the whole point of the gate.
+            return _refused(DISABLED, call, tool.risk, turn_id=turn_id, audit=audit)
+        try:
+            # The real argument values go into the sentence: the user hears
+            # exactly what the model asked for, which is what catches an
+            # injected request (architecture guide section 6).
+            question = tool.confirm_prompt.format(**call.arguments)
+        except KeyError as missing:
+            # The model left out an argument the question needs. It is told
+            # which; nobody is asked and nothing is written, since no
+            # decision was reached.
+            return MISSING_ARGUMENT.format(name=missing.args[0])
+        if not await confirm(question):
+            return _refused(DECLINED, call, tool.risk, turn_id=turn_id, audit=audit)
+
+    # Written down before it runs (section 3.9). From here on a crash leaves a
+    # row that says `started`, and that is the honest record of it.
+    row = audit.start(call, turn_id=turn_id, risk=tool.risk) if audit is not None else None
+    try:
+        result = await tool.run(**call.arguments)
+    except Exception as error:
+        # Deliberately broad: whatever broke inside the tool, the turn goes on
+        # and the model gets to tell the user. The class name is enough - the
+        # message could carry anything, and nothing here is allowed to log it.
+        kind = type(error).__name__
+        logger.warning("tool {name} failed: {kind}", name=call.name, kind=kind)
+        if audit is not None and row is not None:
+            audit.finish(row, status="error", error=kind)
+        return FAILED.format(kind=kind)
+
+    if audit is not None and row is not None:
+        audit.finish(row, status="ok", summary=result)
+    return result
+
+
+def _refused(
+    answer: str, call: ToolCall, risk: str, *, turn_id: str, audit: AuditRepo | None
+) -> str:
+    """The gate said no: one closed row, if there is somewhere to write it."""
+    if audit is not None:
+        audit.deny(call, turn_id=turn_id, risk=risk)
+    return answer

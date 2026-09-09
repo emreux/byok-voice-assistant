@@ -1,9 +1,15 @@
-"""Command line entry point - and, in phase 1, the whole of the program.
+"""Command line entry point - and the composition root of the program.
 
 `setup` asks the three questions of item 1.4. `run` is item 1.11: it puts the
-pieces of phase 1 together, hands them to the state machine, and shows the one
-line of terminal that is the entire interface until the tray icon of phase 4.2.
-`doctor` and `cost` arrive in phase 3 and phase 2 (design.md section 8).
+pieces together, hands them to the state machine, and shows the one line of
+terminal that is the entire interface until the tray icon of phase 4.2.
+`doctor` and `cost` arrive in phase 3 and phase 2.4 (design.md section 8).
+
+This is the only file that knows the concrete names: which tools are on
+offer, which gate runs them, where the audit rows go. `agent/core.py` sees a
+registry and a gate, `agent/policy.py` sees a registry and a repository, and
+neither knows what the other is called - which is what lets a test hand
+either of them a fake.
 
 Three things about `run` are decisions rather than plumbing.
 
@@ -36,12 +42,18 @@ import sys
 from collections.abc import Callable, Sequence
 from typing import TYPE_CHECKING
 
+from loguru import logger
+
 from assistant import __version__, locales
 from assistant.config import Settings, is_configured, load_settings
 
 if TYPE_CHECKING:
+    from assistant.agent.core import Dispatch
     from assistant.app import Turn
+    from assistant.llm.base import ToolCall
     from assistant.locales import Locale
+    from assistant.store.repos import AuditRepo
+    from assistant.tools.registry import ToolRegistry
     from assistant.ui.status import StatusLine
 
 __all__ = ["TEXT", "build_parser", "main", "use_utf8"]
@@ -182,48 +194,99 @@ def _run(*, device: str | None = None) -> int:
 
 
 async def _talk(settings: Settings, pack: Locale, *, device: int | str | None = None) -> None:
-    """Builds the pieces of phase 1 and lets the state machine drive them."""
+    """Builds the pieces and lets the state machine drive them."""
     from assistant.agent.core import Agent
     from assistant.app import Assistant
     from assistant.audio.capture import HandsFree, SystemMicrophone
     from assistant.audio.player import SystemSpeaker
     from assistant.audio.vad import Endpoint, SileroVAD
     from assistant.llm.registry import create_provider
+    from assistant.store.db import open_database
+    from assistant.store.repos import AuditRepo
     from assistant.stt.local_whisper import LocalWhisper
+    from assistant.tools.registry import ToolRegistry
+    from assistant.tools.system import get_current_time
     from assistant.tts.sapi import SapiTTS
     from assistant.ui.status import StatusLine
 
     # First, and before anything slow: a provider that cannot be built is the
-    # likeliest thing to be wrong, and the cheapest to find out about.
+    # likeliest thing to be wrong, and the cheapest to find out about. The
+    # database is next for the same reason - cheap, and a disk that refuses
+    # is better found out about before Whisper has been loaded.
     provider = create_provider(settings.llm.provider)
-    speech = LocalWhisper()
-    detector = SileroVAD()
+    database = open_database()
+    try:
+        speech = LocalWhisper()
+        detector = SileroVAD()
+        # The tools on offer, by name, in one place. Every one of them runs
+        # through the gate below and nowhere else (section 3.9).
+        tools = ToolRegistry([get_current_time])
 
-    with StatusLine(pack) as screen:
-        screen.starting()
-        # Loading Whisper takes seconds of four cores. Doing it now rather than
-        # at the first press is what keeps the first sentence from waiting for
-        # it (item 1.6). The detector is a tenth of a second beside it, and is
-        # loaded here for the same reason rather than inside the first block
-        # of audio it is asked about.
-        await speech.load()
-        await detector.load()
+        with StatusLine(pack) as screen:
+            screen.starting()
+            # Loading Whisper takes seconds of four cores. Doing it now rather
+            # than at the first press is what keeps the first sentence from
+            # waiting for it (item 1.6). The detector is a tenth of a second
+            # beside it, and is loaded here for the same reason rather than
+            # inside the first block of audio it is asked about.
+            await speech.load()
+            await detector.load()
 
-        assistant = Assistant(
-            capture=HandsFree(
-                microphone=SystemMicrophone(device=device),
-                endpoint=Endpoint(detector),
-                on_mode=screen.hands_free,
-            ),
-            stt=speech,
-            agent=Agent(provider, model=settings.llm.model),
-            tts=SapiTTS(),
-            speaker=SystemSpeaker(),
-            locale=pack,
-            on_state=screen.state,
-            on_turn=_finished(screen),
+            assistant = Assistant(
+                capture=HandsFree(
+                    microphone=SystemMicrophone(device=device),
+                    endpoint=Endpoint(detector),
+                    on_mode=screen.hands_free,
+                ),
+                stt=speech,
+                agent=Agent(
+                    provider,
+                    model=settings.llm.model,
+                    tools=tools,
+                    dispatch=_gate(settings, tools, AuditRepo(database)),
+                ),
+                tts=SapiTTS(),
+                speaker=SystemSpeaker(),
+                locale=pack,
+                on_state=screen.state,
+                on_turn=_finished(screen),
+            )
+            await assistant.run()
+    finally:
+        database.close()
+
+
+def _gate(settings: Settings, tools: ToolRegistry, audit: AuditRepo) -> Dispatch:
+    """The one permission gate, with everything it needs already in hand.
+
+    What the loop gets is a function of the call alone; the registry, the
+    audit rows and the user's `[tools]` settings are bound here, so that
+    `agent/core.py` never imports `policy.py` and a test can hand it a fake.
+    """
+    from assistant.agent import policy
+
+    async def dispatch(call: ToolCall, *, turn_id: str) -> str:
+        return await policy.dispatch(
+            call,
+            turn_id=turn_id,
+            registry=tools,
+            confirm=_declines_until_phase_2_3,
+            unblocked=settings.tools.unblocked,
+            audit=audit,
         )
-        await assistant.run()
+
+    return dispatch
+
+
+async def _declines_until_phase_2_3(question: str) -> bool:
+    """Nobody can be asked yet, so the answer is no.
+
+    The `CONFIRMING` state of 2.3 is what opens the microphone for a yes or
+    no. Until then a `confirm` tool cannot run - and cannot quietly run
+    either, which is why this is a refusal and not a placeholder yes.
+    """
+    logger.info("a tool asked for confirmation; nobody can answer before phase 2.3")
+    return False
 
 
 def _finished(screen: StatusLine) -> Callable[[Turn], None]:

@@ -27,6 +27,7 @@ from assistant.llm.base import (
     Delta,
     LLMProvider,
     Message,
+    ToolCall,
     ToolSpec,
 )
 from assistant.llm.gemini_adapter import GeminiAdapter
@@ -81,17 +82,23 @@ def final_chunk(
 
 
 def call_chunk(
-    name: str, args: dict[str, Any], *, call_id: str = "c1", still_streaming: bool = False
+    name: str,
+    args: dict[str, Any],
+    *,
+    call_id: str | None = "c1",
+    still_streaming: bool = False,
+    signature: bytes | None = None,
 ) -> types.GenerateContentResponse:
     function_call = types.FunctionCall(
         id=call_id, name=name, args=args, will_continue=still_streaming or None
     )
+    return parts_chunk(types.Part(function_call=function_call, thought_signature=signature))
+
+
+def parts_chunk(*parts: types.Part) -> types.GenerateContentResponse:
+    """A chunk carrying exactly these parts, in this order."""
     return types.GenerateContentResponse(
-        candidates=[
-            types.Candidate(
-                content=types.Content(role="model", parts=[types.Part(function_call=function_call)])
-            )
-        ]
+        candidates=[types.Candidate(content=types.Content(role="model", parts=list(parts)))]
     )
 
 
@@ -224,15 +231,123 @@ async def test_the_assistant_speaks_under_the_role_gemini_expects() -> None:
     assert [c.role for c in models.sent["contents"]] == ["user", "model", "user"]
 
 
-async def test_a_tool_result_goes_back_as_a_function_response() -> None:
+async def test_a_tool_result_goes_back_as_a_function_response_by_name() -> None:
+    """Gemini matches a result to its call by the function's name and refuses
+    one without it - "Name cannot be empty", measured 2026-09-09."""
     models = FakeModels([text_chunk("ok")])
     adapter = adapter_for(models)
+    call = ToolCall(id="c1", name="get_weather", arguments={})
 
-    await collect(adapter, messages=[Message.tool_result("c1", "22 degrees")])
+    await collect(adapter, messages=[Message.tool_result(call, "22 degrees")])
 
     part = models.sent["contents"][0].parts[0]
     assert part.function_response is not None
+    assert part.function_response.name == "get_weather"
+    assert part.function_response.id == "c1"
     assert part.function_response.response == {"result": "22 degrees"}
+
+
+async def test_an_id_the_model_never_issued_is_not_sent_back_as_an_empty_one() -> None:
+    """Older Gemini models issue no call ids; the adapter reads those as `""`,
+    and what goes back is nothing rather than an empty string."""
+    models = FakeModels([text_chunk("ok")])
+    adapter = adapter_for(models)
+    call = ToolCall(id="", name="get_weather", arguments={})
+
+    await collect(
+        adapter,
+        messages=[Message.assistant(tool_calls=(call,)), Message.tool_result(call, "22")],
+    )
+
+    resent, result = models.sent["contents"]
+    assert resent.parts[0].function_call.id is None
+    assert result.parts[0].function_response.id is None
+
+
+async def test_the_signature_on_a_function_call_part_travels_with_the_call() -> None:
+    """Gemini 3 signs every call it makes. The signature lives on the part,
+    not on the call, and the protocol's `ToolCall` is where it is kept."""
+    adapter = adapter_for(FakeModels([call_chunk("open_app", {}, signature=b"opaque-96-bytes")]))
+
+    [call] = [d.tool_call for d in await collect(adapter) if d.tool_call is not None]
+
+    assert call.signature == b"opaque-96-bytes"
+
+
+async def test_a_resent_call_carries_its_signature_back_on_the_same_part() -> None:
+    """Without this the second request of every tool turn is refused with
+    "Function call is missing a thought_signature" (measured 2026-09-09)."""
+    models = FakeModels([text_chunk("ok")])
+    adapter = adapter_for(models)
+    call = ToolCall(id="c1", name="open_app", arguments={}, signature=b"opaque")
+
+    await collect(
+        adapter,
+        messages=[
+            Message.user("aç"),
+            Message.assistant(tool_calls=(call,)),
+            Message.tool_result(call, "opened"),
+        ],
+    )
+
+    part = models.sent["contents"][1].parts[0]
+    assert part.function_call is not None
+    assert part.function_call.name == "open_app"
+    assert part.thought_signature == b"opaque"
+
+
+async def test_a_call_without_a_signature_is_resent_without_one() -> None:
+    models = FakeModels([text_chunk("ok")])
+    adapter = adapter_for(models)
+    call = ToolCall(id="c1", name="open_app", arguments={})
+
+    await collect(adapter, messages=[Message.assistant(tool_calls=(call,))])
+
+    assert models.sent["contents"][0].parts[0].thought_signature is None
+
+
+async def test_text_beside_a_function_call_is_read_without_the_sdk_complaining(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """`chunk.text` logs a warning through the standard library whenever a
+    function call sits among the text parts - which, on this project, would
+    be drawn through the status line. The parts are read directly instead."""
+    adapter = adapter_for(
+        FakeModels(
+            [
+                parts_chunk(
+                    types.Part(text="Bakıyorum."),
+                    types.Part(function_call=types.FunctionCall(id="c1", name="clock", args={})),
+                )
+            ]
+        )
+    )
+
+    deltas = await collect(adapter)
+
+    assert [d.text for d in deltas if d.text] == ["Bakıyorum."]
+    assert [d.tool_call.name for d in deltas if d.tool_call] == ["clock"]
+    assert caplog.records == []
+
+
+async def test_a_thought_part_is_not_part_of_the_answer() -> None:
+    """A part marked `thought` is the model's summary of its own reasoning.
+    It is not what the user asked for, and it is not spoken."""
+    adapter = adapter_for(
+        FakeModels(
+            [parts_chunk(types.Part(text="Let me think.", thought=True), types.Part(text="Üç."))]
+        )
+    )
+
+    deltas = await collect(adapter)
+
+    assert [d.text for d in deltas if d.text] == ["Üç."]
+
+
+async def test_a_chunk_with_no_candidate_carries_nothing() -> None:
+    adapter = adapter_for(FakeModels([types.GenerateContentResponse(candidates=[])]))
+
+    assert await collect(adapter) == []
 
 
 async def test_tools_are_offered_as_function_declarations() -> None:

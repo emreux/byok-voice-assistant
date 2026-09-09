@@ -104,8 +104,13 @@ def log_turn(finished: Turn) -> None:
         logger.info("missed: nothing worth answering, confidence {value}", value=confidence)
         return
 
+    # By the name the turn goes by in `tool_audit` (section 3.9), so that a
+    # row there and a line here can be read together. A turn from before
+    # there were names is still a turn.
+    where = f"turn {finished.turn_id}" if finished.turn_id else "turn"
+
     if finished.failure is not None:
-        logger.warning("failed: {kind}", kind=finished.failure)
+        logger.warning("{where} failed: {kind}", where=where, kind=finished.failure)
         return
 
     if not finished.heard:
@@ -113,7 +118,8 @@ def log_turn(finished: Turn) -> None:
 
     usage = finished.usage
     logger.info(
-        "turn: {input} in, {output} out, {cached} cached",
+        "{where}: {input} in, {output} out, {cached} cached",
+        where=where,
         input=usage.input_tokens,
         output=usage.output_tokens,
         cached=usage.cached_tokens,
