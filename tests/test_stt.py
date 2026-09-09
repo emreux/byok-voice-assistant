@@ -223,7 +223,8 @@ async def test_words_that_were_all_hallucination_report_the_engine_s_own_verdict
 
     transcript = await stt.transcribe(silence())
 
-    assert (transcript.text, transcript.no_speech_probability) == ("", pytest.approx(0.86))
+    assert transcript.text == ""
+    assert transcript.no_speech_probability == pytest.approx(0.86)
 
 
 async def test_nothing_left_to_decode_is_certainly_no_speech() -> None:
