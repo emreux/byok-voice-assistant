@@ -24,6 +24,7 @@ from assistant.config import (
     LLMSettings,
     LocaleSettings,
     Settings,
+    ToolSettings,
     config_dir,
     config_path,
     data_dir,
@@ -108,6 +109,16 @@ def test_the_input_device_round_trips_through_the_file(config_home: Path) -> Non
 
 def test_no_input_device_means_the_system_default(config_home: Path) -> None:
     assert load_settings().audio.input_device == ""
+
+
+def test_the_unblocked_tools_round_trip_through_the_file(config_home: Path) -> None:
+    save_settings(Settings(tools=ToolSettings(unblocked=["delete_file", "run_command"])))
+
+    assert load_settings().tools.unblocked == ["delete_file", "run_command"]
+
+
+def test_no_tool_is_unblocked_by_default(config_home: Path) -> None:
+    assert load_settings().tools.unblocked == []
 
 
 def test_a_file_written_before_there_was_an_audio_table_still_loads(config_home: Path) -> None:

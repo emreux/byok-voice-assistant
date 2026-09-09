@@ -42,6 +42,7 @@ __all__ = [
     "LLMSettings",
     "LocaleSettings",
     "Settings",
+    "ToolSettings",
     "config_dir",
     "config_path",
     "data_dir",
@@ -162,6 +163,20 @@ class AudioSettings(BaseModel):
     input_device: str = ""
 
 
+class ToolSettings(BaseModel):
+    """Which `blocked` tools the user switched on, by name (section 3.9).
+
+    A tool declared `blocked` never runs unless it is named here, and even
+    then it asks first. A list in a file is deliberately the only way to open
+    one: editing the file is a decision made calmly, a spoken "yes" in the
+    middle of a turn is not.
+    """
+
+    model_config = ConfigDict(extra="ignore")
+
+    unblocked: list[str] = []
+
+
 class Settings(BaseSettings):
     """Everything phase 1 stores. There is deliberately no field for a key."""
 
@@ -176,6 +191,7 @@ class Settings(BaseSettings):
     llm: LLMSettings = LLMSettings()
     locale: LocaleSettings = LocaleSettings()
     audio: AudioSettings = AudioSettings()
+    tools: ToolSettings = ToolSettings()
 
     @classmethod
     def settings_customise_sources(
