@@ -27,6 +27,14 @@ the callback and never reaches memory. Hands-free is exactly the decision to
 stop dropping them - fifty blocks a second do cross into the event loop while
 it is on, each costing a fraction of a millisecond, and none at all while it
 is off.
+
+The confirmation window of phase 2.3 is the third way to be listened to.
+`listen_for` takes the next sentence - by the key, or by the detector whether
+or not hands-free is on - for a few seconds, and hands it back to whoever
+asked instead of queueing it as a question. What is said inside it is an
+answer, so the key going down there is not announced: the state machine
+would otherwise take the user's "yes" for a new question and withdraw the
+one it was asking.
 """
 
 from __future__ import annotations
@@ -170,6 +178,10 @@ class PushToTalk:
         self._take: list[Audio] | None = None
         self._finished: asyncio.Queue[list[Audio]] = asyncio.Queue()
 
+        # The window of `listen_for`, while one is open: the next take goes
+        # here instead of into `_finished`, and its press is not announced.
+        self._window: asyncio.Future[list[Audio]] | None = None
+
     def start(self) -> None:
         """Opens the microphone and starts watching the keyboard."""
         self._loop = asyncio.get_running_loop()
@@ -208,12 +220,26 @@ class PushToTalk:
 
     async def utterance(self) -> Audio:
         """Waits for the next completed recording and returns it as one buffer."""
-        chunks = await self._finished.get()
-        if not chunks:
-            # A stray press. Still a turn - what to make of it belongs to the
-            # state machine, not here.
-            return np.empty(0, dtype=np.float32)
-        return np.concatenate(chunks).astype(np.float32, copy=False)
+        return _as_audio(await self._finished.get())
+
+    async def listen_for(self, seconds: float) -> Audio | None:
+        """The next recording, if the key is pressed within `seconds`; else `None`.
+
+        The confirmation window of `app.py` (section 3.1 rule 2). With no
+        detector the only way to answer is the key, so a press while the
+        window is open is the answer and not a new question: `on_listening`
+        is not called for it, and what it recorded comes back here rather
+        than through `utterance`. The window closes when time is up or on
+        the first recording, whichever comes first.
+        """
+        self._window = asyncio.get_running_loop().create_future()
+        try:
+            chunks = await asyncio.wait_for(self._window, seconds)
+        except TimeoutError:
+            return None
+        finally:
+            self._window = None
+        return _as_audio(chunks)
 
     # ----------------------------------------------------------------------
     # Called from other threads. Nothing here touches asyncio directly.
@@ -241,7 +267,9 @@ class PushToTalk:
 
     def _begin(self) -> None:
         self._take = []
-        if self.on_listening is not None:
+        # Inside the window a press is the answer being given, not a new
+        # question: the state machine is not told, so it does not withdraw.
+        if self._window is None and self.on_listening is not None:
             self.on_listening()
 
     def _keep(self, chunk: Audio) -> None:
@@ -253,7 +281,11 @@ class PushToTalk:
 
     def _end(self) -> None:
         take, self._take = self._take, None
-        if take is not None:
+        if take is None:
+            return
+        if self._window is not None and not self._window.done():
+            self._window.set_result(take)
+        else:
             self._finished.put_nowait(take)
 
 
@@ -313,6 +345,10 @@ class HandsFree(PushToTalk):
         self._on = threading.Event()
         self._muted = threading.Event()
 
+        # Set while `listen_for` is open, so that the detector is shown blocks
+        # even with hands-free off. Read on the audio thread like the others.
+        self._answering = threading.Event()
+
         # Counted down on the event loop, in samples rather than blocks so that
         # a block of any size costs what it actually holds.
         self._deaf_samples = 0
@@ -355,7 +391,7 @@ class HandsFree(PushToTalk):
             # The key is held: this block belongs to that recording, and the
             # detector is not shown it.
             self._to_loop(self._keep, chunk)
-        elif self._on.is_set() and not self._muted.is_set():
+        elif self._answering.is_set() or (self._on.is_set() and not self._muted.is_set()):
             self._to_loop(self._examine, chunk)
 
     def _pressed(self) -> None:
@@ -363,6 +399,24 @@ class HandsFree(PushToTalk):
         # is about to say deliberately.
         super()._pressed()
         self._to_loop(self._endpoint.reset)
+
+    async def listen_for(self, seconds: float) -> Audio | None:
+        """One sentence within `seconds`, by the detector or the key; else `None`.
+
+        Opened whether or not hands-free is on: the assistant asked a
+        question, and hearing the answer is the point of asking. The echo
+        tail `unmute` left behind still counts down first - the room
+        repeating the question is not a yes. The detector starts afresh on
+        either side of the window, and what it hears inside is the answer:
+        not announced, and never a question.
+        """
+        self._endpoint.reset()
+        self._answering.set()
+        try:
+            return await super().listen_for(seconds)
+        finally:
+            self._answering.clear()
+            self._endpoint.reset()
 
     def _toggled(self) -> None:
         if self._on.is_set():
@@ -395,6 +449,14 @@ class HandsFree(PushToTalk):
         started = self._endpoint.speaking
         finished = self._endpoint.feed(chunk)
 
+        if self._window is not None:
+            # The sentence answers the question just asked: it goes to whoever
+            # asked, and the state machine is not told a new question began.
+            for utterance in finished:
+                if not self._window.done():
+                    self._window.set_result([utterance])
+            return
+
         # Announced before the sentence is handed over, and for the same reason
         # the parent announces the key going down: this is the moment the state
         # machine learns that whatever it was doing has been overtaken.
@@ -403,6 +465,15 @@ class HandsFree(PushToTalk):
 
         for utterance in finished:
             self._finished.put_nowait([utterance])
+
+
+def _as_audio(chunks: list[Audio]) -> Audio:
+    """The blocks of one take as a single buffer."""
+    if not chunks:
+        # A stray press. Still a turn - what to make of it belongs to the
+        # state machine, not here.
+        return np.empty(0, dtype=np.float32)
+    return np.concatenate(chunks).astype(np.float32, copy=False)
 
 
 def _nothing() -> None:
