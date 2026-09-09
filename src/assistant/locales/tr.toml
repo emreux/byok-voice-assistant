@@ -13,6 +13,12 @@ language = "tr"
 # the commands people say most. The app names are added by the program.
 vocabulary_hint = "aç, ayarlar, müzik, sonraki, önceki, saat, Bluetooth, Spotify"
 
+[speech]
+# What the confirmation window listens for (design.md 3.1 rule 2). Whole
+# words, any case; a "no" anywhere in the answer wins over a "yes".
+yes_words = ["evet", "onaylıyorum", "tamam", "olur"]
+no_words = ["hayır", "iptal", "vazgeç", "olmaz"]
+
 [tts.voice]
 # Tolga is the voice Windows itself ships for Turkish. It lives in the
 # Speech_OneCore registry hive, which `tts/sapi.py` reads on purpose.
@@ -42,6 +48,8 @@ unreachable = "Sağlayıcıya bağlanamadım, tekrar dener misin?"
 key_invalid = "API anahtarın geçersiz görünüyor, yenilemen gerekiyor."
 took_too_long = "Bu iş uzadı, tekrar dener misin?"
 not_understood = "Seni anlayamadım, tekrar söyler misin?"
+confirm_hint = "Evet ya da hayır de."
+confirm_again = "Anlayamadım. Evet mi, hayır mı?"
 
 # Shown on screen while it runs - the status line and what a turn left behind
 # (item 1.11). Short: they share one line with the hotkey.
@@ -52,6 +60,7 @@ state_idle = "hazır"
 state_listening = "dinliyor"
 state_transcribing = "yazıya döküyor"
 state_thinking = "düşünüyor"
+state_confirming = "onay bekliyor"
 state_speaking = "konuşuyor"
 you_said = "sen"
 it_said = "asistan"

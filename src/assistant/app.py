@@ -1,9 +1,10 @@
 """The state machine - where the pieces of phase 1 become a product (item 1.10).
 
 `IDLE`, then `LISTENING` while the key is held, then `TRANSCRIBING`, `THINKING`
-and `SPEAKING`, and back to `IDLE`. `CONFIRMING` arrives with the first tool in
-phase 2.3 and `ANNOUNCING` with the announce queue in phase 4.2; the diagram in
-section 3.1 is the target, not this file (rule 6).
+and `SPEAKING`, and back to `IDLE`. `CONFIRMING` is the window of phase 2.3,
+opened from inside `THINKING` when a tool wants a yes; `ANNOUNCING` arrives
+with the announce queue in phase 4.2. The diagram in section 3.1 is the
+target, not this file (rule 6).
 
 Everything is injected - the microphone, the recogniser, the model, the voice,
 the sound card - so the whole turn can be driven in a test without any of them.
@@ -37,6 +38,19 @@ somebody noticed. Which microphone is being deafened is not this file's
 business: it calls `mute` and `unmute`, and the capture that has nothing to
 mute does nothing.
 
+**A tool that wants a yes gets one out loud, or does not run.** The gate of
+section 3.9 hands `confirm` the sentence with the real argument values in it;
+this file reads it, tells the user how to answer, and opens the microphone
+for six seconds without waiting for a key (section 3.1 rule 2). A "no"
+anywhere in the answer wins over a "yes"; silence is a no; an answer with
+neither word in it is asked about once more, and a second such answer is a no
+as well. Every path that is not a clear yes ends in nothing being done - the
+window exists so that an action the user did not agree to cannot happen, not
+so that one they did agree to happens quickly. The exchange belongs to the
+gate, not to the model: nothing said in it reaches the conversation. The
+words that count as yes and no come from the locale pack; the English ones
+below are the end of the chain.
+
 **Three failures are said out loud, and no others.** A refused key means the
 user has to go and renew it (section 3.2), a provider that cannot be reached
 means try again, and a minute of thinking means the same. Anything else is a
@@ -54,8 +68,9 @@ English constants below are the end of the chain, exactly as in the wizard
 from __future__ import annotations
 
 import asyncio
+import re
 import uuid
-from collections.abc import AsyncIterator, Callable, Sequence
+from collections.abc import AsyncIterator, Callable, Iterable, Sequence
 from dataclasses import dataclass, field
 from enum import StrEnum
 from typing import Protocol
@@ -66,13 +81,17 @@ from assistant.agent.core import Agent
 from assistant.audio.player import PlaybackError, Speaker
 from assistant.llm.base import AuthenticationError, ProviderError, Usage
 from assistant.locales import Locale
+from assistant.store.normalize import normalize_search
 from assistant.stt.base import NO_SPEECH_CEILING, SAMPLE_RATE, Audio, STTProvider, Transcript
 from assistant.tts.base import TTSProvider, VoiceInfo
 
 __all__ = [
+    "CONFIRM_WINDOW_SECONDS",
     "MIN_UTTERANCE_SECONDS",
+    "NO_WORDS",
     "TEXT",
     "THINKING_TIMEOUT",
+    "YES_WORDS",
     "Assistant",
     "Capture",
     "Heard",
@@ -81,6 +100,7 @@ __all__ = [
     "Turn",
     "choose_voice",
     "hear",
+    "read_answer",
 ]
 
 
@@ -100,15 +120,26 @@ class State(StrEnum):
     LISTENING = "listening"
     TRANSCRIBING = "transcribing"
     THINKING = "thinking"
+    CONFIRMING = "confirming"
     SPEAKING = "speaking"
 
 
 # Section 3.1 rule 5. A turn that has not finished in a minute is not going to.
 THINKING_TIMEOUT = 60.0
 
+# Section 3.1 rule 6. How long the microphone stays open for a yes or a no
+# after the question has been read; what comes after it is a no.
+CONFIRM_WINDOW_SECONDS = 6.0
+
 # Shorter than this and the key was tapped rather than held. Below a syllable,
 # so nothing anybody meant to say is thrown away.
 MIN_UTTERANCE_SECONDS = 0.35
+
+# The last link of the chain of section 3.12 for the two words the window
+# listens for, as `TEXT` is for the sentences: the pack's `[speech]` table
+# answers first, and a pack that has none gets these.
+YES_WORDS = ("yes", "ok", "okay", "confirm")
+NO_WORDS = ("no", "cancel", "stop")
 
 # The last link of the chain of section 3.12: what is said when no locale pack
 # offers a translation. Keys are unique across the whole project - the pack has
@@ -119,6 +150,10 @@ TEXT: dict[str, str] = {
     "key_invalid": "Your API key is not being accepted any more. You need to renew it.",
     "took_too_long": "That took too long. Will you try again?",
     "not_understood": "I did not catch that. Will you say it again?",
+    # Read after the gate's question, so the user knows what kind of answer is
+    # being listened for - and again, alone, when the answer had neither.
+    "confirm_hint": "Say yes or no.",
+    "confirm_again": "I did not catch that. Yes, or no?",
 }
 
 
@@ -203,6 +238,15 @@ class Capture(Protocol):
         """Waits for the next completed recording."""
         ...
 
+    async def listen_for(self, seconds: float) -> Audio | None:
+        """One sentence within `seconds`, key or no key; `None` if none came.
+
+        The window of section 3.1 rule 2. What is said in it is an answer to
+        the assistant, not a question for it, so it is not announced through
+        `on_listening` and does not come back through `utterance`.
+        """
+        ...
+
 
 class Assistant:
     """One turn after another, for as long as the program runs."""
@@ -231,6 +275,8 @@ class Assistant:
         self._on_turn = on_turn
 
         self._said = {key: locale.say(key, default) for key, default in TEXT.items()}
+        self._yes = locale.yes_words or YES_WORDS
+        self._no = locale.no_words or NO_WORDS
         self._state = State.IDLE
         self._voice = ""
 
@@ -291,6 +337,29 @@ class Assistant:
         self._rest()
         return Turn(heard=heard.text, said=said, usage=usage, failure=failure, turn_id=turn_id)
 
+    async def confirm(self, question: str) -> bool:
+        """Asks `question` out loud and listens for a yes (section 3.1 rule 2).
+
+        The gate's `Confirm`. `question` already holds the real argument
+        values; what is added is how to answer, since the user cannot know
+        that only two words are being listened for. Everything that is not a
+        clear yes is a no: silence, a no beside a yes, a press of the key
+        while the question is still being read, and two answers with neither
+        word in them.
+        """
+        if self._withdrawn():
+            return False
+
+        self._enter(State.CONFIRMING)
+        answer = await self._ask(f"{question} {self._said['confirm_hint']}")
+        if answer is None:
+            answer = await self._ask(self._said["confirm_again"])
+
+        # Back to where the turn was: the loop that asked is still running.
+        if not self._withdrawn():
+            self._enter(State.THINKING)
+        return answer is True
+
     async def _missed(self, heard: Heard) -> Turn:
         """Nothing usable came back. Whether that is worth saying depends.
 
@@ -333,7 +402,8 @@ class Assistant:
         """
         try:
             answer = await asyncio.wait_for(
-                self._agent.reply(heard, turn_id=turn_id), self._thinking_timeout
+                self._agent.reply(heard, turn_id=turn_id, confirm=self.confirm),
+                self._thinking_timeout,
             )
         except TimeoutError:
             return self._said["took_too_long"], Usage(), "took_too_long"
@@ -349,14 +419,41 @@ class Assistant:
 
         return answer.text, answer.usage, None
 
+    async def _ask(self, prompt: str) -> bool | None:
+        """Reads `prompt`, opens the window, and reads the answer.
+
+        `None` is "neither word was heard": something was said, or the
+        recogniser could not read it, and it is worth one more try. `False`
+        is every way of not saying yes that is not worth one: silence, a no,
+        the key going down while the question was still being read.
+        """
+        await self._play(prompt)
+        if self._withdrawn():
+            return False
+
+        pcm = await self._capture.listen_for(CONFIRM_WINDOW_SECONDS)
+        if pcm is None or self._withdrawn():
+            return False
+
+        heard = await self._heard(pcm)
+        if not heard.text:
+            return None if heard.missed else False
+        return read_answer(heard.text, yes=self._yes, no=self._no)
+
     async def _speak(self, said: str) -> None:
         if not said or self._withdrawn():
             return
 
         self._enter(State.SPEAKING)
-        # The microphone is deaf for exactly as long as there is something for
-        # it to mishear, and in a `finally` because an answer that failed
-        # halfway through must not leave the assistant unable to hear at all.
+        await self._play(said)
+
+    async def _play(self, said: str) -> None:
+        """Says `said` through the sound card, with the microphone deaf meanwhile.
+
+        Deaf for exactly as long as there is something for it to mishear, and
+        in a `finally` because an answer that failed halfway through must not
+        leave the assistant unable to hear at all.
+        """
         self._capture.mute()
         try:
             await self._speaker.play(
@@ -391,9 +488,12 @@ class Assistant:
             self._enter(State.IDLE)
 
     def _key_went_down(self) -> None:
-        was_speaking = self._state is State.SPEAKING
+        # A question being read is cut off like an answer: the user is talking
+        # over it. A press inside the window itself never arrives here - the
+        # capture keeps it as the answer (`Capture.listen_for`).
+        was_talking = self._state in (State.SPEAKING, State.CONFIRMING)
         self._enter(State.LISTENING)
-        if was_speaking:
+        if was_talking:
             self._speaker.stop()
 
     async def _pick_voice(self) -> str:
@@ -457,6 +557,40 @@ def hear(transcript: Transcript) -> Heard:
 
     # There was speech, or an engine with no opinion, and no words came of it.
     return Heard(missed=True, confidence=transcript.confidence)
+
+
+# A word, for the purpose of hearing "yes" in an answer: letters and digits in
+# any script. Punctuation and the spaces between are where words end.
+_WORD = re.compile(r"\w+")
+
+
+def read_answer(text: str, *, yes: Iterable[str], no: Iterable[str]) -> bool | None:
+    """Whether `text` says yes, says no, or says neither.
+
+    Whole words, folded the way search is (`store/normalize.py`): "Evet." and
+    "EVET" are the same word, and "evetlemedim" is not it. A `no` word
+    anywhere wins over a `yes` word - "yes, but no" is a no - because the
+    window only ever guards something that should not happen by mistake.
+    `None` means neither was heard, and is the caller's cue to ask once more.
+    """
+    said = _spaced(text)
+    if any(phrase in said for phrase in _phrases(no)):
+        return False
+    if any(phrase in said for phrase in _phrases(yes)):
+        return True
+    return None
+
+
+def _phrases(words: Iterable[str]) -> list[str]:
+    """Each entry as it would appear inside `_spaced` text; blanks dropped."""
+    spaced = (_spaced(word) for word in words)
+    return [phrase for phrase in spaced if phrase.strip()]
+
+
+def _spaced(text: str) -> str:
+    """The words of `text`, folded, one space between and one either side -
+    so that a phrase of one or more words can be found only at word edges."""
+    return f" {' '.join(_WORD.findall(normalize_search(text)))} "
 
 
 async def _one(said: str) -> AsyncIterator[str]:

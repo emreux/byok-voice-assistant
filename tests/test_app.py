@@ -27,15 +27,18 @@ locale pack, with the English constants of `app.TEXT` as the end of the chain
 
 from __future__ import annotations
 
-from collections.abc import AsyncIterator, Callable
+from collections.abc import AsyncIterator, Callable, Iterator, Sequence
+from typing import Any
 
 import numpy as np
 import pytest
 from loguru import logger
 
 from assistant import app
-from assistant.agent.core import Agent
+from assistant.agent.core import Agent, Confirm
+from assistant.agent.policy import DECLINED, dispatch
 from assistant.app import (
+    CONFIRM_WINDOW_SECONDS,
     THINKING_TIMEOUT,
     Assistant,
     Heard,
@@ -44,6 +47,7 @@ from assistant.app import (
     Turn,
     choose_voice,
     hear,
+    read_answer,
 )
 from assistant.audio.player import PlaybackError
 from assistant.llm.base import AuthenticationError, Delta, ProviderError, ToolCall, Usage
@@ -66,7 +70,11 @@ TURKISH = Locale(
         "unreachable": "Sağlayıcıya bağlanamadım, tekrar dener misin?",
         "took_too_long": "Bu iş uzadı, tekrar dener misin?",
         "not_understood": "Seni anlayamadım, tekrar söyler misin?",
+        "confirm_hint": "Evet ya da hayır de.",
+        "confirm_again": "Anlayamadım. Evet mi, hayır mı?",
     },
+    yes_words=("evet", "tamam"),
+    no_words=("hayır", "iptal"),
 )
 
 
@@ -81,7 +89,7 @@ class StopError(Exception):
 class FakeCapture:
     """Push to talk without a keyboard: utterances arrive in the order given."""
 
-    def __init__(self, *utterances: Audio) -> None:
+    def __init__(self, *utterances: Audio, answers: Sequence[Audio | None] = ()) -> None:
         self.on_listening: Callable[[], None] | None = None
         self.started = False
         # Whether the state machine has told it to stop listening, and how many
@@ -90,6 +98,12 @@ class FakeCapture:
         self.deaf = False
         self.switches: list[bool] = []
         self._waiting = list(utterances)
+        # What each confirmation window hears, in order - a window with
+        # nothing scripted hears silence - and, for each one opened, how long
+        # it was opened for and whether the microphone was deaf at the time.
+        self.windows: list[float] = []
+        self.deaf_windows: list[bool] = []
+        self._answers = list(answers)
 
     def start(self) -> None:
         self.started = True
@@ -109,6 +123,11 @@ class FakeCapture:
         if not self._waiting:
             raise StopError
         return self._waiting.pop(0)
+
+    async def listen_for(self, seconds: float) -> Audio | None:
+        self.windows.append(seconds)
+        self.deaf_windows.append(self.deaf)
+        return self._answers.pop(0) if self._answers else None
 
     def press(self) -> None:
         """What the hotkey does the moment it goes down."""
@@ -833,7 +852,7 @@ class FakeGate:
     def __init__(self) -> None:
         self.turn_ids: list[str] = []
 
-    async def __call__(self, call: ToolCall, *, turn_id: str) -> str:
+    async def __call__(self, call: ToolCall, *, turn_id: str, confirm: Confirm) -> str:
         self.turn_ids.append(turn_id)
         return "15:04"
 
@@ -922,3 +941,300 @@ async def test_every_turn_is_handed_to_whoever_is_watching() -> None:
         await assistant_with(capture=capture, provider=provider, on_turn=seen.append).run()
 
     assert [turn.said for turn in seen] == ["Bir.", "İki."]
+
+
+# --------------------------------------------------------------------------
+# The confirmation window (2.3)
+# --------------------------------------------------------------------------
+
+
+@tool(risk="confirm", confirm_prompt="{name} will be opened.")
+async def open_app(name: str) -> str:
+    """Opens an application, once the user has said yes."""
+    ran.append(f"open_app:{name}")
+    return f"{name} opened"
+
+
+# What ran, in order. The body of the one risky tool above writes here, so
+# "did not run" is something a test sees rather than assumes.
+ran: list[str] = []
+
+
+@pytest.fixture(autouse=True)
+def _nothing_ran_before() -> Iterator[None]:
+    ran.clear()
+    yield
+    ran.clear()
+
+
+async def through_the_gate(call: ToolCall, *, turn_id: str, confirm: Confirm) -> str:
+    """The real gate of section 3.9 over this file's one risky tool."""
+    return await dispatch(call, turn_id=turn_id, registry=ToolRegistry([open_app]), confirm=confirm)
+
+
+def wants_spotify() -> ScriptedProvider:
+    """A model that asks to open Spotify, then says whatever it has to say."""
+    return ScriptedProvider(
+        [Delta(tool_call=ToolCall(id="c1", name="open_app", arguments={"name": "Spotify"}))],
+        [Delta(text="Tamam.")],
+    )
+
+
+def asking(provider: ScriptedProvider | None = None, **parts: Any) -> Assistant:
+    """An assistant whose gate is the real one and whose model wants Spotify."""
+    agent = Agent(
+        provider if provider is not None else wants_spotify(),
+        model="fake-1",
+        tools=ToolRegistry([open_app]),
+        dispatch=through_the_gate,
+    )
+    return assistant_with(agent=agent, **parts)
+
+
+def says(*answers: str) -> FakeSTT:
+    """A recogniser that hears the request first, then each answer in turn."""
+    return FakeSTT(
+        Transcript(text="Spotify'ı aç", confidence=0.9),
+        *(Transcript(text=answer, confidence=0.9) for answer in answers),
+    )
+
+
+async def test_a_tool_that_asks_runs_when_the_user_says_yes() -> None:
+    capture = FakeCapture(answers=[speech()])
+
+    await one_turn(asking(capture=capture, stt=says("Evet.")))
+
+    assert ran == ["open_app:Spotify"]
+    assert capture.windows == [CONFIRM_WINDOW_SECONDS]
+
+
+async def test_the_question_says_how_to_answer() -> None:
+    """The user cannot know only two words are being listened for, so the
+    gate's sentence - real argument values and all - is followed by the
+    pack's hint on how to answer it."""
+    tts = FakeTTS()
+
+    await one_turn(asking(capture=FakeCapture(answers=[speech()]), stt=says("evet"), tts=tts))
+
+    assert tts.said[0] == "Spotify will be opened. Evet ya da hayır de."
+
+
+async def test_a_tool_that_asks_does_not_run_when_the_user_says_no() -> None:
+    await one_turn(asking(capture=FakeCapture(answers=[speech()]), stt=says("Hayır.")))
+
+    assert ran == []
+
+
+async def test_the_model_is_told_the_user_declined() -> None:
+    """In the tool's own channel, so the model can say so rather than pretend."""
+    provider = wants_spotify()
+
+    await one_turn(asking(provider, capture=FakeCapture(answers=[speech()]), stt=says("hayır")))
+
+    assert provider.calls[-1].turns[-1].content == DECLINED
+
+
+async def test_silence_in_the_window_is_a_no() -> None:
+    """Six seconds of nothing is the safe side (section 3.1 rule 2), and
+    not worth asking again: nobody was there to hear the second question."""
+    capture = FakeCapture()
+    tts = FakeTTS()
+
+    await one_turn(asking(capture=capture, stt=says(), tts=tts))
+
+    assert ran == []
+    assert capture.windows == [CONFIRM_WINDOW_SECONDS]
+    assert TURKISH.ui["confirm_again"] not in tts.said
+
+
+async def test_an_answer_with_neither_word_is_asked_about_once_more() -> None:
+    capture = FakeCapture(answers=[speech(), speech()])
+    tts = FakeTTS()
+
+    await one_turn(asking(capture=capture, stt=says("belki", "evet"), tts=tts))
+
+    assert ran == ["open_app:Spotify"]
+    assert len(capture.windows) == 2
+    assert tts.said[1] == TURKISH.ui["confirm_again"]
+
+
+async def test_two_answers_with_neither_word_are_a_no() -> None:
+    capture = FakeCapture(answers=[speech(), speech()])
+
+    await one_turn(asking(capture=capture, stt=says("belki", "olabilir")))
+
+    assert ran == []
+    assert len(capture.windows) == 2
+
+
+async def test_speech_that_could_not_be_read_is_asked_about_once_more() -> None:
+    """The engine says there was speech and gives no words for it: worth a
+    second question, unlike silence."""
+    capture = FakeCapture(answers=[speech(), speech()])
+    stt = FakeSTT(
+        Transcript(text="Spotify'ı aç", confidence=0.9),
+        Transcript(text="", no_speech_probability=0.0),
+        Transcript(text="evet"),
+    )
+
+    await one_turn(asking(capture=capture, stt=stt))
+
+    assert ran == ["open_app:Spotify"]
+    assert len(capture.windows) == 2
+
+
+async def test_a_recording_the_engine_calls_silence_is_silence() -> None:
+    """The detector fired on a cough; the engine says nothing was said. Words
+    it produced anyway are not an answer, and silence is not a reason to ask
+    again."""
+    capture = FakeCapture(answers=[speech(), speech()])
+    stt = FakeSTT(
+        Transcript(text="Spotify'ı aç", confidence=0.9),
+        Transcript(text="evet", no_speech_probability=1.0),
+    )
+
+    await one_turn(asking(capture=capture, stt=stt))
+
+    assert ran == []
+    assert len(capture.windows) == 1
+
+
+async def test_a_no_beside_a_yes_is_a_no() -> None:
+    await one_turn(asking(capture=FakeCapture(answers=[speech()]), stt=says("evet, yok hayır")))
+
+    assert ran == []
+
+
+async def test_the_turn_passes_through_confirming_and_back_into_thinking() -> None:
+    """The loop that asked is still running; the window is a detour from
+    `THINKING`, not a state the turn ends in."""
+    seen: list[State] = []
+
+    await one_turn(
+        asking(capture=FakeCapture(answers=[speech()]), stt=says("evet"), on_state=seen.append)
+    )
+
+    assert seen == [
+        State.IDLE,
+        State.TRANSCRIBING,
+        State.THINKING,
+        State.CONFIRMING,
+        State.THINKING,
+        State.SPEAKING,
+        State.IDLE,
+    ]
+
+
+async def test_the_microphone_is_deaf_while_the_question_is_read_and_not_after() -> None:
+    """A question is something the microphone could mishear like any answer,
+    and the window right after it is the one moment it has to hear."""
+    capture = FakeCapture(answers=[speech()])
+    during: list[bool] = []
+    speaker = FakeSpeaker(on_play=lambda: during.append(capture.deaf))
+
+    await one_turn(asking(capture=capture, stt=says("evet"), speaker=speaker))
+
+    assert during == [True, True], "the question, then the answer"
+    assert capture.deaf_windows == [False]
+
+
+async def test_a_press_while_the_question_is_read_is_a_no() -> None:
+    """The user is talking over the question: a new question, and the window
+    is never opened. Nothing runs, and what the model says about being
+    refused is not said over them either."""
+    capture = FakeCapture()
+    speaker = FakeSpeaker()
+    speaker.on_play = capture.press
+    assistant = asking(capture=capture, stt=says("evet"), speaker=speaker)
+
+    await one_turn(assistant)
+
+    assert ran == []
+    assert capture.windows == []
+    assert speaker.stopped
+    assert assistant.state is State.LISTENING
+
+
+async def test_what_was_said_in_the_window_never_reaches_the_model() -> None:
+    """The exchange belongs to the gate. The model asked a question of the
+    user through the gate and gets the gate's answer, not the words."""
+    provider = wants_spotify()
+
+    turn = await one_turn(
+        asking(provider, capture=FakeCapture(answers=[speech()]), stt=says("evet"))
+    )
+
+    assert turn.heard == "Spotify'ı aç"
+    assert turn.said == "Tamam."
+    assert not any(
+        "evet" in str(message.content) for request in provider.calls for message in request.turns
+    )
+
+
+async def test_the_words_that_count_come_from_the_pack() -> None:
+    """A pack that names no words gets the English ones beside the code."""
+    english = Locale(code="en", name="English", stt_language="en", voices={}, ui={})
+
+    await one_turn(
+        asking(capture=FakeCapture(answers=[speech()]), stt=says("Yes."), locale=english)
+    )
+
+    assert ran == ["open_app:Spotify"]
+
+
+async def test_the_pack_s_words_replace_the_english_ones_rather_than_adding_to_them() -> None:
+    """The Turkish pack says nothing about "yes", so "yes" is not a yes."""
+    await one_turn(asking(capture=FakeCapture(answers=[speech()]), stt=says("yes")))
+
+    assert ran == []
+
+
+async def test_the_hint_falls_back_to_english_together_with_the_words() -> None:
+    """Whichever words are listened for, the hint names them: the two fall
+    back as one, or the user would be told to say words nobody hears."""
+    english = Locale(code="en", name="English", stt_language="en", voices={}, ui={})
+    tts = FakeTTS()
+
+    await one_turn(
+        asking(capture=FakeCapture(answers=[speech()]), stt=says("no"), tts=tts, locale=english)
+    )
+
+    assert tts.said[0] == "Spotify will be opened. " + app.TEXT["confirm_hint"]
+
+
+def test_the_window_is_the_six_seconds_section_3_1_allows() -> None:
+    assert CONFIRM_WINDOW_SECONDS == 6
+
+
+@pytest.mark.parametrize(
+    ("text", "expected"),
+    [
+        ("evet", True),
+        ("Evet.", True),
+        ("EVET", True),
+        ("tamam, olur", True),
+        ("hayır", False),
+        ("Hayır!", False),
+        ("HAYIR", False),
+        ("evet ama hayır", False),
+        ("belki", None),
+        ("", None),
+        ("evetlemedim", None),
+        ("hayırlısı olsun", None),
+    ],
+)
+def test_read_answer_hears_whole_words_in_any_case(text: str, expected: bool | None) -> None:
+    """Folded the way search is: "HAYIR" is "hayır" once the dotless i is
+    folded, which `casefold` alone gets wrong. Whole words, so that a word
+    that merely begins with "evet" is not a yes."""
+    assert read_answer(text, yes=("evet", "tamam", "olur"), no=("hayır", "iptal")) is expected
+
+
+def test_read_answer_hears_a_phrase_of_more_than_one_word() -> None:
+    assert read_answer("boş ver artık", yes=("evet",), no=("boş ver",)) is False
+    assert read_answer("boş verme, evet", yes=("evet",), no=("boş ver",)) is True
+
+
+def test_a_blank_entry_in_the_pack_matches_nothing() -> None:
+    """An empty string is inside every string; it must not be a yes."""
+    assert read_answer("belki", yes=("", " "), no=("",)) is None

@@ -7,6 +7,8 @@
 # There is deliberately no [ui] table. Every sentence already exists in English
 # next to the code that says it, and a second copy here would be a second thing
 # to keep in step - the two would drift, and the drift would be invisible.
+# No [speech] table either, for the same reason: the English yes and no words
+# are the constants beside the code that listens for them.
 
 code = "en"
 name = "English"

@@ -94,8 +94,10 @@ def test_a_pack_is_filed_under_the_name_of_its_own_file() -> None:
 
 def test_english_is_not_written_down_twice() -> None:
     """`en.toml` carries no sentences: English is already the constant the
-    chain ends at, and a second copy is a second thing to keep in step."""
+    chain ends at, and a second copy is a second thing to keep in step. The
+    same goes for the yes and no words the window listens for."""
     assert "ui" not in read(PACKAGED / "en.toml")
+    assert "speech" not in read(PACKAGED / "en.toml")
 
 
 def test_the_template_offers_every_sentence_a_translator_has_to_write() -> None:
@@ -313,3 +315,46 @@ def test_english_does_not_lend_its_vocabulary_either(tmp_path: Path) -> None:
     write(tmp_path, "en", '[stt]\nlanguage = "en"\nvocabulary_hint = "open, settings"\n')
 
     assert load("de", directory=tmp_path).stt_vocabulary == ""
+
+
+# --------------------------------------------------------------------------
+# The yes and no words (2.3)
+# --------------------------------------------------------------------------
+
+
+def test_turkish_knows_its_yes_and_no() -> None:
+    """The window of section 3.1 rule 2 listens for these; a pack without
+    them would have the assistant say "evet ya da hayır de" and hear neither."""
+    pack = load("tr")
+
+    assert pack.yes_words and pack.no_words
+    assert not set(pack.yes_words) & set(pack.no_words)
+
+
+def test_the_template_offers_the_two_lists_a_translator_has_to_fill() -> None:
+    assert set(read(PACKAGED / "_template.toml")["speech"]) == {"yes_words", "no_words"}
+
+
+def test_the_yes_and_no_words_come_from_the_pack(tmp_path: Path) -> None:
+    write(tmp_path, "de", '[speech]\nyes_words = ["ja", " jawohl "]\nno_words = ["nein"]\n')
+
+    pack = load("de", directory=tmp_path)
+
+    assert (pack.yes_words, pack.no_words) == (("ja", "jawohl"), ("nein",))
+
+
+def test_a_pack_without_them_leaves_the_words_to_the_code(tmp_path: Path) -> None:
+    """Like a sentence: the English words live beside the code that listens
+    for them, with the English hint that names them, and not in `en.toml`."""
+    write(tmp_path, "en", '[speech]\nyes_words = ["yes"]\n')
+
+    assert load("de", directory=tmp_path).yes_words == ()
+    assert load("de", directory=tmp_path).no_words == ()
+
+
+def test_words_of_the_wrong_shape_are_read_as_far_as_they_make_sense(tmp_path: Path) -> None:
+    write(tmp_path, "de", '[speech]\nyes_words = "ja"\nno_words = ["nein", 3, ""]\n')
+
+    pack = load("de", directory=tmp_path)
+
+    assert (pack.yes_words, pack.no_words) == ((), ("nein",))

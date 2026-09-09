@@ -25,10 +25,11 @@ the model, not the user, so the locale chain of section 3.12 does not apply.
 
 from __future__ import annotations
 
-from collections.abc import Awaitable, Callable, Iterable
+from collections.abc import Iterable
 
 from loguru import logger
 
+from assistant.agent.core import Confirm
 from assistant.llm.base import ToolCall
 from assistant.store.repos import AuditRepo
 from assistant.tools.registry import ToolRegistry
@@ -42,11 +43,6 @@ __all__ = [
     "Confirm",
     "dispatch",
 ]
-
-# Asks the user a question and answers yes or no. Who actually asks is decided
-# by whoever calls `dispatch`: phase 2.3 hands over the microphone, a test
-# hands over a fake, and the gate never learns the difference.
-Confirm = Callable[[str], Awaitable[bool]]
 
 NO_SUCH_TOOL = "There is no tool named {name!r}."
 DISABLED = "This tool is disabled in the current configuration."
@@ -72,6 +68,12 @@ async def dispatch(
 
     `turn_id` groups the rows of one turn in `tool_audit`, and `audit` is
     where they go. Without one - most tests - nothing is written.
+
+    `confirm` is whoever can put a question to the user and hear the
+    answer: the state machine's own microphone in life (`app.py`), a
+    fake in a test. It is a parameter rather than something built here so
+    that the gate never holds the microphone and the loop never holds the
+    gate's insides.
     """
     tool = registry.get(call.name)
     if tool is None:

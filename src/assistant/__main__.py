@@ -42,13 +42,11 @@ import sys
 from collections.abc import Callable, Sequence
 from typing import TYPE_CHECKING
 
-from loguru import logger
-
 from assistant import __version__, locales
 from assistant.config import Settings, is_configured, load_settings
 
 if TYPE_CHECKING:
-    from assistant.agent.core import Dispatch
+    from assistant.agent.core import Confirm, Dispatch
     from assistant.app import Turn
     from assistant.llm.base import ToolCall
     from assistant.locales import Locale
@@ -278,31 +276,23 @@ def _gate(settings: Settings, tools: ToolRegistry, audit: AuditRepo) -> Dispatch
     What the loop gets is a function of the call alone; the registry, the
     audit rows and the user's `[tools]` settings are bound here, so that
     `agent/core.py` never imports `policy.py` and a test can hand it a fake.
+    Who to ask is not bound here: it comes with each turn, because it is the
+    state machine's own microphone, and the state machine is built after
+    the gate.
     """
     from assistant.agent import policy
 
-    async def dispatch(call: ToolCall, *, turn_id: str) -> str:
+    async def dispatch(call: ToolCall, *, turn_id: str, confirm: Confirm) -> str:
         return await policy.dispatch(
             call,
             turn_id=turn_id,
             registry=tools,
-            confirm=_declines_until_phase_2_3,
+            confirm=confirm,
             unblocked=settings.tools.unblocked,
             audit=audit,
         )
 
     return dispatch
-
-
-async def _declines_until_phase_2_3(question: str) -> bool:
-    """Nobody can be asked yet, so the answer is no.
-
-    The `CONFIRMING` state of 2.3 is what opens the microphone for a yes or
-    no. Until then a `confirm` tool cannot run - and cannot quietly run
-    either, which is why this is a refusal and not a placeholder yes.
-    """
-    logger.info("a tool asked for confirmation; nobody can answer before phase 2.3")
-    return False
 
 
 def _finished(screen: StatusLine) -> Callable[[Turn], None]:

@@ -72,6 +72,14 @@ class Locale:
     # it out gives the recogniser nothing rather than the wrong thing.
     stt_vocabulary: str = ""
 
+    # The words the confirmation window listens for, from `[speech]`
+    # (design.md 3.1 rule 2). They fall back the way sentences do, not the
+    # way identity does: a pack without them gets the English words beside
+    # the code that listens (`app.py`), together with the English hint that
+    # tells the user which words to say - so the two always agree.
+    yes_words: tuple[str, ...] = ()
+    no_words: tuple[str, ...] = ()
+
     def voice(self, engine: str) -> str | None:
         """The voice this locale prefers for `engine`, if it names one."""
         return self.voices.get(engine) or None
@@ -104,6 +112,8 @@ def load(code: str | None = None, *, directory: Path | None = None) -> Locale:
         voices=_texts(_table(_table(pack, "tts"), "voice")),
         ui={**_texts(_table(english, "ui")), **_texts(_table(pack, "ui"))},
         stt_vocabulary=_text(_table(pack, "stt"), "vocabulary_hint").strip(),
+        yes_words=_words(_table(pack, "speech"), "yes_words"),
+        no_words=_words(_table(pack, "speech"), "no_words"),
     )
 
 
@@ -210,6 +220,14 @@ def _text(values: Mapping[str, Any], key: str) -> str:
 
 def _texts(values: Mapping[str, Any]) -> dict[str, str]:
     return {key: value for key, value in values.items() if isinstance(value, str)}
+
+
+def _words(values: Mapping[str, Any], key: str) -> tuple[str, ...]:
+    """A list of words, or nothing if the pack put something else there."""
+    found = values.get(key)
+    if not isinstance(found, list):
+        return ()
+    return tuple(word.strip() for word in found if isinstance(word, str) and word.strip())
 
 
 def _ui_language_id() -> int:

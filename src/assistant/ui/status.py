@@ -58,6 +58,7 @@ TEXT: dict[str, str] = {
     "state_listening": "listening",
     "state_transcribing": "writing it down",
     "state_thinking": "thinking",
+    "state_confirming": "waiting for a yes or no",
     "state_speaking": "speaking",
     "you_said": "you",
     "it_said": "assistant",
@@ -73,6 +74,7 @@ _STYLES: dict[State, str] = {
     State.LISTENING: "bold green",
     State.TRANSCRIBING: "yellow",
     State.THINKING: "cyan",
+    State.CONFIRMING: "bold yellow",
     State.SPEAKING: "magenta",
 }
 

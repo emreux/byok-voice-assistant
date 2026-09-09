@@ -27,6 +27,9 @@ clean turn rather than one built on half of a previous one.
 composition root builds the gate and passes it; a test passes a fake; and the
 loop cannot be talked into running a tool any other way, because it has no
 other way (invariant 1). Offering tools without a gate is refused outright.
+So is the one who answers a tool's question: `confirm` comes with each turn
+from `app.py`, because the microphone that hears the yes lives there and the
+gate that needs it is built first - neither can be built holding the other.
 
 **The system prompt is not part of the conversation.** It is prepended to each
 request instead of living in the history, which keeps it out of reach of the
@@ -41,7 +44,7 @@ times, and one of the three would be forgotten.
 
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import dataclass
 from typing import Protocol
 
@@ -55,7 +58,9 @@ __all__ = [
     "WINDOW_TURNS",
     "Agent",
     "Answer",
+    "Confirm",
     "Dispatch",
+    "decline",
     "window",
 ]
 
@@ -74,14 +79,26 @@ MAX_TOOL_CALLS = 8
 TOOL_LIMIT_REACHED = "Tool limit reached; answer with what you have."
 
 
+# Asks the user a question out loud and answers yes or no. Who actually asks
+# is decided by whoever calls `reply`: the state machine hands over the
+# microphone, a test hands over a fake, and the gate never learns which.
+Confirm = Callable[[str], Awaitable[bool]]
+
+
+async def decline(question: str) -> bool:
+    """Nobody to ask means no - never a quiet yes."""
+    return False
+
+
 class Dispatch(Protocol):
     """The gate, as the loop sees it: one call in, the words for the model out.
 
-    `turn_id` names the turn in `tool_audit` (section 3.9); the loop carries
-    it from `app.py` to the gate and never reads it.
+    `turn_id` names the turn in `tool_audit` (section 3.9) and `confirm` is
+    whoever can ask the user a question; the loop carries both from `app.py`
+    to the gate and reads neither.
     """
 
-    async def __call__(self, call: ToolCall, *, turn_id: str) -> str: ...
+    async def __call__(self, call: ToolCall, *, turn_id: str, confirm: Confirm) -> str: ...
 
 
 @dataclass(frozen=True, slots=True)
@@ -139,9 +156,14 @@ class Agent:
         self._dispatch = dispatch
         self._history: list[Message] = []
 
-    async def reply(self, said: str, *, turn_id: str = "") -> Answer:
+    async def reply(self, said: str, *, turn_id: str = "", confirm: Confirm = decline) -> Answer:
         """Answers one thing the user said, running whatever tools it takes,
-        and remembers having done so."""
+        and remembers having done so.
+
+        `confirm` is who a tool that wants a yes asks. Left out, the answer
+        is no: a tool that needs asking about is a tool that does not run
+        until somebody can be asked.
+        """
         conversation = window([*self._history, Message.user(said)])
         spent = Usage()
         dispatched = 0
@@ -161,7 +183,7 @@ class Agent:
             conversation.append(Message.assistant(got.text, got.tool_calls))
             for call in got.tool_calls:
                 if dispatched < MAX_TOOL_CALLS:
-                    result = await self._dispatch(call, turn_id=turn_id)
+                    result = await self._dispatch(call, turn_id=turn_id, confirm=confirm)
                     dispatched += 1
                 else:
                     result = TOOL_LIMIT_REACHED

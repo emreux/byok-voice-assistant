@@ -32,6 +32,14 @@ language = "xx"
 # after it, and the recogniser reads only so much. Leave it empty if unsure.
 vocabulary_hint = "open, settings, music, next, previous, time"
 
+[speech]
+# The words the assistant listens for after asking "shall I?" - the ones
+# people actually say, in your language. Whole words, any case. A word from
+# `no_words` anywhere in the answer wins over one from `yes_words`, so keep
+# the two lists apart. Leave the table out and the English words are used.
+yes_words = ["yes", "ok", "okay", "confirm"]
+no_words = ["no", "cancel", "stop"]
+
 [tts.voice]
 # The preferred voice per speech engine, matched against the voices actually
 # installed on the machine. It is a preference, not an identifier: when it is
@@ -70,6 +78,11 @@ unreachable = "I could not reach the provider. Will you try again?"
 key_invalid = "Your API key is not being accepted any more. You need to renew it."
 took_too_long = "That took too long. Will you try again?"
 not_understood = "I did not catch that. Will you say it again?"
+# Read after a tool's question ("... will be deleted. Shall I?"), so the
+# user knows only a yes or a no is being listened for; the second one when
+# the answer had neither.
+confirm_hint = "Say yes or no."
+confirm_again = "I did not catch that. Yes, or no?"
 
 # Shown on screen while the assistant runs (item 1.11). The status line holds
 # the state and the hotkey together on one line, so keep these short.
@@ -80,6 +93,7 @@ state_idle = "ready"
 state_listening = "listening"
 state_transcribing = "writing it down"
 state_thinking = "thinking"
+state_confirming = "waiting for a yes or no"
 state_speaking = "speaking"
 you_said = "you"
 it_said = "assistant"

@@ -30,7 +30,7 @@ import pytest
 from loguru import logger
 
 from assistant import app, locales, logs, setup_wizard
-from assistant.__main__ import TEXT, _declines_until_phase_2_3, build_parser, main, use_utf8
+from assistant.__main__ import TEXT, build_parser, main, use_utf8
 from assistant.agent import core
 from assistant.agent.policy import NO_SUCH_TOOL
 from assistant.app import State, Turn
@@ -380,13 +380,38 @@ def test_the_gate_the_agent_is_handed_is_the_permission_gate(
     [gate] = wiring.gates
     made_up = ToolCall(id="c1", name="format_disk", arguments={})
 
-    assert asyncio.run(gate(made_up, turn_id="t1")) == NO_SUCH_TOOL.format(name="format_disk")
+    refused = asyncio.run(gate(made_up, turn_id="t1", confirm=nobody_asked))
+    assert refused == NO_SUCH_TOOL.format(name="format_disk")
 
 
-def test_a_tool_that_asks_is_refused_until_there_is_someone_to_ask() -> None:
-    """The `CONFIRMING` state of 2.3 opens the microphone for a yes or no.
-    Until then the answer is no - and never a quiet yes."""
-    assert asyncio.run(_declines_until_phase_2_3("Spotify will be opened.")) is False
+async def nobody_asked(question: str) -> bool:
+    raise AssertionError(f"nobody should have been asked {question!r}")
+
+
+def test_who_answers_a_tool_s_question_comes_with_the_turn_and_reaches_the_gate(
+    configured: Path, wiring: Wiring, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The gate is built before the state machine, so who to ask cannot be
+    bound into it; each turn brings its own, and the gate hands it to
+    `policy.dispatch` unchanged."""
+    from assistant.agent import policy
+
+    handed: list[Any] = []
+
+    async def recording(call: ToolCall, **rest: Any) -> str:
+        handed.append(rest["confirm"])
+        return "recorded"
+
+    monkeypatch.setattr(policy, "dispatch", recording)
+    main(["run"])
+    [gate] = wiring.gates
+    order = ToolCall(id="c1", name="get_current_time", arguments={})
+
+    async def says_yes(question: str) -> bool:
+        return True
+
+    assert asyncio.run(gate(order, turn_id="t1", confirm=says_yes)) == "recorded"
+    assert handed == [says_yes]
 
 
 def test_the_database_is_built_where_the_data_lives(configured: Path, wiring: Wiring) -> None:

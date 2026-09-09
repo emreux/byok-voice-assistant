@@ -9,6 +9,10 @@ The second half is the audit trail of 2.1d. The claim there is one of order:
 the row is on disk *before* the tool's body starts, which is proved by a tool
 that reads the table from inside its own body. Everything else - `ok`,
 `error`, `denied`, what the arguments look like - follows from that row.
+
+The last two tests put the real `Confirm` behind the gate: the state
+machine's window of 2.3, over a fake microphone. Silence there is what
+"unconfirmed" means in life, and the tool still does not run.
 """
 
 from __future__ import annotations
@@ -19,6 +23,7 @@ from typing import Any
 
 import pytest
 
+from assistant.agent.core import Confirm
 from assistant.agent.policy import (
     DECLINED,
     DISABLED,
@@ -30,7 +35,9 @@ from assistant.agent.policy import (
 from assistant.llm.base import ToolCall, ToolSpec
 from assistant.store.db import open_database
 from assistant.store.repos import AuditRepo
+from assistant.stt.base import Transcript
 from assistant.tools.registry import Tool, ToolRegistry, tool
+from tests.test_app import FakeCapture, FakeSTT, assistant_with, speech
 
 TURN = "turn-1"
 
@@ -96,7 +103,7 @@ def call(tool_name: str, **arguments: str) -> ToolCall:
 async def gate(
     order: ToolCall,
     *,
-    confirm: FakeConfirm,
+    confirm: Confirm,
     registry: ToolRegistry = REGISTRY,
     unblocked: list[str] | None = None,
     audit: AuditRepo | None = None,
@@ -362,3 +369,32 @@ async def test_without_a_repository_the_gate_writes_nothing_and_still_works() ->
     answer = await gate(call("get_current_time"), confirm=FakeConfirm(answer=False), audit=None)
 
     assert answer == "09:12"
+
+
+# --------------------------------------------------------------------------
+# The gate and the microphone together (2.3)
+# --------------------------------------------------------------------------
+
+
+async def test_a_confirm_tool_does_not_run_when_the_microphone_hears_nothing() -> None:
+    """The claim CLAUDE.md names, with the real `Confirm` this time - the
+    state machine's own window. Nobody answers, and the tool does not run."""
+    assistant = assistant_with(capture=FakeCapture(), stt=FakeSTT())
+    await assistant.begin()
+
+    answer = await gate(call("open_app", name="Spotify"), confirm=assistant.confirm)
+
+    assert answer == DECLINED
+    assert ran == []
+
+
+async def test_a_confirm_tool_runs_when_the_microphone_hears_yes() -> None:
+    assistant = assistant_with(
+        capture=FakeCapture(answers=[speech()]), stt=FakeSTT(Transcript(text="evet"))
+    )
+    await assistant.begin()
+
+    answer = await gate(call("open_app", name="Spotify"), confirm=assistant.confirm)
+
+    assert answer == "Spotify opened"
+    assert ran == ["open_app:Spotify"]

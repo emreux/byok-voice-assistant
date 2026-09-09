@@ -37,7 +37,15 @@ from pathlib import Path
 import pytest
 
 from assistant.agent import prompts
-from assistant.agent.core import MAX_TOOL_CALLS, TOOL_LIMIT_REACHED, WINDOW_TURNS, Agent, window
+from assistant.agent.core import (
+    MAX_TOOL_CALLS,
+    TOOL_LIMIT_REACHED,
+    WINDOW_TURNS,
+    Agent,
+    Confirm,
+    decline,
+    window,
+)
 from assistant.agent.prompts import (
     BREVITY,
     LANGUAGE_FALLBACK,
@@ -403,10 +411,12 @@ class FakeGate:
     def __init__(self) -> None:
         self.calls: list[ToolCall] = []
         self.turn_ids: list[str] = []
+        self.confirms: list[Confirm] = []
 
-    async def __call__(self, call: ToolCall, *, turn_id: str) -> str:
+    async def __call__(self, call: ToolCall, *, turn_id: str, confirm: Confirm) -> str:
         self.calls.append(call)
         self.turn_ids.append(turn_id)
+        self.confirms.append(confirm)
         return f"{call.name}: done"
 
 
@@ -583,3 +593,35 @@ async def test_without_a_gate_a_call_the_model_makes_anyway_is_not_acted_on() ->
 
     assert answer.text == "Saat üç."
     assert len(provider.calls) == 1
+
+
+# --------------------------------------------------------------------------
+# Who answers a tool's question (2.3)
+# --------------------------------------------------------------------------
+
+
+async def test_the_one_who_answers_a_tool_s_question_is_handed_to_the_gate() -> None:
+    """`app.py` owns the microphone and the gate owns the question; the loop
+    carries the one to the other and reads neither."""
+    gate = FakeGate()
+    provider = ScriptedProvider([asks("clock")], [Delta(text="Üç.")])
+
+    async def says_yes(question: str) -> bool:
+        return True
+
+    await with_tools(provider, gate).reply("saat kaç?", confirm=says_yes)
+
+    assert gate.confirms == [says_yes]
+
+
+async def test_with_nobody_to_ask_the_answer_is_no() -> None:
+    """Never a quiet yes: a tool that needs asking about does not run until
+    somebody can be asked."""
+    gate = FakeGate()
+    provider = ScriptedProvider([asks("clock")], [Delta(text="Üç.")])
+
+    await with_tools(provider, gate).reply("saat kaç?")
+
+    [confirm] = gate.confirms
+    assert confirm is decline
+    assert await confirm("Spotify will be opened.") is False
