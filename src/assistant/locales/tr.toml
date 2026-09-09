@@ -62,6 +62,9 @@ answer_cut_off = "Cevabın sonu kesildi."
 daily_over = "Bugünkü harcama sınırını aştın."
 monthly_over = "Bu ayki harcama sınırını aştın."
 spend_stopped = "Harcama sınırı aşıldı, bu yüzden modele sormuyorum."
+# The fast path's answer to "saat kaç" (design.md 4). Two numbers for now;
+# the voice reads them, and the number formatter of phase 3 words them.
+time_is = "Saat {hour} {minute}."
 # Added by the gate to a risky tool's question when the same call ran a
 # moment ago (design.md 3.11). {ago} is one of the two spans below.
 duplicate_done = "Bunu {ago} önce zaten yaptın."

@@ -29,6 +29,8 @@ from __future__ import annotations
 
 import sqlite3
 from collections.abc import AsyncIterator, Callable, Iterator, Sequence
+from dataclasses import replace
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
 import numpy as np
@@ -36,9 +38,10 @@ import pytest
 from loguru import logger
 
 from assistant import app
-from assistant.agent.core import Agent, Confirm
+from assistant.agent.core import Agent, Confirm, Dispatch
+from assistant.agent.intents import CANCEL, GET_TIME, STOP, TIME_TOOL
 from assistant.agent.limits import Limits
-from assistant.agent.policy import DECLINED, dispatch
+from assistant.agent.policy import DECLINED, NO_SUCH_TOOL, dispatch
 from assistant.app import (
     CONFIRM_WINDOW_SECONDS,
     THINKING_TIMEOUT,
@@ -55,9 +58,11 @@ from assistant.audio.player import PlaybackError
 from assistant.llm.base import AuthenticationError, Delta, ProviderError, ToolCall, Usage
 from assistant.locales import Locale
 from assistant.store.db import open_database
-from assistant.store.repos import UsageRepo
+from assistant.store.repos import AuditRepo, UsageRepo
 from assistant.stt.base import SAMPLE_RATE, Audio, Transcript
+from assistant.tools import system
 from assistant.tools.registry import ToolRegistry, tool
+from assistant.tools.system import get_current_time
 from assistant.tts.base import VoiceInfo
 from assistant.usage.tracker import Pricing, UsageTracker
 from tests.test_agent_loop import ScriptedProvider
@@ -81,6 +86,7 @@ TURKISH = Locale(
         "daily_over": "Bugünkü harcama sınırını aştın.",
         "monthly_over": "Bu ayki harcama sınırını aştın.",
         "spend_stopped": "Harcama sınırı aşıldı, bu yüzden modele sormuyorum.",
+        "time_is": "Saat {hour} {minute}.",
     },
     yes_words=("evet", "tamam"),
     no_words=("hayır", "iptal"),
@@ -238,6 +244,7 @@ def assistant_with(
     on_turn: Callable[[Turn], None] | None = None,
     agent: Agent | None = None,
     tracker: UsageTracker | None = None,
+    dispatch: Dispatch | None = None,
 ) -> Assistant:
     return Assistant(
         capture=capture if capture is not None else FakeCapture(),
@@ -255,6 +262,7 @@ def assistant_with(
         on_state=on_state,
         on_turn=on_turn,
         tracker=tracker,
+        dispatch=dispatch,
     )
 
 
@@ -1425,3 +1433,220 @@ async def test_the_calls_a_turn_ran_leave_the_turn() -> None:
 def test_the_thinking_timeout_is_the_turn_seconds_of_section_3_11() -> None:
     """One number, written once: the constant here reads it off `Limits`."""
     assert Limits().turn_seconds == THINKING_TIMEOUT
+
+
+# --------------------------------------------------------------------------
+# The fast path (2.5)
+# --------------------------------------------------------------------------
+
+# The Turkish pack's short commands, on a locale of this section's own. The
+# `TURKISH` above lists none on purpose: "saat kaç" is the default thing the
+# fake recogniser hears, and every test above expects it to reach the model.
+WITH_COMMANDS = replace(
+    TURKISH,
+    intents={
+        GET_TIME: ("saat kaç", "saat kaçta"),
+        STOP: ("dur", "sus"),
+        CANCEL: ("iptal", "vazgeç"),
+    },
+)
+
+# What `get_current_time` answers with, three minutes past two.
+TOLD = "2026-09-09T14:03+03:00 Wednesday, Turkey Standard Time"
+ANKARA = timezone(timedelta(hours=3))
+
+
+class TimeGate:
+    """A gate that answers what it is told to, and keeps what it was asked."""
+
+    def __init__(self, answer: str = TOLD) -> None:
+        self.answer = answer
+        self.calls: list[tuple[str, str]] = []
+
+    async def __call__(self, call: ToolCall, *, turn_id: str, confirm: Confirm) -> str:
+        self.calls.append((call.name, turn_id))
+        return self.answer
+
+
+def commanding(
+    text: str = "saat kaç", *, locale: Locale = WITH_COMMANDS, **parts: Any
+) -> Assistant:
+    """An assistant that hears `text` and knows the short commands."""
+    stt = FakeSTT(Transcript(text=text, confidence=0.9))
+    return assistant_with(stt=stt, locale=locale, **parts)
+
+
+async def test_a_short_command_the_pack_lists_is_answered_without_the_model() -> None:
+    """Section 4: "saat kaç" costs nothing and waits for nobody."""
+    provider = ScriptedProvider([Delta(text="Üç.")])
+    speaker = FakeSpeaker()
+
+    turn = await one_turn(commanding(provider=provider, speaker=speaker, dispatch=TimeGate()))
+
+    assert provider.calls == []
+    assert speaker.heard == "Saat 14 3."
+    assert (turn.heard, turn.said, turn.intent) == ("saat kaç", "Saat 14 3.", GET_TIME)
+
+
+async def test_the_time_is_asked_of_the_gate_and_not_of_a_clock() -> None:
+    """The fast path skips the model, not the gate (invariant 1): the one
+    tool it runs is run the way every tool is, under the turn's own name."""
+    gate = TimeGate()
+
+    turn = await one_turn(commanding(dispatch=gate))
+
+    assert gate.calls == [(TIME_TOOL, turn.turn_id)]
+    assert len(turn.turn_id) == 32
+    assert turn.tool_calls == 1
+
+
+async def test_a_fast_turn_spent_nothing_and_is_not_on_the_bill(
+    ledger: sqlite3.Connection,
+) -> None:
+    """A real zero, not a guess: no request was made. And no row, because
+    `usage_log` is the record of requests."""
+    turn = await one_turn(commanding(dispatch=TimeGate(), tracker=tracking(ledger)))
+
+    assert turn.usage == Usage()
+    assert turn.cost_usd is None
+    assert ledger.execute("SELECT COUNT(*) FROM usage_log").fetchone()[0] == 0
+
+
+async def test_the_fast_path_never_thinks() -> None:
+    """There is nothing to wait for, so nothing to show as waiting."""
+    seen: list[State] = []
+
+    await one_turn(commanding(dispatch=TimeGate(), on_state=seen.append))
+
+    assert seen == [State.IDLE, State.TRANSCRIBING, State.SPEAKING, State.IDLE]
+
+
+@pytest.mark.parametrize(("text", "intent"), [("dur", STOP), ("iptal", CANCEL)])
+async def test_stop_and_cancel_are_answered_by_silence(text: str, intent: str) -> None:
+    """In phase 2 the microphone is deaf while the assistant talks and a
+    press already cuts it off, so there is nothing to stop. What the two
+    words save is the request they would have cost."""
+    provider = ScriptedProvider([Delta(text="Tamam.")])
+    tts = FakeTTS()
+    seen: list[State] = []
+
+    turn = await one_turn(
+        commanding(text, provider=provider, tts=tts, dispatch=TimeGate(), on_state=seen.append)
+    )
+
+    assert provider.calls == []
+    assert tts.said == []
+    assert turn == Turn(heard=text, intent=intent)
+    assert seen == [State.IDLE, State.TRANSCRIBING, State.IDLE]
+
+
+async def test_a_sentence_that_merely_contains_the_command_goes_to_the_model() -> None:
+    """ "saat kaçta toplantım var" is a question about the calendar."""
+    provider = ScriptedProvider([Delta(text="Üçte.")])
+
+    turn = await one_turn(
+        commanding("saat kaçta toplantım var", provider=provider, dispatch=TimeGate())
+    )
+
+    assert len(provider.calls) == 1
+    assert (turn.said, turn.intent) == ("Üçte.", None)
+
+
+async def test_the_command_is_heard_however_the_recogniser_spells_it() -> None:
+    """ "Saat kac?" - no cedilla, a question mark - is what Whisper sometimes
+    writes down."""
+    provider = ScriptedProvider([Delta(text="Üç.")])
+
+    turn = await one_turn(commanding("Saat kac?", provider=provider, dispatch=TimeGate()))
+
+    assert provider.calls == []
+    assert turn.intent == GET_TIME
+
+
+async def test_without_a_gate_the_command_goes_to_the_model() -> None:
+    """No gate, no tool: the fast path cannot tell the time on its own and
+    does not try to."""
+    provider = ScriptedProvider([Delta(text="Üç.")])
+
+    turn = await one_turn(commanding(provider=provider))
+
+    assert len(provider.calls) == 1
+    assert turn.intent is None
+
+
+async def test_a_gate_that_did_not_tell_the_time_leaves_the_turn_to_the_model() -> None:
+    """What comes back from the gate is addressed to a model: a refusal is
+    a sentence, not a time, and the model is who can do something with a
+    sentence."""
+    provider = ScriptedProvider([Delta(text="Bilmiyorum.")])
+    refusing = TimeGate(NO_SUCH_TOOL.format(name=TIME_TOOL))
+
+    turn = await one_turn(commanding(provider=provider, dispatch=refusing))
+
+    assert len(provider.calls) == 1
+    assert (turn.said, turn.intent) == ("Bilmiyorum.", None)
+
+
+async def test_the_fast_path_runs_past_the_spending_limit_even_with_hard_stop(
+    ledger: sqlite3.Connection,
+) -> None:
+    """A limit on spending has nothing to say about a turn that costs nothing."""
+    already_spent(ledger, 0.5)
+    provider = priced()
+    speaker = FakeSpeaker()
+    spending = tracking(ledger, Limits(daily_usd=0.1, hard_stop=True))
+
+    turn = await one_turn(
+        commanding(provider=provider, speaker=speaker, dispatch=TimeGate(), tracker=spending)
+    )
+
+    assert provider.calls == []
+    assert speaker.heard == "Saat 14 3."
+    assert turn.failure is None
+
+
+async def test_the_fast_path_runs_through_the_permission_gate_and_is_written_down(
+    ledger: sqlite3.Connection, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The real gate over the real tool: one `ok` row in `tool_audit`, under
+    the turn's name, exactly as if the model had asked for it."""
+    monkeypatch.setattr(system, "_now", lambda: datetime(2026, 9, 9, 14, 3, tzinfo=ANKARA))
+    audit = AuditRepo(ledger)
+
+    async def gate(call: ToolCall, *, turn_id: str, confirm: Confirm) -> str:
+        registry = ToolRegistry([get_current_time])
+        return await dispatch(
+            call, turn_id=turn_id, registry=registry, confirm=confirm, audit=audit
+        )
+
+    turn = await one_turn(commanding(dispatch=gate))
+
+    assert turn.said == "Saat 14 3."
+    [row] = ledger.execute("SELECT tool, status, turn_id FROM tool_audit").fetchall()
+    assert (row["tool"], row["status"], row["turn_id"]) == (TIME_TOOL, "ok", turn.turn_id)
+
+
+async def test_the_time_sentence_comes_from_the_pack_and_falls_back_with_the_rest() -> None:
+    speaker = FakeSpeaker()
+
+    await one_turn(
+        commanding(locale=replace(WITH_COMMANDS, ui={}), speaker=speaker, dispatch=TimeGate())
+    )
+
+    assert speaker.heard == "It is 14 3."
+
+
+async def test_a_press_during_the_fast_path_is_not_spoken_over() -> None:
+    """The same rule as for an answer from the model: the user is talking."""
+    capture = FakeCapture()
+    speaker = FakeSpeaker()
+
+    async def pressed_meanwhile(call: ToolCall, *, turn_id: str, confirm: Confirm) -> str:
+        capture.press()
+        return TOLD
+
+    assistant = commanding(capture=capture, speaker=speaker, dispatch=pressed_meanwhile)
+    await one_turn(assistant)
+
+    assert speaker.played == []
+    assert assistant.state is State.LISTENING

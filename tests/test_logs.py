@@ -219,6 +219,27 @@ def test_a_turn_that_failed_says_why_and_claims_no_tokens(log: Path) -> None:
     assert "Sağlayıcıya" not in line
 
 
+def test_a_turn_the_fast_path_answered_is_written_by_its_intent(log: Path) -> None:
+    """No request was made, so no token count - and no zeros either, which
+    would read as a request that happened to be free (2.5)."""
+    log_turn(
+        Turn(heard="saat kaç", said="Saat 14 3.", intent="get_time", tool_calls=1, turn_id="9f2a")
+    )
+
+    line = read(log)
+    assert "turn 9f2a: intent get_time, 1 tools" in line
+    assert " in, " not in line
+    assert "$" not in line
+
+
+def test_a_command_answered_by_silence_is_still_a_line(log: Path) -> None:
+    """It is a turn the user had, and the count of them is how "dur" being
+    heard as "durum" would be noticed."""
+    log_turn(Turn(heard="dur", intent="stop"))
+
+    assert "intent stop, 0 tools" in read(log)
+
+
 # --------------------------------------------------------------------------
 # What cannot reach it
 # --------------------------------------------------------------------------

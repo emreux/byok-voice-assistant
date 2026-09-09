@@ -2,7 +2,9 @@
 
 One line per turn, holding what it cost: the tokens, how many tools ran, and
 the price in dollars - the same number the turn's row in `usage_log` carries
-(2.4), so that the log and `assistant cost` never disagree about a turn.
+(2.4), so that the log and `assistant cost` never disagree about a turn. A
+turn the fast path answered without the model (2.5) is written by its intent
+instead: no request was made, so there is no count to write.
 
 Three decisions are worth stating, because each of them is about what is *not*
 written.
@@ -98,6 +100,10 @@ def log_turn(finished: Turn) -> None:
     already answered each other. The decoder's doubt goes with it when there
     was one. The words are still not written down: a transcript nothing stood
     behind is no more worth keeping than one that was.
+
+    A turn the fast path answered (2.5) is written by its intent and the
+    number of tools the gate ran for it, and by no token count: none was
+    spent, and zeros would read as a request that happened to be free.
     """
     if finished.missed:
         confidence = "-" if finished.confidence is None else f"{finished.confidence:.2f}"
@@ -114,6 +120,15 @@ def log_turn(finished: Turn) -> None:
         return
 
     if not finished.heard:
+        return
+
+    if finished.intent is not None:
+        logger.info(
+            "{where}: intent {intent}, {tools} tools",
+            where=where,
+            intent=finished.intent,
+            tools=finished.tool_calls,
+        )
         return
 
     usage = finished.usage

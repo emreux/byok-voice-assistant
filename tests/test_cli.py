@@ -420,6 +420,17 @@ def test_who_answers_a_tool_s_question_comes_with_the_turn_and_reaches_the_gate(
     assert handed == [says_yes]
 
 
+def test_the_fast_path_is_handed_the_same_gate_as_the_loop(
+    configured: Path, wiring: Wiring
+) -> None:
+    """One gate, two callers (2.5): a second gate would be a second way to
+    run a tool, which is the thing section 3.9 forbids."""
+    main(["run"])
+
+    [gate] = wiring.gates
+    assert wiring.built[-1]["dispatch"] is gate
+
+
 def test_the_database_is_built_where_the_data_lives(configured: Path, wiring: Wiring) -> None:
     main(["run"])
 

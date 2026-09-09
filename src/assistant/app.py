@@ -59,6 +59,17 @@ not asked at all. An answer the token limit cut short says so at its end:
 a sentence that stops halfway with nothing said about it is a bug nobody
 can find.
 
+**A short command the pack lists never reaches the model.** "saat kaç",
+"dur", "iptal": the phrases in the pack's `[intents]` table are matched
+whole (`agent/intents.py`) before anything is sent, and answered here. The
+time is asked of `get_current_time` through the same gate the model's calls
+go through - the fast path skips the model, not the gate (invariant 1) -
+and said in the pack's words. Stop and cancel are answered by silence: in
+phase 2 the microphone is deaf while the assistant talks and a key press
+already cuts it off, so all there is to do about them is not spend a
+request. A turn like this costs nothing and says so: no tokens, no row on
+the bill.
+
 **Three failures are said out loud, and no others.** A refused key means the
 user has to go and renew it (section 3.2), a provider that cannot be reached
 means try again, and a minute of thinking means the same. Anything else is a
@@ -80,15 +91,17 @@ import re
 import uuid
 from collections.abc import AsyncIterator, Callable, Iterable, Sequence
 from dataclasses import dataclass, field
+from datetime import datetime
 from enum import StrEnum
 from typing import Protocol
 
 from loguru import logger
 
-from assistant.agent.core import Agent, Answer
+from assistant.agent.core import Agent, Answer, Dispatch
+from assistant.agent.intents import GET_TIME, TIME_TOOL, match_intent
 from assistant.agent.limits import Limits
 from assistant.audio.player import PlaybackError, Speaker
-from assistant.llm.base import AuthenticationError, ProviderError, Usage
+from assistant.llm.base import AuthenticationError, ProviderError, ToolCall, Usage
 from assistant.locales import Locale
 from assistant.store.normalize import normalize_search
 from assistant.stt.base import NO_SPEECH_CEILING, SAMPLE_RATE, Audio, STTProvider, Transcript
@@ -175,6 +188,9 @@ TEXT: dict[str, str] = {
     "daily_over": "You have gone over today's spending limit.",
     "monthly_over": "You have gone over this month's spending limit.",
     "spend_stopped": "The spending limit has been passed, so I am not asking the model.",
+    # The fast path's answer to "what time is it" (section 4), with the
+    # hour and the minute as two numbers: the number formatter is phase 3's.
+    "time_is": "It is {hour} {minute}.",
 }
 
 
@@ -217,11 +233,17 @@ class Turn:
 
     `turn_id` is the name the turn goes by in `tool_audit` (section 3.9),
     so that a row there and a line in the log can be read together. A turn
-    that never reached the model has none.
+    that made no call has none: a tapped key, a stop, a turn the spending
+    limit stopped.
 
     `cost_usd` is what the turn cost at its model's price - `None` when the
     price is not known, or the turn never reached the model - and
     `tool_calls` how many calls the gate ran. Both go to the log (2.4).
+
+    `intent` names the short command the turn was, when the fast path
+    answered it without the model (2.5) - `get_time`, `stop`, `cancel` -
+    and is `None` for every turn the model heard. Such a turn's usage is a
+    real zero: no request was made.
     """
 
     heard: str = ""
@@ -233,6 +255,7 @@ class Turn:
     turn_id: str = ""
     cost_usd: float | None = None
     tool_calls: int = 0
+    intent: str | None = None
 
 
 class Capture(Protocol):
@@ -291,6 +314,7 @@ class Assistant:
         on_state: Callable[[State], None] | None = None,
         on_turn: Callable[[Turn], None] | None = None,
         tracker: UsageTracker | None = None,
+        dispatch: Dispatch | None = None,
     ) -> None:
         self._capture = capture
         self._stt = stt
@@ -302,6 +326,11 @@ class Assistant:
         self._on_state = on_state
         self._on_turn = on_turn
         self._tracker = tracker
+        # The gate of section 3.9 - the same one the loop runs the model's
+        # calls through - for the one call the fast path makes on its own.
+        # Without it the fast path cannot tell the time, and "saat kaç" goes
+        # to the model as it did before 2.5.
+        self._dispatch = dispatch
 
         self._said = {key: locale.say(key, default) for key, default in TEXT.items()}
         self._yes = locale.yes_words or YES_WORDS
@@ -357,15 +386,25 @@ class Assistant:
         if not heard.text:
             return await self._missed(heard)
 
+        # Minted here, where the turn becomes something that may act: every
+        # tool call it makes, on the fast path or through the model, is
+        # written down under this name.
+        turn_id = uuid.uuid4().hex
+
+        intent = match_intent(heard.text, self._locale)
+        if intent is not None:
+            # A short command the pack lists (section 4): answered here when
+            # it can be, and the model never hears of it.
+            answered = await self._fast(heard.text, intent, turn_id)
+            if answered is not None:
+                return answered
+
         if self._tracker is not None and self._tracker.stopped():
             # `hard_stop` and a limit passed (section 3.11): the model is
             # not asked, and the user hears why instead of an answer.
             return await self._stopped(heard.text)
 
         self._enter(State.THINKING)
-        # Minted here, where the turn becomes something the model may act on:
-        # every tool call the turn makes is written down under this name.
-        turn_id = uuid.uuid4().hex
         answer, failure = await self._answer(heard.text, turn_id)
         cost = self._record(turn_id, answer, failure)
         said = self._worded(answer, failure)
@@ -421,6 +460,38 @@ class Assistant:
         await self._speak(said)
         self._rest()
         return Turn(said=said, missed=True, confidence=heard.confidence)
+
+    async def _fast(self, heard: str, intent: str, turn_id: str) -> Turn | None:
+        """A short command answered without the model (section 4) - or
+        `None` when it could not be, and the turn goes on to the model as
+        though nothing had matched.
+
+        `stop` and `cancel` are answered by silence: the request they would
+        have cost is the whole of what there was to save. `get_time` asks
+        `get_current_time` through the gate - the one way a tool runs
+        (invariant 1), so the call is judged and written down like the
+        model's - and says the answer in the pack's words. What the gate
+        hands back is addressed to a model: the tool's own line when it
+        ran, a sentence when it was refused or failed. Only the first reads
+        as a time, and a turn without one is not answered here.
+        """
+        if intent != GET_TIME:
+            self._rest()
+            return Turn(heard=heard, intent=intent)
+
+        if self._dispatch is None:
+            return None
+        call = ToolCall(id="", name=TIME_TOOL, arguments={})
+        result = await self._dispatch(call, turn_id=turn_id, confirm=self.confirm)
+        moment = _time_in(result)
+        if moment is None:
+            logger.warning("the fast path was told {result!r} instead of the time", result=result)
+            return None
+
+        said = self._said["time_is"].format(hour=moment.hour, minute=moment.minute)
+        await self._speak(said)
+        self._rest()
+        return Turn(heard=heard, said=said, intent=intent, turn_id=turn_id, tool_calls=1)
 
     # ----------------------------------------------------------------------
     # The turn, one stage at a time
@@ -508,8 +579,9 @@ class Assistant:
         """`hard_stop` and a limit passed: what the user hears instead of an answer.
 
         No `turn_id`: the turn never reached the model and made no call to
-        be filed under one. The fast path of 2.5 does not come this way - a
-        limit on spending has nothing to say about a turn that costs nothing.
+        be filed under one. The fast path of 2.5 comes before this, not
+        through it - a limit on spending has nothing to say about a turn
+        that costs nothing.
         """
         said = self._said["spend_stopped"]
         await self._speak(said)
@@ -654,6 +726,21 @@ def hear(transcript: Transcript) -> Heard:
 
     # There was speech, or an engine with no opinion, and no words came of it.
     return Heard(missed=True, confidence=transcript.confidence)
+
+
+def _time_in(result: str) -> datetime | None:
+    """The moment `get_current_time` reported, or `None` when `result` is
+    not its line.
+
+    The tool writes the time first and in ISO form, so that a model reads
+    it without ambiguity (`tools/system.py`). The gate's refusals and the
+    tool's own failure are sentences, and a sentence does not start with a
+    time.
+    """
+    try:
+        return datetime.fromisoformat(result.split(" ", 1)[0])
+    except ValueError:
+        return None
 
 
 # A word, for the purpose of hearing "yes" in an answer: letters and digits in

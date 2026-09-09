@@ -103,6 +103,9 @@ answer_cut_off = "The end of the answer was cut off."
 daily_over = "You have gone over today's spending limit."
 monthly_over = "You have gone over this month's spending limit."
 spend_stopped = "The spending limit has been passed, so I am not asking the model."
+# Said in answer to "what time is it" without the model. {hour} and {minute}
+# are two numbers, 14 and 3, which the voice reads out.
+time_is = "It is {hour} {minute}."
 # Added to a risky tool's question when the same thing was done, or may have
 # been, a moment ago. {ago} is filled with one of the two spans below.
 duplicate_done = "You already did this {ago} ago."

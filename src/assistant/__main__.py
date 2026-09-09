@@ -275,6 +275,11 @@ async def _talk(settings: Settings, pack: Locale, *, device: int | str | None = 
             await speech.load()
             await detector.load()
 
+            # The one gate, built once and handed to both places a tool is
+            # run from: the loop, and the fast path of 2.5 (section 4). A
+            # second gate would be a second way to run a tool, which is the
+            # thing section 3.9 forbids.
+            gate = _gate(settings, tools, AuditRepo(database), limits=limits, pack=pack)
             assistant = Assistant(
                 capture=HandsFree(
                     microphone=SystemMicrophone(device=device),
@@ -286,7 +291,7 @@ async def _talk(settings: Settings, pack: Locale, *, device: int | str | None = 
                     provider,
                     model=settings.llm.model,
                     tools=tools,
-                    dispatch=_gate(settings, tools, AuditRepo(database), limits=limits, pack=pack),
+                    dispatch=gate,
                     limits=limits,
                 ),
                 tts=SapiTTS(),
@@ -304,6 +309,7 @@ async def _talk(settings: Settings, pack: Locale, *, device: int | str | None = 
                     model=settings.llm.model,
                     limits=limits,
                 ),
+                dispatch=gate,
             )
             await assistant.run()
     finally:
