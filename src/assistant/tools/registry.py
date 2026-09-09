@@ -82,19 +82,34 @@ def build_spec(fn: ToolFunction) -> ToolSpec:
 
 
 def _property(tool_name: str, name: str, hint: object) -> dict[str, Any]:
-    """One parameter's schema. `Annotated[T, "text"]` contributes the description."""
+    """One parameter's schema.
+
+    `Annotated[T, "text"]` contributes the description; `Literal["a", "b"]`
+    becomes an `enum`, which is how the model is told the choices rather
+    than asked to guess them from the description.
+    """
     description: str | None = None
     if get_origin(hint) is Annotated:
         hint, description, *_ = get_args(hint)
 
-    json_type = _JSON_TYPES.get(hint) if isinstance(hint, type) else None
-    if json_type is None:
-        raise TypeError(
-            f"tool {tool_name!r}: parameter {name!r} has type {hint!r}, "
-            "which the schema cannot express"
-        )
+    schema: dict[str, Any]
+    if get_origin(hint) is Literal:
+        choices = get_args(hint)
+        if not all(isinstance(choice, str) for choice in choices):
+            raise TypeError(
+                f"tool {tool_name!r}: parameter {name!r} offers {choices!r}, "
+                "and only strings can be an enum"
+            )
+        schema = {"type": "string", "enum": list(choices)}
+    else:
+        json_type = _JSON_TYPES.get(hint) if isinstance(hint, type) else None
+        if json_type is None:
+            raise TypeError(
+                f"tool {tool_name!r}: parameter {name!r} has type {hint!r}, "
+                "which the schema cannot express"
+            )
+        schema = {"type": json_type}
 
-    schema: dict[str, Any] = {"type": json_type}
     if description is not None:
         schema["description"] = description
     return schema

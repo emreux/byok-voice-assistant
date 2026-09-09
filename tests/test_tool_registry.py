@@ -9,7 +9,7 @@ import registers anything, so two tests never share a registry by accident.
 
 from __future__ import annotations
 
-from typing import Annotated
+from typing import Annotated, Literal
 
 import pytest
 
@@ -133,6 +133,40 @@ def test_a_prompt_that_names_only_required_arguments_is_accepted() -> None:
 
 async def test_run_is_the_function_itself() -> None:
     assert await weather.run("Ankara", days=2) == "Ankara: sunny for 2 days"
+
+
+def test_a_choice_of_strings_becomes_an_enum() -> None:
+    """The model is told the choices rather than left to guess them."""
+
+    async def media(action: Literal["play_pause", "next"]) -> str:
+        """Presses a media key."""
+        return action
+
+    assert build_spec(media).parameters["properties"]["action"] == {
+        "type": "string",
+        "enum": ["play_pause", "next"],
+    }
+
+
+def test_an_annotated_choice_keeps_its_description() -> None:
+    async def media(action: Annotated[Literal["next", "previous"], "Which way"]) -> str:
+        """Changes the track."""
+        return action
+
+    assert build_spec(media).parameters["properties"]["action"] == {
+        "type": "string",
+        "enum": ["next", "previous"],
+        "description": "Which way",
+    }
+
+
+def test_a_choice_that_is_not_strings_is_refused() -> None:
+    async def dice(faces: Literal[6, 20]) -> str:
+        """Rolls a die."""
+        return str(faces)
+
+    with pytest.raises(TypeError, match="faces"):
+        build_spec(dice)
 
 
 # --------------------------------------------------------------------------
