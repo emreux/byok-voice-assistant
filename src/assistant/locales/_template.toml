@@ -83,6 +83,19 @@ not_understood = "I did not catch that. Will you say it again?"
 # the answer had neither.
 confirm_hint = "Say yes or no."
 confirm_again = "I did not catch that. Yes, or no?"
+# Said at the end of an answer the token limit cut short.
+answer_cut_off = "The end of the answer was cut off."
+# Said before every answer once a spending limit is passed, and instead of
+# an answer when the user asked to be stopped at the limit.
+daily_over = "You have gone over today's spending limit."
+monthly_over = "You have gone over this month's spending limit."
+spend_stopped = "The spending limit has been passed, so I am not asking the model."
+# Added to a risky tool's question when the same thing was done, or may have
+# been, a moment ago. {ago} is filled with one of the two spans below.
+duplicate_done = "You already did this {ago} ago."
+duplicate_uncertain = "You tried this {ago} ago, and the outcome is not known."
+seconds_ago = "{count} seconds"
+minutes_ago = "{count} minutes"
 
 # Shown on screen while the assistant runs (item 1.11). The status line holds
 # the state and the hotkey together on one line, so keep these short.
@@ -104,3 +117,15 @@ not_caught = "(not caught - confidence {confidence})"
 not_set_up = "Nothing is set up yet. Run 'assistant setup' first."
 cannot_start = "The assistant cannot start: {problem}"
 stopped = "Stopped."
+
+# Shown by `assistant cost`: two small tables, today and this month, one row
+# per model. The amounts are written by the code as `$0.0004`.
+cost_none = "No usage recorded yet."
+cost_today = "today"
+cost_month = "this month"
+cost_model = "model"
+cost_turns = "turns"
+cost_tokens = "in / out / cached"
+cost_spent = "spent"
+cost_total = "total"
+cost_unpriced = "{count} turns of {model} have no price in pricing.toml and are not in the total."

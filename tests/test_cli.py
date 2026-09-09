@@ -32,11 +32,13 @@ from loguru import logger
 from assistant import app, locales, logs, setup_wizard
 from assistant.__main__ import TEXT, build_parser, main, use_utf8
 from assistant.agent import core
+from assistant.agent.limits import Limits
 from assistant.agent.policy import NO_SUCH_TOOL
 from assistant.app import State, Turn
 from assistant.audio import capture
 from assistant.config import (
     AudioSettings,
+    LimitSettings,
     LLMSettings,
     LocaleSettings,
     Settings,
@@ -45,10 +47,12 @@ from assistant.config import (
 )
 from assistant.llm.base import ToolCall, Usage
 from assistant.store import db
+from assistant.store.repos import UsageRepo
 from assistant.stt import local_whisper
 from assistant.tools import system
 from assistant.tools.system import AppCatalog, AppEntry
 from assistant.ui import status
+from assistant.usage.tracker import UsageTracker
 from tests.conftest import MemoryKeyring
 
 MODEL = "gemini-2.5-flash"
@@ -87,6 +91,7 @@ class Wiring:
     # offer, and the gate they run through.
     tools: list[list[str]] = field(default_factory=list)
     gates: list[Any] = field(default_factory=list)
+    limits: list[Any] = field(default_factory=list)
     microphones: list[Any] = field(default_factory=list)
     databases: list[sqlite3.Connection] = field(default_factory=list)
     # What the speech model was told to expect (2.2).
@@ -124,6 +129,7 @@ def wiring(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Wiring:
             seen.agents.append((provider.id, model))
             seen.tools.append([spec.name for spec in rest["tools"].specs()])
             seen.gates.append(rest["dispatch"])
+            seen.limits.append(rest["limits"])
 
     class FakeMicrophone:
         def __init__(self, *, device: Any = None) -> None:
@@ -186,7 +192,7 @@ def test_no_command_prints_usage(capsys: pytest.CaptureFixture[str]) -> None:
     assert "usage:" in capsys.readouterr().out
 
 
-@pytest.mark.parametrize("command", ["setup", "run"])
+@pytest.mark.parametrize("command", ["setup", "run", "cost"])
 def test_the_command_names_are_declared(command: str) -> None:
     assert build_parser().parse_args([command]).command == command
 
@@ -469,6 +475,94 @@ def test_ctrl_c_is_how_it_is_meant_to_end(
 
     assert main(["run"]) == 0
     assert said("stopped") in capsys.readouterr().out
+
+
+# --------------------------------------------------------------------------
+# run: the limits and the bill (2.4)
+# --------------------------------------------------------------------------
+
+
+def with_limits(limits: LimitSettings) -> None:
+    save_settings(
+        Settings(
+            llm=LLMSettings(primary=f"gemini:{MODEL}"),
+            locale=LocaleSettings(code="tr"),
+            limits=limits,
+        )
+    )
+
+
+def test_the_limits_in_the_settings_are_the_ones_the_loop_gets(
+    configured: Path, wiring: Wiring
+) -> None:
+    with_limits(LimitSettings(tool_calls_per_turn=3))
+
+    main(["run"])
+
+    assert wiring.limits == [Limits(tool_calls_per_turn=3)]
+
+
+def test_the_assistant_is_handed_a_tracker_and_the_turn_s_clock(
+    configured: Path, wiring: Wiring
+) -> None:
+    """The tracker is what writes `usage_log`; the clock is `[limits]
+    turn_seconds`, the one source of the `THINKING` timeout."""
+    with_limits(LimitSettings(turn_seconds=45.0))
+
+    main(["run"])
+
+    parts = wiring.built[0]
+    assert isinstance(parts["tracker"], UsageTracker)
+    assert parts["thinking_timeout"] == 45.0
+
+
+# --------------------------------------------------------------------------
+# cost
+# --------------------------------------------------------------------------
+
+
+def spent(*, cost: float | None) -> None:
+    """One turn of 300 in and 10 out on the configured model, on the books."""
+    connection = db.open_database()
+    try:
+        UsageRepo(connection).insert(
+            turn_id="t1", provider="gemini", model=MODEL, usage=Usage(300, 10), cost_usd=cost
+        )
+    finally:
+        connection.close()
+
+
+def test_cost_on_a_machine_that_has_spent_nothing_says_so(
+    config_home: Path, wiring: Wiring, capsys: pytest.CaptureFixture[str]
+) -> None:
+    assert main(["cost"]) == 0
+    assert TEXT["cost_none"] in capsys.readouterr().out
+
+
+def test_cost_shows_today_s_spending_by_model(
+    configured: Path, wiring: Wiring, capsys: pytest.CaptureFixture[str]
+) -> None:
+    spent(cost=0.0004)
+
+    assert main(["cost"]) == 0
+
+    printed = capsys.readouterr().out
+    assert said("cost_today") in printed
+    assert f"gemini:{MODEL}" in printed
+    assert "$0.0004" in printed
+
+
+def test_a_turn_with_no_price_is_counted_and_reported_as_unpriced(
+    configured: Path, wiring: Wiring, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Never a zero that reads as free (section 6)."""
+    spent(cost=None)
+
+    main(["cost"])
+
+    printed = capsys.readouterr().out
+    assert "pricing.toml" in printed
+    assert "$0.0000" not in printed
 
 
 # --------------------------------------------------------------------------

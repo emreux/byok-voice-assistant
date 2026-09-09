@@ -3,7 +3,8 @@
 `setup` asks the three questions of item 1.4. `run` is item 1.11: it puts the
 pieces together, hands them to the state machine, and shows the one line of
 terminal that is the entire interface until the tray icon of phase 4.2.
-`doctor` and `cost` arrive in phase 3 and phase 2.4 (design.md section 8).
+`cost` is 2.4: what the turns cost, read back from `usage_log`. `doctor`
+arrives in phase 3 (design.md section 8).
 
 This is the only file that knows the concrete names: which tools are on
 offer, which gate runs them, where the audit rows go. `agent/core.py` sees a
@@ -39,18 +40,22 @@ import argparse
 import asyncio
 import contextlib
 import sys
-from collections.abc import Callable, Sequence
+import time
+from collections.abc import Callable, Mapping, Sequence
 from typing import TYPE_CHECKING
 
 from assistant import __version__, locales
 from assistant.config import Settings, is_configured, load_settings
 
 if TYPE_CHECKING:
+    from rich.table import Table
+
     from assistant.agent.core import Confirm, Dispatch
+    from assistant.agent.limits import Limits
     from assistant.app import Turn
     from assistant.llm.base import ToolCall
     from assistant.locales import Locale
-    from assistant.store.repos import AuditRepo
+    from assistant.store.repos import AuditRepo, ModelUsage
     from assistant.tools.registry import ToolRegistry
     from assistant.ui.status import StatusLine
 
@@ -66,6 +71,21 @@ TEXT: dict[str, str] = {
     "not_set_up": "Nothing is set up yet. Run 'assistant setup' first.",
     "cannot_start": "The assistant cannot start: {problem}",
     "stopped": "Stopped.",
+    # `assistant cost` (section 6): two small tables, today and this month,
+    # one row per model. The amounts are written by the code as `$0.0004` -
+    # number formatting is the locale formatter of phase 3, and until then a
+    # dollar sign reads the same in every language.
+    "cost_none": "No usage recorded yet.",
+    "cost_today": "today",
+    "cost_month": "this month",
+    "cost_model": "model",
+    "cost_turns": "turns",
+    "cost_tokens": "in / out / cached",
+    "cost_spent": "spent",
+    "cost_total": "total",
+    "cost_unpriced": (
+        "{count} turns of {model} have no price in pricing.toml and are not in the total."
+    ),
 }
 
 
@@ -89,6 +109,7 @@ def build_parser() -> argparse.ArgumentParser:
             "Overrides [audio] input_device in config.toml."
         ),
     )
+    subparsers.add_parser("cost", help="Show what the assistant has spent, today and this month.")
 
     return parser
 
@@ -111,6 +132,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         # Looked up on the module rather than imported by name so the tests can
         # stand in for it; the wizard itself opens a prompt and would hang.
         return asyncio.run(setup_wizard.run_setup(setup_wizard.TerminalPrompter()))
+
+    if args.command == "cost":
+        return _cost()
 
     return _run(device=args.device)
 
@@ -194,13 +218,14 @@ def _run(*, device: str | None = None) -> int:
 async def _talk(settings: Settings, pack: Locale, *, device: int | str | None = None) -> None:
     """Builds the pieces and lets the state machine drive them."""
     from assistant.agent.core import Agent
+    from assistant.agent.limits import Limits
     from assistant.app import Assistant
     from assistant.audio.capture import HandsFree, SystemMicrophone
     from assistant.audio.player import SystemSpeaker
     from assistant.audio.vad import Endpoint, SileroVAD
     from assistant.llm.registry import create_provider
     from assistant.store.db import open_database
-    from assistant.store.repos import AuditRepo
+    from assistant.store.repos import AuditRepo, UsageRepo
     from assistant.stt.local_whisper import LocalWhisper
     from assistant.tools.media import media_control
     from assistant.tools.registry import ToolRegistry
@@ -214,6 +239,7 @@ async def _talk(settings: Settings, pack: Locale, *, device: int | str | None = 
     )
     from assistant.tts.sapi import SapiTTS
     from assistant.ui.status import StatusLine
+    from assistant.usage.tracker import Pricing, UsageTracker
 
     # First, and before anything slow: a provider that cannot be built is the
     # likeliest thing to be wrong, and the cheapest to find out about. The
@@ -221,6 +247,9 @@ async def _talk(settings: Settings, pack: Locale, *, device: int | str | None = 
     # is better found out about before Whisper has been loaded.
     provider = create_provider(settings.llm.provider)
     database = open_database()
+    # The table of section 3.11, once, for everyone who reads a row of it:
+    # the loop, the gate, the state machine's clock and the tracker.
+    limits = Limits.from_settings(settings.limits)
     try:
         detector = SileroVAD()
 
@@ -257,30 +286,46 @@ async def _talk(settings: Settings, pack: Locale, *, device: int | str | None = 
                     provider,
                     model=settings.llm.model,
                     tools=tools,
-                    dispatch=_gate(settings, tools, AuditRepo(database)),
+                    dispatch=_gate(settings, tools, AuditRepo(database), limits=limits, pack=pack),
+                    limits=limits,
                 ),
                 tts=SapiTTS(),
                 speaker=SystemSpeaker(),
                 locale=pack,
+                thinking_timeout=limits.turn_seconds,
                 on_state=screen.state,
                 on_turn=_finished(screen),
+                # Every turn's tokens, priced, to `usage_log`: what `assistant
+                # cost` reads and what the spending limits are checked against.
+                tracker=UsageTracker(
+                    UsageRepo(database),
+                    Pricing.load(),
+                    provider=settings.llm.provider,
+                    model=settings.llm.model,
+                    limits=limits,
+                ),
             )
             await assistant.run()
     finally:
         database.close()
 
 
-def _gate(settings: Settings, tools: ToolRegistry, audit: AuditRepo) -> Dispatch:
+def _gate(
+    settings: Settings, tools: ToolRegistry, audit: AuditRepo, *, limits: Limits, pack: Locale
+) -> Dispatch:
     """The one permission gate, with everything it needs already in hand.
 
     What the loop gets is a function of the call alone; the registry, the
-    audit rows and the user's `[tools]` settings are bound here, so that
-    `agent/core.py` never imports `policy.py` and a test can hand it a fake.
-    Who to ask is not bound here: it comes with each turn, because it is the
-    state machine's own microphone, and the state machine is built after
-    the gate.
+    audit rows, the user's `[tools]` settings, the look-back window of
+    section 3.11 and the gate's own sentences in the user's language are
+    bound here, so that `agent/core.py` never imports `policy.py` and a
+    test can hand it a fake. Who to ask is not bound here: it comes with
+    each turn, because it is the state machine's own microphone, and the
+    state machine is built after the gate.
     """
     from assistant.agent import policy
+
+    wording = {key: pack.say(key, default) for key, default in policy.TEXT.items()}
 
     async def dispatch(call: ToolCall, *, turn_id: str, confirm: Confirm) -> str:
         return await policy.dispatch(
@@ -290,9 +335,102 @@ def _gate(settings: Settings, tools: ToolRegistry, audit: AuditRepo) -> Dispatch
             confirm=confirm,
             unblocked=settings.tools.unblocked,
             audit=audit,
+            wording=wording,
+            duplicate_window=limits.duplicate_window_sec,
         )
 
     return dispatch
+
+
+# --------------------------------------------------------------------------
+# assistant cost
+# --------------------------------------------------------------------------
+
+
+def _cost() -> int:
+    """What the assistant has spent, today and this month, by model (section 6).
+
+    Read back from `usage_log`, where every turn was written with its price
+    at the time; nothing is recomputed, so a price edited today does not
+    rewrite last week. A model with no price in `pricing.toml` is counted
+    and not billed, and the report says so rather than show a zero.
+    """
+    from rich.console import Console
+
+    from assistant.store.db import open_database
+    from assistant.store.repos import UsageRepo
+    from assistant.usage.tracker import start_of_day, start_of_month
+
+    pack = locales.load(load_settings().locale.code)
+    said = {key: pack.say(key, default) for key, default in TEXT.items()}
+    console = Console()
+
+    database = open_database()
+    try:
+        usage = UsageRepo(database)
+        now = time.time()
+        ever = usage.by_model_since(0)
+        today = usage.by_model_since(start_of_day(now))
+        month = usage.by_model_since(start_of_month(now))
+    finally:
+        database.close()
+
+    if not ever:
+        console.print(said["cost_none"], markup=False, highlight=False)
+        return _OK
+
+    console.print(_cost_table(said["cost_today"], today, said))
+    console.print(_cost_table(said["cost_month"], month, said))
+    for row in month:
+        if row.unpriced:
+            line = said["cost_unpriced"].format(count=row.unpriced, model=_model(row))
+            console.print(line, markup=False, highlight=False)
+    return _OK
+
+
+def _cost_table(title: str, rows: Sequence[ModelUsage], said: Mapping[str, str]) -> Table:
+    """One period: a row per model, and a total."""
+    from rich.table import Table
+
+    table = Table(title=title, title_justify="left")
+    table.add_column(said["cost_model"])
+    table.add_column(said["cost_turns"], justify="right")
+    table.add_column(said["cost_tokens"], justify="right")
+    table.add_column(said["cost_spent"], justify="right")
+    for row in rows:
+        table.add_row(
+            _model(row),
+            str(row.turns),
+            f"{row.input_tokens} / {row.output_tokens} / {row.cached_tokens}",
+            _dollars(row.cost_usd),
+        )
+
+    priced = [row.cost_usd for row in rows if row.cost_usd is not None]
+    table.add_row(
+        said["cost_total"],
+        str(sum(row.turns for row in rows)),
+        " / ".join(
+            str(sum(tokens))
+            for tokens in (
+                (row.input_tokens for row in rows),
+                (row.output_tokens for row in rows),
+                (row.cached_tokens for row in rows),
+            )
+        ),
+        _dollars(sum(priced) if priced else None),
+        style="bold",
+    )
+    return table
+
+
+def _model(row: ModelUsage) -> str:
+    """`gemini:gemini-3.5-flash-lite` - the way `config.toml` writes it."""
+    return f"{row.provider}:{row.model}"
+
+
+def _dollars(amount: float | None) -> str:
+    """`$0.0004`, or a question mark for turns whose price is not known."""
+    return "?" if amount is None else f"${amount:.4f}"
 
 
 def _finished(screen: StatusLine) -> Callable[[Turn], None]:

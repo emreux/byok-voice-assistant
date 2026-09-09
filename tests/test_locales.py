@@ -23,20 +23,23 @@ from typing import Any
 
 from assistant import __main__ as cli
 from assistant import app, locales, setup_wizard
+from assistant.agent import policy
 from assistant.locales import FALLBACK_CODE, available, iso_code, load, system_code
 from assistant.ui import status
 
 PACKAGED = Path(locales.__file__).parent
 
-# A pack has one `[ui]` table, and four modules say things: the wizard asks the
+# A pack has one `[ui]` table, and five modules say things: the wizard asks the
 # questions, `app.py` says what went wrong in a turn, the status line says what
-# is happening, and the command line says whether it can start at all. What a
-# pack may translate is the four of them together.
+# is happening, the command line says whether it can start at all and what was
+# spent, and the gate adds a sentence to a risky tool's question. What a pack
+# may translate is the five of them together.
 TABLES = {
     "setup_wizard": setup_wizard.TEXT,
     "app": app.TEXT,
     "ui.status": status.TEXT,
     "__main__": cli.TEXT,
+    "agent.policy": policy.TEXT,
 }
 SENTENCES = {key: text for table in TABLES.values() for key, text in table.items()}
 

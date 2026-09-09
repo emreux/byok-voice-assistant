@@ -27,6 +27,7 @@ locale pack, with the English constants of `app.TEXT` as the end of the chain
 
 from __future__ import annotations
 
+import sqlite3
 from collections.abc import AsyncIterator, Callable, Iterator, Sequence
 from typing import Any
 
@@ -36,6 +37,7 @@ from loguru import logger
 
 from assistant import app
 from assistant.agent.core import Agent, Confirm
+from assistant.agent.limits import Limits
 from assistant.agent.policy import DECLINED, dispatch
 from assistant.app import (
     CONFIRM_WINDOW_SECONDS,
@@ -52,9 +54,12 @@ from assistant.app import (
 from assistant.audio.player import PlaybackError
 from assistant.llm.base import AuthenticationError, Delta, ProviderError, ToolCall, Usage
 from assistant.locales import Locale
+from assistant.store.db import open_database
+from assistant.store.repos import UsageRepo
 from assistant.stt.base import SAMPLE_RATE, Audio, Transcript
 from assistant.tools.registry import ToolRegistry, tool
 from assistant.tts.base import VoiceInfo
+from assistant.usage.tracker import Pricing, UsageTracker
 from tests.test_agent_loop import ScriptedProvider
 
 TOLGA = VoiceInfo(id=r"HKLM\...\TR-TR_TOLGA", display_name="Microsoft Tolga", language="tr")
@@ -72,6 +77,10 @@ TURKISH = Locale(
         "not_understood": "Seni anlayamadım, tekrar söyler misin?",
         "confirm_hint": "Evet ya da hayır de.",
         "confirm_again": "Anlayamadım. Evet mi, hayır mı?",
+        "answer_cut_off": "Cevabın sonu kesildi.",
+        "daily_over": "Bugünkü harcama sınırını aştın.",
+        "monthly_over": "Bu ayki harcama sınırını aştın.",
+        "spend_stopped": "Harcama sınırı aşıldı, bu yüzden modele sormuyorum.",
     },
     yes_words=("evet", "tamam"),
     no_words=("hayır", "iptal"),
@@ -228,6 +237,7 @@ def assistant_with(
     on_state: Callable[[State], None] | None = None,
     on_turn: Callable[[Turn], None] | None = None,
     agent: Agent | None = None,
+    tracker: UsageTracker | None = None,
 ) -> Assistant:
     return Assistant(
         capture=capture if capture is not None else FakeCapture(),
@@ -244,6 +254,7 @@ def assistant_with(
         thinking_timeout=thinking_timeout,
         on_state=on_state,
         on_turn=on_turn,
+        tracker=tracker,
     )
 
 
@@ -1238,3 +1249,179 @@ def test_read_answer_hears_a_phrase_of_more_than_one_word() -> None:
 def test_a_blank_entry_in_the_pack_matches_nothing() -> None:
     """An empty string is inside every string; it must not be a yes."""
     assert read_answer("belki", yes=("", " "), no=("",)) is None
+
+
+# --------------------------------------------------------------------------
+# What the turn cost (2.4)
+# --------------------------------------------------------------------------
+
+# A round price for the fake model: a token in is a millionth of a dollar and
+# a token out ten of them, so 300 in and 10 out is $0.0004.
+PRICED = Pricing.from_toml('[fake."fake-1"]\ninput_per_mtok = 1.0\noutput_per_mtok = 10.0\n')
+
+
+@pytest.fixture
+def ledger() -> Iterator[sqlite3.Connection]:
+    connection = open_database(":memory:")
+    yield connection
+    connection.close()
+
+
+def tracking(ledger: sqlite3.Connection, limits: Limits | None = None) -> UsageTracker:
+    return UsageTracker(UsageRepo(ledger), PRICED, provider="fake", model="fake-1", limits=limits)
+
+
+def priced() -> ScriptedProvider:
+    """A model that answers and says what it counted."""
+    return ScriptedProvider([Delta(text="Üç."), Delta(usage=Usage(300, 10))])
+
+
+def already_spent(ledger: sqlite3.Connection, dollars: float) -> None:
+    """A turn from earlier in the day, on the books."""
+    UsageRepo(ledger).insert(
+        turn_id="earlier", provider="fake", model="fake-1", usage=Usage(1000, 0), cost_usd=dollars
+    )
+
+
+async def test_a_turn_that_reached_the_model_is_priced_and_written_down(
+    ledger: sqlite3.Connection,
+) -> None:
+    turn = await one_turn(assistant_with(provider=priced(), tracker=tracking(ledger)))
+
+    assert turn.cost_usd == pytest.approx(0.0004)
+    [row] = ledger.execute("SELECT turn_id, in_tokens, out_tokens, cost_usd FROM usage_log")
+    assert (row["turn_id"], row["in_tokens"], row["out_tokens"]) == (turn.turn_id, 300, 10)
+    assert row["cost_usd"] == pytest.approx(0.0004)
+
+
+async def test_a_turn_that_failed_is_not_written_down(ledger: sqlite3.Connection) -> None:
+    """It reports no tokens, and a row of zeros would read as a free turn."""
+    provider = ScriptedProvider([ProviderError("503")])
+
+    turn = await one_turn(assistant_with(provider=provider, tracker=tracking(ledger)))
+
+    assert turn.cost_usd is None
+    assert ledger.execute("SELECT COUNT(*) FROM usage_log").fetchone()[0] == 0
+
+
+async def test_without_a_tracker_nothing_costs_anything() -> None:
+    turn = await one_turn(assistant_with(provider=priced()))
+
+    assert turn.cost_usd is None
+
+
+async def test_past_the_day_s_limit_the_answer_starts_with_a_warning(
+    ledger: sqlite3.Connection,
+) -> None:
+    """Every turn, including the one that crossed the line."""
+    speaker = FakeSpeaker()
+    spending = tracking(ledger, Limits(daily_usd=0.0001))
+
+    turn = await one_turn(assistant_with(provider=priced(), speaker=speaker, tracker=spending))
+
+    assert speaker.heard == f"{TURKISH.ui['daily_over']} Üç."
+    assert turn.said == speaker.heard
+
+
+async def test_past_the_month_s_limit_the_warning_is_the_month_s(
+    ledger: sqlite3.Connection,
+) -> None:
+    speaker = FakeSpeaker()
+    spending = tracking(ledger, Limits(daily_usd=100.0, monthly_usd=0.0001))
+
+    await one_turn(assistant_with(provider=priced(), speaker=speaker, tracker=spending))
+
+    assert speaker.heard.startswith(TURKISH.ui["monthly_over"])
+
+
+async def test_under_the_limit_nothing_is_said_about_money(ledger: sqlite3.Connection) -> None:
+    speaker = FakeSpeaker()
+
+    await one_turn(assistant_with(provider=priced(), speaker=speaker, tracker=tracking(ledger)))
+
+    assert speaker.heard == "Üç."
+
+
+async def test_with_hard_stop_on_the_model_is_not_asked_past_the_limit(
+    ledger: sqlite3.Connection,
+) -> None:
+    """Section 3.11: `hard_stop = true` and the day's limit passed. The user
+    hears why, the model hears nothing, and the turn has no name because
+    nothing was filed under one."""
+    already_spent(ledger, 0.5)
+    provider = priced()
+    speaker = FakeSpeaker()
+    spending = tracking(ledger, Limits(daily_usd=0.1, hard_stop=True))
+
+    turn = await one_turn(assistant_with(provider=provider, speaker=speaker, tracker=spending))
+
+    assert provider.calls == []
+    assert speaker.heard == TURKISH.ui["spend_stopped"]
+    assert (turn.heard, turn.failure, turn.turn_id) == ("saat kaç", "spend_stopped", "")
+
+
+async def test_without_hard_stop_the_model_is_still_asked_past_the_limit(
+    ledger: sqlite3.Connection,
+) -> None:
+    """The default of decision 10: warn, do not silence."""
+    already_spent(ledger, 0.5)
+    provider = priced()
+
+    await one_turn(
+        assistant_with(provider=provider, tracker=tracking(ledger, Limits(daily_usd=0.1)))
+    )
+
+    assert len(provider.calls) == 1
+
+
+async def test_an_answer_the_token_limit_cut_short_says_so_at_its_end() -> None:
+    speaker = FakeSpeaker()
+    provider = ScriptedProvider(
+        [Delta(text="Uzun bir hikâyenin başı"), Delta(finish_reason="MAX_TOKENS")]
+    )
+
+    turn = await one_turn(assistant_with(provider=provider, speaker=speaker))
+
+    assert speaker.heard == f"Uzun bir hikâyenin başı {TURKISH.ui['answer_cut_off']}"
+    assert turn.said == speaker.heard
+
+
+async def test_an_answer_that_ended_on_its_own_says_nothing_about_being_cut() -> None:
+    speaker = FakeSpeaker()
+    provider = ScriptedProvider([Delta(text="Üç."), Delta(finish_reason="STOP")])
+
+    await one_turn(assistant_with(provider=provider, speaker=speaker))
+
+    assert speaker.heard == "Üç."
+
+
+async def test_the_warning_comes_first_and_the_cut_off_notice_last(
+    ledger: sqlite3.Connection,
+) -> None:
+    """The warning is the one sentence to act on; the notice is where the cut is."""
+    speaker = FakeSpeaker()
+    provider = ScriptedProvider(
+        [Delta(text="Başı"), Delta(finish_reason="MAX_TOKENS", usage=Usage(300, 10))]
+    )
+    spending = tracking(ledger, Limits(daily_usd=0.0001))
+
+    await one_turn(assistant_with(provider=provider, speaker=speaker, tracker=spending))
+
+    assert speaker.heard == f"{TURKISH.ui['daily_over']} Başı {TURKISH.ui['answer_cut_off']}"
+
+
+async def test_the_calls_a_turn_ran_leave_the_turn() -> None:
+    gate = FakeGate()
+    provider = ScriptedProvider(
+        [Delta(tool_call=ToolCall(id="c1", name="clock", arguments={}))], [Delta(text="Üç.")]
+    )
+    agent = Agent(provider, model="fake-1", tools=ToolRegistry([clock]), dispatch=gate)
+
+    turn = await one_turn(assistant_with(agent=agent))
+
+    assert turn.tool_calls == 1
+
+
+def test_the_thinking_timeout_is_the_turn_seconds_of_section_3_11() -> None:
+    """One number, written once: the constant here reads it off `Limits`."""
+    assert Limits().turn_seconds == THINKING_TIMEOUT

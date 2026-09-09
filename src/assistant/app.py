@@ -51,6 +51,14 @@ gate, not to the model: nothing said in it reaches the conversation. The
 words that count as yes and no come from the locale pack; the English ones
 below are the end of the chain.
 
+**What a turn cost is written down, and what a day cost is said out loud.**
+Every turn that reached the model goes to `usage_log` through the tracker,
+priced (section 6). Past the day's or the month's limit (section 3.11)
+every answer starts with a warning, and with `hard_stop` on the model is
+not asked at all. An answer the token limit cut short says so at its end:
+a sentence that stops halfway with nothing said about it is a bug nobody
+can find.
+
 **Three failures are said out loud, and no others.** A refused key means the
 user has to go and renew it (section 3.2), a provider that cannot be reached
 means try again, and a minute of thinking means the same. Anything else is a
@@ -77,13 +85,15 @@ from typing import Protocol
 
 from loguru import logger
 
-from assistant.agent.core import Agent
+from assistant.agent.core import Agent, Answer
+from assistant.agent.limits import Limits
 from assistant.audio.player import PlaybackError, Speaker
 from assistant.llm.base import AuthenticationError, ProviderError, Usage
 from assistant.locales import Locale
 from assistant.store.normalize import normalize_search
 from assistant.stt.base import NO_SPEECH_CEILING, SAMPLE_RATE, Audio, STTProvider, Transcript
 from assistant.tts.base import TTSProvider, VoiceInfo
+from assistant.usage.tracker import UsageTracker
 
 __all__ = [
     "CONFIRM_WINDOW_SECONDS",
@@ -125,7 +135,9 @@ class State(StrEnum):
 
 
 # Section 3.1 rule 5. A turn that has not finished in a minute is not going to.
-THINKING_TIMEOUT = 60.0
+# The number is the section 3.11 table's, written once in `limits.py`;
+# `config.toml` `[limits] turn_seconds` replaces it through the constructor.
+THINKING_TIMEOUT = Limits().turn_seconds
 
 # Section 3.1 rule 6. How long the microphone stays open for a yes or a no
 # after the question has been read; what comes after it is a no.
@@ -154,6 +166,15 @@ TEXT: dict[str, str] = {
     # being listened for - and again, alone, when the answer had neither.
     "confirm_hint": "Say yes or no.",
     "confirm_again": "I did not catch that. Yes, or no?",
+    # The token limit of section 3.11 ended the answer; said at its end,
+    # where the cut is.
+    "answer_cut_off": "The end of the answer was cut off.",
+    # Said before the answer once a spending limit is passed - every turn,
+    # until the day or the month turns; and instead of an answer with
+    # `hard_stop` on.
+    "daily_over": "You have gone over today's spending limit.",
+    "monthly_over": "You have gone over this month's spending limit.",
+    "spend_stopped": "The spending limit has been passed, so I am not asking the model.",
 }
 
 
@@ -197,6 +218,10 @@ class Turn:
     `turn_id` is the name the turn goes by in `tool_audit` (section 3.9),
     so that a row there and a line in the log can be read together. A turn
     that never reached the model has none.
+
+    `cost_usd` is what the turn cost at its model's price - `None` when the
+    price is not known, or the turn never reached the model - and
+    `tool_calls` how many calls the gate ran. Both go to the log (2.4).
     """
 
     heard: str = ""
@@ -206,6 +231,8 @@ class Turn:
     confidence: float | None = None
     failure: str | None = None
     turn_id: str = ""
+    cost_usd: float | None = None
+    tool_calls: int = 0
 
 
 class Capture(Protocol):
@@ -263,6 +290,7 @@ class Assistant:
         thinking_timeout: float = THINKING_TIMEOUT,
         on_state: Callable[[State], None] | None = None,
         on_turn: Callable[[Turn], None] | None = None,
+        tracker: UsageTracker | None = None,
     ) -> None:
         self._capture = capture
         self._stt = stt
@@ -273,6 +301,7 @@ class Assistant:
         self._thinking_timeout = thinking_timeout
         self._on_state = on_state
         self._on_turn = on_turn
+        self._tracker = tracker
 
         self._said = {key: locale.say(key, default) for key, default in TEXT.items()}
         self._yes = locale.yes_words or YES_WORDS
@@ -328,14 +357,29 @@ class Assistant:
         if not heard.text:
             return await self._missed(heard)
 
+        if self._tracker is not None and self._tracker.stopped():
+            # `hard_stop` and a limit passed (section 3.11): the model is
+            # not asked, and the user hears why instead of an answer.
+            return await self._stopped(heard.text)
+
         self._enter(State.THINKING)
         # Minted here, where the turn becomes something the model may act on:
         # every tool call the turn makes is written down under this name.
         turn_id = uuid.uuid4().hex
-        said, usage, failure = await self._answer(heard.text, turn_id)
+        answer, failure = await self._answer(heard.text, turn_id)
+        cost = self._record(turn_id, answer, failure)
+        said = self._worded(answer, failure)
         await self._speak(said)
         self._rest()
-        return Turn(heard=heard.text, said=said, usage=usage, failure=failure, turn_id=turn_id)
+        return Turn(
+            heard=heard.text,
+            said=said,
+            usage=answer.usage,
+            failure=failure,
+            turn_id=turn_id,
+            cost_usd=cost,
+            tool_calls=answer.tool_calls,
+        )
 
     async def confirm(self, question: str) -> bool:
         """Asks `question` out loud and listens for a yes (section 3.1 rule 2).
@@ -392,13 +436,14 @@ class Assistant:
 
         return hear(await self._stt.transcribe(pcm, hint=self._locale.stt_language))
 
-    async def _answer(self, heard: str, turn_id: str) -> tuple[str, Usage, str | None]:
+    async def _answer(self, heard: str, turn_id: str) -> tuple[Answer, str | None]:
         """The model's answer, or the sentence that explains why there is none.
 
-        A turn that failed spent no tokens anybody can account for: what the
-        provider counted before it refused is not reported to us, and guessing
-        would put a number in the cost report that nothing backs. The third
-        value is the key of the sentence that was said instead, for the log.
+        The second value is the key of that sentence, for the log, and `None`
+        when the model answered. A turn that failed spent no tokens anybody
+        can account for: what the provider counted before it refused is not
+        reported to us, and guessing would put a number in the cost report
+        that nothing backs.
         """
         try:
             answer = await asyncio.wait_for(
@@ -406,18 +451,70 @@ class Assistant:
                 self._thinking_timeout,
             )
         except TimeoutError:
-            return self._said["took_too_long"], Usage(), "took_too_long"
+            return self._instead("took_too_long")
         except AuthenticationError:
             # Never retried and never failed over: the key will not start
             # working on its own, and quietly using another model would put the
             # user on a bill they did not agree to (section 3.2).
-            return self._said["key_invalid"], Usage(), "key_invalid"
+            return self._instead("key_invalid")
         except (ProviderError, OSError):
             # OSError as well as our own: a socket that was refused below the
             # adapter's transport never reaches it to be translated.
-            return self._said["unreachable"], Usage(), "unreachable"
+            return self._instead("unreachable")
 
-        return answer.text, answer.usage, None
+        return answer, None
+
+    def _instead(self, key: str) -> tuple[Answer, str]:
+        """The sentence said in place of an answer, shaped as an answer with
+        nothing behind it, and the key of it for the log."""
+        return Answer(text=self._said[key], usage=Usage(), finish_reason=None), key
+
+    def _record(self, turn_id: str, answer: Answer, failure: str | None) -> float | None:
+        """The turn's tokens to `usage_log`, priced (section 6).
+
+        A turn that failed reports no tokens and is not a row: a row of
+        zeros would read as a free turn, which is the mistake `logs.py`
+        already refuses to make. Without a tracker - most tests - nothing
+        is written and nothing costs anything.
+        """
+        if self._tracker is None or failure is not None:
+            return None
+        return self._tracker.record(turn_id, answer.usage)
+
+    def _worded(self, answer: Answer, failure: str | None) -> str:
+        """What is said out loud: the answer, with the day's warning before
+        it and the cut-off notice after it (section 3.11).
+
+        The warning comes first because the answer may be long and the
+        warning is the one sentence the user has to act on. The notice
+        comes last because that is where the cut is. A turn that failed
+        gets neither: its one sentence is already the whole of what there
+        is to say.
+        """
+        if failure is not None:
+            return answer.text
+
+        parts: list[str] = []
+        warning = None if self._tracker is None else self._tracker.warning()
+        if warning is not None:
+            parts.append(self._said[warning])
+        if answer.text:
+            parts.append(answer.text)
+        if answer.cut_off:
+            parts.append(self._said["answer_cut_off"])
+        return " ".join(parts)
+
+    async def _stopped(self, heard: str) -> Turn:
+        """`hard_stop` and a limit passed: what the user hears instead of an answer.
+
+        No `turn_id`: the turn never reached the model and made no call to
+        be filed under one. The fast path of 2.5 does not come this way - a
+        limit on spending has nothing to say about a turn that costs nothing.
+        """
+        said = self._said["spend_stopped"]
+        await self._speak(said)
+        self._rest()
+        return Turn(heard=heard, said=said, failure="spend_stopped")
 
     async def _ask(self, prompt: str) -> bool | None:
         """Reads `prompt`, opens the window, and reads the answer.

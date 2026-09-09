@@ -1,8 +1,8 @@
 """The application log (item 1.11).
 
-One line per turn, holding what it cost. That is the whole of phase 1: the
-`usage_log` table and `assistant cost` arrive in phase 2.4, and until they do
-this file is where the answer to "what am I spending" is kept.
+One line per turn, holding what it cost: the tokens, how many tools ran, and
+the price in dollars - the same number the turn's row in `usage_log` carries
+(2.4), so that the log and `assistant cost` never disagree about a turn.
 
 Three decisions are worth stating, because each of them is about what is *not*
 written.
@@ -118,9 +118,20 @@ def log_turn(finished: Turn) -> None:
 
     usage = finished.usage
     logger.info(
-        "{where}: {input} in, {output} out, {cached} cached",
+        "{where}: {input} in, {output} out, {cached} cached, {tools} tools, {cost}",
         where=where,
         input=usage.input_tokens,
         output=usage.output_tokens,
         cached=usage.cached_tokens,
+        tools=finished.tool_calls,
+        cost=_dollars(finished.cost_usd),
     )
+
+
+def _dollars(cost: float | None) -> str:
+    """`$0.0004`, or the admission that the price is not known.
+
+    Not `$0.0000`: a model with no entry in `pricing.toml` did not run for
+    free, and a zero in the log would say it did (section 6).
+    """
+    return "price unknown" if cost is None else f"${cost:.4f}"

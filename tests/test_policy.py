@@ -10,7 +10,11 @@ the row is on disk *before* the tool's body starts, which is proved by a tool
 that reads the table from inside its own body. Everything else - `ok`,
 `error`, `denied`, what the arguments look like - follows from that row.
 
-The last two tests put the real `Confirm` behind the gate: the state
+The gate also reads the table before it asks (2.4): the same call run a
+moment ago adds a sentence to the question. That is tested with the real
+`:memory:` table and a clock the test moves.
+
+Two tests put the real `Confirm` behind the gate: the state
 machine's window of 2.3, over a fake microphone. Silence there is what
 "unconfirmed" means in life, and the tool still does not run.
 """
@@ -27,9 +31,11 @@ from assistant.agent.core import Confirm
 from assistant.agent.policy import (
     DECLINED,
     DISABLED,
+    DUPLICATE_WINDOW_SECONDS,
     FAILED,
     MISSING_ARGUMENT,
     NO_SUCH_TOOL,
+    TEXT,
     dispatch,
 )
 from assistant.llm.base import ToolCall, ToolSpec
@@ -247,9 +253,24 @@ def database() -> Iterator[sqlite3.Connection]:
     connection.close()
 
 
+class Clock:
+    """A clock a test can move: the gate reads "a moment ago" off it."""
+
+    def __init__(self, now: float) -> None:
+        self.now = now
+
+    def __call__(self) -> float:
+        return self.now
+
+
 @pytest.fixture
-def audit(database: sqlite3.Connection) -> AuditRepo:
-    return AuditRepo(database, clock=lambda: 1_700_000_000)
+def clock() -> Clock:
+    return Clock(1_700_000_000)
+
+
+@pytest.fixture
+def audit(database: sqlite3.Connection, clock: Clock) -> AuditRepo:
+    return AuditRepo(database, clock=clock)
 
 
 def rows(database: sqlite3.Connection) -> list[dict[str, Any]]:
@@ -398,3 +419,161 @@ async def test_a_confirm_tool_runs_when_the_microphone_hears_yes() -> None:
 
     assert answer == "Spotify opened"
     assert ran == ["open_app:Spotify"]
+
+
+# --------------------------------------------------------------------------
+# The question knows what happened a moment ago (2.4, section 3.11)
+# --------------------------------------------------------------------------
+
+
+def spotify() -> ToolCall:
+    return call("open_app", name="Spotify")
+
+
+async def test_the_question_says_the_same_thing_was_just_done(
+    audit: AuditRepo, clock: Clock
+) -> None:
+    """The harm of section 3.11: the user gave the command, the connection
+    dropped, they say it again - and would say yes to a question they were
+    already expecting. The gate tells them the one thing they do not know."""
+    confirm = FakeConfirm(answer=True)
+    await gate(spotify(), confirm=confirm, audit=audit)
+    clock.now += 40
+
+    await gate(spotify(), confirm=confirm, audit=audit)
+
+    assert confirm.asked[1] == "Spotify will be opened. You already did this 40 seconds ago."
+
+
+async def test_a_call_whose_outcome_is_unknown_is_said_to_be_unknown(
+    audit: AuditRepo, clock: Clock
+) -> None:
+    """A row left `started` is a crash between the write and the finish: it
+    may have happened. The sentence says so rather than guess."""
+    audit.start(spotify(), turn_id="earlier", risk="confirm")
+    clock.now += 40
+    confirm = FakeConfirm(answer=False)
+
+    await gate(spotify(), confirm=confirm, audit=audit)
+
+    assert confirm.asked == [
+        "Spotify will be opened. You tried this 40 seconds ago, and the outcome is not known."
+    ]
+
+
+async def test_a_call_the_user_refused_was_not_done(audit: AuditRepo, clock: Clock) -> None:
+    confirm = FakeConfirm(answer=False)
+    await gate(spotify(), confirm=confirm, audit=audit)
+    clock.now += 40
+
+    await gate(spotify(), confirm=confirm, audit=audit)
+
+    assert confirm.asked == ["Spotify will be opened."] * 2
+
+
+async def test_a_call_that_failed_was_not_done_either(audit: AuditRepo, clock: Clock) -> None:
+    row = audit.start(spotify(), turn_id="earlier", risk="confirm")
+    audit.finish(row, status="error", error="RuntimeError")
+    clock.now += 40
+    confirm = FakeConfirm(answer=False)
+
+    await gate(spotify(), confirm=confirm, audit=audit)
+
+    assert confirm.asked == ["Spotify will be opened."]
+
+
+async def test_what_happened_before_the_window_is_not_mentioned(
+    audit: AuditRepo, clock: Clock
+) -> None:
+    """Ten minutes: an outage and the command said again fit inside it; a
+    repeat the user means an hour later is not bothered."""
+    confirm = FakeConfirm(answer=True)
+    await gate(spotify(), confirm=confirm, audit=audit)
+    clock.now += DUPLICATE_WINDOW_SECONDS + 1
+
+    await gate(spotify(), confirm=confirm, audit=audit)
+
+    assert confirm.asked[1] == "Spotify will be opened."
+
+
+async def test_the_window_is_the_gate_s_to_be_given(audit: AuditRepo, clock: Clock) -> None:
+    """From `[limits] duplicate_window_sec`, through the composition root."""
+    confirm = FakeConfirm(answer=True)
+    await gate(spotify(), confirm=confirm, audit=audit)
+    clock.now += 30
+
+    await dispatch(
+        spotify(),
+        turn_id=TURN,
+        registry=REGISTRY,
+        confirm=confirm,
+        audit=audit,
+        duplicate_window=10,
+    )
+
+    assert confirm.asked[1] == "Spotify will be opened."
+
+
+async def test_the_same_tool_with_other_arguments_is_another_call(
+    audit: AuditRepo, clock: Clock
+) -> None:
+    confirm = FakeConfirm(answer=True)
+    await gate(spotify(), confirm=confirm, audit=audit)
+    clock.now += 40
+
+    await gate(call("open_app", name="Chrome"), confirm=confirm, audit=audit)
+
+    assert confirm.asked[1] == "Chrome will be opened."
+
+
+async def test_a_safe_tool_asks_nothing_and_so_says_nothing(audit: AuditRepo, clock: Clock) -> None:
+    confirm = FakeConfirm(answer=True)
+    await gate(call("get_current_time"), confirm=confirm, audit=audit)
+    clock.now += 40
+
+    await gate(call("get_current_time"), confirm=confirm, audit=audit)
+
+    assert confirm.asked == []
+    assert ran == ["get_current_time"] * 2
+
+
+async def test_from_a_minute_on_the_span_is_said_in_minutes(audit: AuditRepo, clock: Clock) -> None:
+    confirm = FakeConfirm(answer=True)
+    await gate(spotify(), confirm=confirm, audit=audit)
+    clock.now += 150
+
+    await gate(spotify(), confirm=confirm, audit=audit)
+
+    assert confirm.asked[1].endswith("You already did this 2 minutes ago.")
+
+
+async def test_the_sentence_is_the_pack_s(audit: AuditRepo, clock: Clock) -> None:
+    """Section 3.12: the composition root hands the gate the pack's wording,
+    and the English in `policy.TEXT` is the end of the chain."""
+    confirm = FakeConfirm(answer=True)
+    turkish = {
+        **TEXT,
+        "duplicate_done": "Bunu {ago} önce zaten yaptın.",
+        "seconds_ago": "{count} saniye",
+    }
+    await gate(spotify(), confirm=confirm, audit=audit)
+    clock.now += 40
+
+    await dispatch(
+        spotify(), turn_id=TURN, registry=REGISTRY, confirm=confirm, audit=audit, wording=turkish
+    )
+
+    assert confirm.asked[1] == "Spotify will be opened. Bunu 40 saniye önce zaten yaptın."
+
+
+async def test_without_a_repository_nothing_is_known_about_a_moment_ago() -> None:
+    confirm = FakeConfirm(answer=True)
+    await gate(spotify(), confirm=confirm)
+
+    await gate(spotify(), confirm=confirm)
+
+    assert confirm.asked == ["Spotify will be opened."] * 2
+
+
+def test_the_window_is_the_ten_minutes_section_3_11_gives() -> None:
+    assert DUPLICATE_WINDOW_SECONDS == 600

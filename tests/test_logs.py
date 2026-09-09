@@ -126,6 +126,24 @@ def test_a_turn_writes_down_what_it_spent(log: Path) -> None:
     assert "300 in, 10 out, 256 cached" in read(log)
 
 
+def test_a_turn_writes_down_how_many_tools_ran_and_what_it_cost(log: Path) -> None:
+    """The same number the turn's row in `usage_log` carries (2.4), so that
+    the log and `assistant cost` never disagree about a turn."""
+    log_turn(
+        Turn(heard="saat kaç", said="Üç.", usage=Usage(300, 10), tool_calls=2, cost_usd=0.0004)
+    )
+
+    assert "300 in, 10 out, 0 cached, 2 tools, $0.0004" in read(log)
+
+
+def test_a_turn_with_no_known_price_says_so_rather_than_claim_it_was_free(log: Path) -> None:
+    log_turn(Turn(heard="saat kaç", said="Üç.", usage=Usage(300, 10)))
+
+    line = read(log)
+    assert "price unknown" in line
+    assert "$0" not in line
+
+
 def test_a_turn_is_filed_under_the_name_it_has_in_the_audit_table(log: Path) -> None:
     """`tool_audit.turn_id` and this line are the two halves of one story;
     the id is what lets them be read together."""
