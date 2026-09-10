@@ -23,10 +23,17 @@ sentence they hear has to say so (section 3.2).
 **Nothing said out loud is written in this file.** The sentences come from the
 locale pack, with the English constants of `app.TEXT` as the end of the chain
 (section 3.12), exactly as in the setup wizard.
+
+**The first sentence is spoken while the model writes the second** (2.8).
+The tests of the last section hold the model back until the speaker has
+the first sentence, say the filler only when a tool round has gone quiet,
+and end the request itself - not just the sound - the moment the key goes
+down.
 """
 
 from __future__ import annotations
 
+import asyncio
 import sqlite3
 from collections.abc import AsyncIterator, Callable, Iterator, Sequence
 from dataclasses import replace
@@ -44,6 +51,7 @@ from assistant.agent.limits import Limits
 from assistant.agent.policy import DECLINED, NO_SUCH_TOOL, dispatch
 from assistant.app import (
     CONFIRM_WINDOW_SECONDS,
+    FILLER_DELAY_SECONDS,
     THINKING_TIMEOUT,
     Assistant,
     Heard,
@@ -55,7 +63,14 @@ from assistant.app import (
     read_answer,
 )
 from assistant.audio.player import PlaybackError
-from assistant.llm.base import AuthenticationError, Delta, ProviderError, ToolCall, Usage
+from assistant.llm.base import (
+    AuthenticationError,
+    Delta,
+    Message,
+    ProviderError,
+    ToolCall,
+    Usage,
+)
 from assistant.locales import Locale
 from assistant.store.db import open_database
 from assistant.store.repos import AuditRepo, UsageRepo
@@ -240,6 +255,7 @@ def assistant_with(
     speaker: FakeSpeaker | None = None,
     locale: Locale = TURKISH,
     thinking_timeout: float = THINKING_TIMEOUT,
+    filler_delay: float = FILLER_DELAY_SECONDS,
     on_state: Callable[[State], None] | None = None,
     on_turn: Callable[[Turn], None] | None = None,
     agent: Agent | None = None,
@@ -259,6 +275,7 @@ def assistant_with(
         speaker=speaker if speaker is not None else FakeSpeaker(),
         locale=locale,
         thinking_timeout=thinking_timeout,
+        filler_delay=filler_delay,
         on_state=on_state,
         on_turn=on_turn,
         tracker=tracker,
@@ -1321,9 +1338,12 @@ async def test_without_a_tracker_nothing_costs_anything() -> None:
 async def test_past_the_day_s_limit_the_answer_starts_with_a_warning(
     ledger: sqlite3.Connection,
 ) -> None:
-    """Every turn, including the one that crossed the line."""
+    """Every turn after the line was crossed. The warning is the first
+    thing said and the answer starts before its own cost is known (2.8),
+    so it is the spend before this turn that decides."""
+    already_spent(ledger, 0.5)
     speaker = FakeSpeaker()
-    spending = tracking(ledger, Limits(daily_usd=0.0001))
+    spending = tracking(ledger, Limits(daily_usd=0.1))
 
     turn = await one_turn(assistant_with(provider=priced(), speaker=speaker, tracker=spending))
 
@@ -1331,11 +1351,34 @@ async def test_past_the_day_s_limit_the_answer_starts_with_a_warning(
     assert turn.said == speaker.heard
 
 
+async def test_the_turn_that_crosses_the_line_is_warned_about_on_the_next_one(
+    ledger: sqlite3.Connection,
+) -> None:
+    """Its first word is out before its cost is; the warning follows one
+    turn later, which is at most one turn's worth of money late."""
+    speaker = FakeSpeaker()
+    provider = ScriptedProvider(
+        [Delta(text="Bir."), Delta(usage=Usage(300, 10))],
+        [Delta(text="İki."), Delta(usage=Usage(300, 10))],
+    )
+    assistant = assistant_with(
+        provider=provider, speaker=speaker, tracker=tracking(ledger, Limits(daily_usd=0.0001))
+    )
+    await assistant.begin()
+
+    first = await assistant.turn(speech())
+    second = await assistant.turn(speech())
+
+    assert first.said == "Bir."
+    assert second.said == f"{TURKISH.ui['daily_over']} İki."
+
+
 async def test_past_the_month_s_limit_the_warning_is_the_month_s(
     ledger: sqlite3.Connection,
 ) -> None:
+    already_spent(ledger, 0.5)
     speaker = FakeSpeaker()
-    spending = tracking(ledger, Limits(daily_usd=100.0, monthly_usd=0.0001))
+    spending = tracking(ledger, Limits(daily_usd=100.0, monthly_usd=0.1))
 
     await one_turn(assistant_with(provider=priced(), speaker=speaker, tracker=spending))
 
@@ -1407,11 +1450,12 @@ async def test_the_warning_comes_first_and_the_cut_off_notice_last(
     ledger: sqlite3.Connection,
 ) -> None:
     """The warning is the one sentence to act on; the notice is where the cut is."""
+    already_spent(ledger, 0.5)
     speaker = FakeSpeaker()
     provider = ScriptedProvider(
         [Delta(text="Başı"), Delta(finish_reason="MAX_TOKENS", usage=Usage(300, 10))]
     )
-    spending = tracking(ledger, Limits(daily_usd=0.0001))
+    spending = tracking(ledger, Limits(daily_usd=0.1))
 
     await one_turn(assistant_with(provider=provider, speaker=speaker, tracker=spending))
 
@@ -1650,3 +1694,304 @@ async def test_a_press_during_the_fast_path_is_not_spoken_over() -> None:
 
     assert speaker.played == []
     assert assistant.state is State.LISTENING
+
+
+# --------------------------------------------------------------------------
+# Speaking as the words come (2.8)
+# --------------------------------------------------------------------------
+
+WITH_FILLERS = replace(TURKISH, fillers=("Bir saniye, bakıyorum...", "Hemen bakıyorum..."))
+
+
+class SlowGate:
+    """A gate whose tool takes `seconds`: a slow tool, or the silence of the
+    model's next request. The tool's body is never run."""
+
+    def __init__(self, seconds: float) -> None:
+        self.seconds = seconds
+        self.calls: list[str] = []
+
+    async def __call__(self, call: ToolCall, *, turn_id: str, confirm: Confirm) -> str:
+        self.calls.append(call.name)
+        await asyncio.sleep(self.seconds)
+        return "15:04"
+
+
+def wants_the_clock(*rounds: int) -> ScriptedProvider:
+    """A model that asks for the clock once per round, then answers."""
+    return ScriptedProvider(
+        *(
+            [Delta(tool_call=ToolCall(id=f"c{number}", name="clock", arguments={"n": number}))]
+            for number in rounds
+        ),
+        [Delta(text="Üç.")],
+    )
+
+
+def looking(seconds: float, provider: ScriptedProvider | None = None, **parts: Any) -> Assistant:
+    """An assistant whose model asks for the clock and waits `seconds` for it.
+
+    The filler's clock is shortened to keep the test quick; what is tested
+    is the rule, not the number.
+    """
+    agent = Agent(
+        provider if provider is not None else wants_the_clock(1),
+        model="fake-1",
+        tools=ToolRegistry([clock]),
+        dispatch=SlowGate(seconds),
+    )
+    parts.setdefault("locale", WITH_FILLERS)
+    return assistant_with(agent=agent, filler_delay=0.05, **parts)
+
+
+class Noticing(FakeSpeaker):
+    """A sound card that says when it has the first buffer in hand."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.has_first = asyncio.Event()
+
+    async def play(self, buffers: AsyncIterator[bytes], *, sample_rate: int) -> None:
+        self.rates.append(sample_rate)
+        async for buffer in buffers:
+            self.played.append(buffer)
+            self.has_first.set()
+
+
+async def test_the_first_sentence_is_spoken_before_the_model_has_written_the_second() -> None:
+    """The whole of 2.8 in one claim. The model is held back until the
+    speaker has the first sentence; a turn that waited for the whole
+    answer would wait for ever here, so the hold gives up after two
+    seconds and the turn fails instead of hanging."""
+    speaker = Noticing()
+    provider = ScriptedProvider(
+        [
+            Delta(text="Birinci cümle burada. "),
+            lambda: asyncio.wait_for(speaker.has_first.wait(), 2.0),
+            Delta(text="İkinci cümle burada."),
+        ]
+    )
+
+    turn = await one_turn(assistant_with(provider=provider, speaker=speaker))
+
+    assert turn.failure is None
+    assert speaker.heard == "Birinci cümle burada. İkinci cümle burada."
+    assert turn.said == speaker.heard
+
+
+async def test_speaking_begins_with_the_first_word_and_not_when_the_model_is_done() -> None:
+    seen: list[State] = []
+    held: list[Assistant] = []
+    provider = ScriptedProvider(
+        [Delta(text="Bir. "), lambda: seen.append(held[0].state), Delta(text="İki.")]
+    )
+    assistant = assistant_with(provider=provider)
+    held.append(assistant)
+
+    await one_turn(assistant)
+
+    assert seen == [State.SPEAKING]
+
+
+async def test_the_filler_is_said_when_a_tool_round_goes_quiet() -> None:
+    """Two seconds of silence do not feel like two seconds once something
+    has been said about them (section 4)."""
+    speaker = FakeSpeaker()
+
+    turn = await one_turn(looking(0.2, speaker=speaker))
+
+    assert speaker.heard == "Bir saniye, bakıyorum... Üç."
+    assert turn.said == speaker.heard
+    assert turn.tool_calls == 1
+
+
+async def test_a_tool_that_answers_at_once_needs_no_filler() -> None:
+    """A "one moment" in front of an answer that was already on its way
+    would only push it back."""
+    speaker = FakeSpeaker()
+
+    await one_turn(looking(0.0, speaker=speaker))
+
+    assert speaker.heard == "Üç."
+
+
+async def test_the_filler_is_said_once_however_many_rounds_go_quiet() -> None:
+    speaker = FakeSpeaker()
+
+    await one_turn(looking(0.2, wants_the_clock(1, 2), speaker=speaker))
+
+    assert speaker.heard == "Bir saniye, bakıyorum... Üç."
+
+
+async def test_the_fillers_are_said_in_turn() -> None:
+    """A pack that lists two is not heard saying the same one every time."""
+    speaker = FakeSpeaker()
+    provider = ScriptedProvider(
+        [Delta(tool_call=ToolCall(id="c1", name="clock", arguments={}))],
+        [Delta(text="Üç.")],
+        [Delta(tool_call=ToolCall(id="c2", name="clock", arguments={}))],
+        [Delta(text="Dört.")],
+    )
+    assistant = looking(0.2, provider, speaker=speaker)
+    await assistant.begin()
+
+    first = await assistant.turn(speech())
+    second = await assistant.turn(speech())
+
+    assert first.said == "Bir saniye, bakıyorum... Üç."
+    assert second.said == "Hemen bakıyorum... Dört."
+
+
+async def test_the_filler_comes_from_the_code_when_the_pack_has_none() -> None:
+    speaker = FakeSpeaker()
+
+    await one_turn(looking(0.2, speaker=speaker, locale=TURKISH))
+
+    assert speaker.heard == f"{app.FILLERS[0]} Üç."
+
+
+async def test_the_filler_follows_what_the_model_said_before_it_looked() -> None:
+    """Set off from the model's words, which may have ended mid-word."""
+    speaker = FakeSpeaker()
+    provider = ScriptedProvider(
+        [Delta(text="Bakıyorum"), Delta(tool_call=ToolCall(id="c1", name="clock", arguments={}))],
+        [Delta(text="Üç.")],
+    )
+
+    await one_turn(looking(0.2, provider, speaker=speaker))
+
+    assert speaker.heard == "Bakıyorum Bir saniye, bakıyorum... Üç."
+
+
+class SlowWindow(FakeCapture):
+    """A confirmation window that takes a while to hear the answer."""
+
+    async def listen_for(self, seconds: float) -> Audio | None:
+        await asyncio.sleep(0.2)
+        return await super().listen_for(seconds)
+
+
+async def test_no_filler_is_said_while_a_question_is_being_asked() -> None:
+    """The user is answering it; "one moment" over a question is noise at
+    best and a second question at worst."""
+    tts = FakeTTS()
+
+    await one_turn(
+        asking(
+            capture=SlowWindow(answers=[speech()]),
+            stt=says("evet"),
+            tts=tts,
+            locale=WITH_FILLERS,
+            filler_delay=0.05,
+        )
+    )
+
+    assert ran == ["open_app:Spotify"]
+    assert tts.said == ["Spotify will be opened. Evet ya da hayır de.", "Tamam."]
+
+
+async def test_the_state_goes_back_to_speaking_after_a_question_asked_mid_answer() -> None:
+    """The model said something, then asked. The window is a detour from
+    wherever the turn was, and `SPEAKING` is where it was."""
+    seen: list[State] = []
+    provider = ScriptedProvider(
+        [
+            Delta(text="Açıyorum. "),
+            Delta(tool_call=ToolCall(id="c1", name="open_app", arguments={"name": "Spotify"})),
+        ],
+        [Delta(text="Tamam.")],
+    )
+
+    await one_turn(
+        asking(
+            provider,
+            capture=FakeCapture(answers=[speech()]),
+            stt=says("evet"),
+            on_state=seen.append,
+        )
+    )
+
+    assert seen == [
+        State.IDLE,
+        State.TRANSCRIBING,
+        State.THINKING,
+        State.SPEAKING,
+        State.CONFIRMING,
+        State.SPEAKING,
+        State.IDLE,
+    ]
+    assert ran == ["open_app:Spotify"]
+
+
+async def test_a_failure_in_the_second_request_is_said_after_what_was_already_heard() -> None:
+    """Half an answer was spoken before the connection dropped; the sentence
+    that says so comes after it, and the turn is not remembered - the next
+    one starts clean, exactly as when the first request failed."""
+    speaker = FakeSpeaker()
+    provider = ScriptedProvider(
+        [Delta(text="Bakıyorum. "), Delta(tool_call=ToolCall(id="c1", name="clock", arguments={}))],
+        [ProviderError("503")],
+        [Delta(text="Selam.")],
+    )
+    agent = Agent(provider, model="fake-1", tools=ToolRegistry([clock]), dispatch=FakeGate())
+    assistant = assistant_with(agent=agent, speaker=speaker)
+    await assistant.begin()
+
+    failed = await assistant.turn(speech())
+    await assistant.turn(speech())
+
+    assert failed.said == f"Bakıyorum. {TURKISH.ui['unreachable']}"
+    assert failed.failure == "unreachable"
+    assert failed.usage == Usage()
+    assert provider.calls[-1].turns == [Message.user("saat kaç")]
+
+
+async def test_the_key_going_down_ends_the_request_and_not_only_the_sound() -> None:
+    """The model would have gone on for a minute. The press ends the wait
+    at once, the provider's stream is closed under it, and the turn is
+    over - because the next one, the one the user is speaking now, cannot
+    start until it is."""
+    capture = FakeCapture()
+    provider = ScriptedProvider([Delta(text="Bir. "), capture.press, 60.0, Delta(text="İki.")])
+    assistant = assistant_with(capture=capture, provider=provider)
+
+    turn = await asyncio.wait_for(one_turn(assistant), 2.0)
+
+    assert turn.said == "Bir."
+    assert provider.open_streams == 0
+    assert assistant.state is State.LISTENING
+
+
+async def test_the_clock_runs_only_until_the_first_word() -> None:
+    """A long answer read out loud is not a turn that hung."""
+    speaker = FakeSpeaker()
+    provider = ScriptedProvider([Delta(text="Başladı. "), 0.05, Delta(text="Bitti.")])
+
+    turn = await one_turn(assistant_with(provider=provider, speaker=speaker, thinking_timeout=0.02))
+
+    assert turn.failure is None
+    assert speaker.heard == "Başladı. Bitti."
+
+
+async def test_how_long_the_first_sound_took_leaves_the_turn() -> None:
+    """The number 2.8 is about, kept by the log so that it can be watched."""
+    spoken = await one_turn(assistant_with())
+    quiet = ScriptedProvider([Delta(finish_reason="SAFETY")])
+    silent = await one_turn(assistant_with(provider=quiet))
+
+    assert spoken.first_sound_ms is not None
+    assert 0 <= spoken.first_sound_ms < 5000
+    assert silent.first_sound_ms is None
+
+
+async def test_a_press_before_the_first_word_leaves_the_model_s_answer_unspoken() -> None:
+    """The stream is closed under the model, and no sentence follows: not the
+    answer, and not a failure's either."""
+    capture = FakeCapture()
+    speaker = FakeSpeaker()
+    provider = ScriptedProvider([capture.press, ProviderError("503")])
+
+    turn = await one_turn(assistant_with(capture=capture, provider=provider, speaker=speaker))
+
+    assert speaker.played == []
+    assert turn.said == ""

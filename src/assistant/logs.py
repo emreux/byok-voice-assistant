@@ -4,7 +4,10 @@ One line per turn, holding what it cost: the tokens, how many tools ran, and
 the price in dollars - the same number the turn's row in `usage_log` carries
 (2.4), so that the log and `assistant cost` never disagree about a turn. A
 turn the fast path answered without the model (2.5) is written by its intent
-instead: no request was made, so there is no count to write.
+instead: no request was made, so there is no count to write. Since 2.8 the
+line also holds how long the first sound took - the number that step is
+about, kept here so that it can be watched across days rather than heard
+once.
 
 Three decisions are worth stating, because each of them is about what is *not*
 written.
@@ -133,14 +136,20 @@ def log_turn(finished: Turn) -> None:
 
     usage = finished.usage
     logger.info(
-        "{where}: {input} in, {output} out, {cached} cached, {tools} tools, {cost}",
+        "{where}: {input} in, {output} out, {cached} cached, {tools} tools, {cost}{first}",
         where=where,
         input=usage.input_tokens,
         output=usage.output_tokens,
         cached=usage.cached_tokens,
         tools=finished.tool_calls,
         cost=_dollars(finished.cost_usd),
+        first=_first_sound(finished.first_sound_ms),
     )
+
+
+def _first_sound(milliseconds: float | None) -> str:
+    """`, first sound 1840 ms`, or nothing for a turn that made no sound."""
+    return "" if milliseconds is None else f", first sound {milliseconds:.0f} ms"
 
 
 def _dollars(cost: float | None) -> str:

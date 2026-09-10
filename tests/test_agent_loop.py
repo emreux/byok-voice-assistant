@@ -41,7 +41,7 @@ from __future__ import annotations
 import ast
 import asyncio
 import inspect
-from collections.abc import AsyncIterator, Callable, Sequence
+from collections.abc import AsyncIterator, Awaitable, Callable, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -79,7 +79,7 @@ class Request:
         return self.messages[1:]
 
 
-Step = Delta | BaseException | Callable[[], None] | float
+Step = Delta | BaseException | Callable[[], None] | Callable[[], Awaitable[object]] | float
 
 
 class ScriptedProvider:
@@ -89,7 +89,8 @@ class ScriptedProvider:
     `Delta` to yield, an exception to raise where it stands - which is how a
     connection that dies halfway through an answer is written down - a number
     of seconds to spend not answering, or something to do while the model is
-    supposedly writing.
+    supposedly writing - which may be something to wait for, when what the
+    test is about is what happened before the model went on (2.8).
     """
 
     id = "scripted"
@@ -130,7 +131,9 @@ class ScriptedProvider:
                 if isinstance(item, int | float):
                     await asyncio.sleep(item)
                 elif callable(item):
-                    item()
+                    outcome = item()
+                    if inspect.isawaitable(outcome):
+                        await outcome
                 else:
                     yield item
         finally:

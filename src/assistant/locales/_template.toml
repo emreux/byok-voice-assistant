@@ -39,6 +39,11 @@ vocabulary_hint = "open, settings, music, next, previous, time"
 # the two lists apart. Leave the table out and the English words are used.
 yes_words = ["yes", "ok", "okay", "confirm"]
 no_words = ["no", "cancel", "stop"]
+# What the assistant says while a tool is taking its time - "one moment,
+# let me check" - so that a second or two of silence does not feel like
+# one. Short, in your language, ending in a pause; list two or three and
+# they are said in turn. Leave it out and the English one is used.
+filler = ["One moment, let me check..."]
 
 [intents]
 # The short commands the assistant answers on its own, without asking the

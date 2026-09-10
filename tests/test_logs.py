@@ -136,6 +136,17 @@ def test_a_turn_writes_down_how_many_tools_ran_and_what_it_cost(log: Path) -> No
     assert "300 in, 10 out, 0 cached, 2 tools, $0.0004" in read(log)
 
 
+def test_a_turn_writes_down_how_long_its_first_sound_took(log: Path) -> None:
+    """The number 2.8 is about, watched here across days rather than
+    heard once; a turn that made no sound has none to write."""
+    log_turn(Turn(heard="saat kaç", said="Üç.", usage=Usage(300, 10), first_sound_ms=1840.2))
+    log_turn(Turn(heard="saat kaç", said="", usage=Usage(300, 10)))
+
+    first, second = read(log).strip().splitlines()
+    assert first.endswith("first sound 1840 ms")
+    assert "first sound" not in second
+
+
 def test_a_turn_with_no_known_price_says_so_rather_than_claim_it_was_free(log: Path) -> None:
     log_turn(Turn(heard="saat kaç", said="Üç.", usage=Usage(300, 10)))
 

@@ -18,6 +18,9 @@ vocabulary_hint = "aç, ayarlar, müzik, sonraki, önceki, saat, Bluetooth, Spot
 # words, any case; a "no" anywhere in the answer wins over a "yes".
 yes_words = ["evet", "onaylıyorum", "tamam", "olur"]
 no_words = ["hayır", "iptal", "vazgeç", "olmaz"]
+# Said while a tool takes its time (design.md 4): short, and ending in a
+# pause. Used in turn, so two of them are not the same one twice.
+filler = ["Bir saniye, bakıyorum...", "Hemen bakıyorum..."]
 
 [intents]
 # Short commands answered without asking the model (design.md 4): the name

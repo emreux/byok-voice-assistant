@@ -70,6 +70,30 @@ already cuts it off, so all there is to do about them is not spend a
 request. A turn like this costs nothing and says so: no tokens, no row on
 the bill.
 
+**The first sentence is spoken while the model is still writing the
+second** (2.8, architecture guide section 11). The loop hands the words out
+as they arrive (`Agent.stream_reply`), `tts.base.sentences` cuts them at the
+first boundary, and the speaker has that sentence while the rest is on its
+way - phase 1 waited for the whole answer, and the first sound came 2.5-6 s
+after the key (measured 3.3 s). The minute of section 3.1 rule 6 is the
+time to the first word; after it the model finishes at its own pace, since
+a long answer read out loud is not a turn that hung. The speaker pulls: the
+model is read only as fast as the speaker asks for more, so a tool the
+model calls runs while the speaker is waiting - which is also why the
+question a tool asks is not spoken over an answer under way.
+
+**A tool that takes long is said to be taking long.** The loop announces a
+tool round the moment it turns to run one; when no word has followed within
+`FILLER_DELAY_SECONDS`, the filler is said instead, once per turn - "bir
+saniye, bakıyorum" is what makes two seconds of silence feel like none
+(section 4). The words come from the pack's `[speech] filler`; `FILLERS`
+below is the end of the chain. Never while a question is being asked: the
+user is answering it.
+
+**The key going down ends the stream, request and all.** Not only the
+sound: the loop is left where it stood, the provider's stream is closed
+under it, and nothing is remembered - the user is asking something else.
+
 **Three failures are said out loud, and no others.** A refused key means the
 user has to go and renew it (section 3.2), a provider that cannot be reached
 means try again, and a minute of thinking means the same. Anything else is a
@@ -87,13 +111,16 @@ English constants below are the end of the chain, exactly as in the wizard
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import re
+import time
 import uuid
-from collections.abc import AsyncIterator, Callable, Iterable, Sequence
+from collections.abc import AsyncGenerator, AsyncIterator, Callable, Iterable, Sequence
+from contextlib import aclosing
 from dataclasses import dataclass, field
 from datetime import datetime
 from enum import StrEnum
-from typing import Protocol
+from typing import Any, Protocol
 
 from loguru import logger
 
@@ -110,6 +137,8 @@ from assistant.usage.tracker import UsageTracker
 
 __all__ = [
     "CONFIRM_WINDOW_SECONDS",
+    "FILLERS",
+    "FILLER_DELAY_SECONDS",
     "MIN_UTTERANCE_SECONDS",
     "NO_WORDS",
     "TEXT",
@@ -165,6 +194,18 @@ MIN_UTTERANCE_SECONDS = 0.35
 # answers first, and a pack that has none gets these.
 YES_WORDS = ("yes", "ok", "okay", "confirm")
 NO_WORDS = ("no", "cancel", "stop")
+
+# The end of the same chain for what is said while a tool takes its time
+# (2.8): the pack's `[speech] filler` answers first. Said in turn, so a
+# pack that lists two is not heard saying the same one every time.
+FILLERS = ("One moment, let me check...",)
+
+# How long a tool round may stay silent before the filler is said. A native
+# tool returns in 5-50 ms and the model's next first token takes 400-1500
+# ms after it (section 4), so this is the model's silence that is covered,
+# not the tool's; below it the answer is on its way and a "one moment"
+# would only push it back. The right number is measured, not argued.
+FILLER_DELAY_SECONDS = 0.3
 
 # The last link of the chain of section 3.12: what is said when no locale pack
 # offers a translation. Keys are unique across the whole project - the pack has
@@ -244,6 +285,11 @@ class Turn:
     answered it without the model (2.5) - `get_time`, `stop`, `cancel` -
     and is `None` for every turn the model heard. Such a turn's usage is a
     real zero: no request was made.
+
+    `first_sound_ms` is how long after the recording arrived the first
+    sound was made (2.8) - the number the whole of 2.8 is about, and the
+    one the log keeps so that it can be watched. `None` for a turn that
+    made none, and for the fast path, whose answer is a tool away.
     """
 
     heard: str = ""
@@ -256,6 +302,38 @@ class Turn:
     cost_usd: float | None = None
     tool_calls: int = 0
     intent: str | None = None
+    first_sound_ms: float | None = None
+
+
+@dataclass(slots=True)
+class _Saying:
+    """What the turn is saying, gathered as it is said (2.8): the pieces
+    in order, the failure that ended it if one did, and how long the first
+    sound took. `Turn` is made of it once the saying is over."""
+
+    started: float
+    pieces: list[str] = field(default_factory=list)
+    failure: str | None = None
+    first_sound_ms: float | None = None
+
+    def add(self, piece: str) -> str:
+        self.pieces.append(piece)
+        return piece
+
+    def own(self, sentence: str) -> str:
+        """One of the assistant's own sentences after the model's words,
+        set off from them - which the model's own pieces are not, since a
+        piece may end in the middle of a word."""
+        if self.pieces and not self.pieces[-1].endswith((" ", "\n")):
+            return f" {sentence}"
+        return sentence
+
+    def first_sound(self) -> None:
+        self.first_sound_ms = (time.perf_counter() - self.started) * 1000
+
+    @property
+    def said(self) -> str:
+        return "".join(self.pieces).strip()
 
 
 class Capture(Protocol):
@@ -311,6 +389,7 @@ class Assistant:
         speaker: Speaker,
         locale: Locale,
         thinking_timeout: float = THINKING_TIMEOUT,
+        filler_delay: float = FILLER_DELAY_SECONDS,
         on_state: Callable[[State], None] | None = None,
         on_turn: Callable[[Turn], None] | None = None,
         tracker: UsageTracker | None = None,
@@ -323,6 +402,7 @@ class Assistant:
         self._speaker = speaker
         self._locale = locale
         self._thinking_timeout = thinking_timeout
+        self._filler_delay = filler_delay
         self._on_state = on_state
         self._on_turn = on_turn
         self._tracker = tracker
@@ -335,8 +415,17 @@ class Assistant:
         self._said = {key: locale.say(key, default) for key, default in TEXT.items()}
         self._yes = locale.yes_words or YES_WORDS
         self._no = locale.no_words or NO_WORDS
+        self._fillers = locale.fillers or FILLERS
+        self._fillers_said = 0
         self._state = State.IDLE
         self._voice = ""
+        # Set the moment the key goes down, so that whatever is waiting for
+        # the model's next word wakes up and stops waiting (`_as_they_come`).
+        self._pressed = asyncio.Event()
+        # How many answers are being played at once: the answer, and inside
+        # it the question a tool asks (2.8). The microphone is deafened by
+        # the outermost and listens again when that one is done.
+        self._playing = 0
 
     @property
     def state(self) -> State:
@@ -374,6 +463,8 @@ class Assistant:
 
     async def turn(self, pcm: Audio) -> Turn:
         """One recording, from what was heard to what was said back."""
+        started = time.perf_counter()
+        self._pressed.clear()
         self._enter(State.TRANSCRIBING)
         heard = await self._heard(pcm)
 
@@ -405,19 +496,24 @@ class Assistant:
             return await self._stopped(heard.text)
 
         self._enter(State.THINKING)
-        answer, failure = await self._answer(heard.text, turn_id)
-        cost = self._record(turn_id, answer, failure)
-        said = self._worded(answer, failure)
-        await self._speak(said)
+        saying = _Saying(started=started)
+        await self._speak_all(self._answering(heard.text, turn_id, saying), saying)
+
+        # What the turn came to is known once its stream has ended, and not
+        # at all when it was cut short: by a press, or by a failure on the
+        # way. A turn cut short spent no tokens anybody can account for.
+        answer = self._agent.last_answer if saying.failure is None else None
+        cost = self._record(turn_id, answer, saying.failure)
         self._rest()
         return Turn(
             heard=heard.text,
-            said=said,
-            usage=answer.usage,
-            failure=failure,
+            said=saying.said,
+            usage=answer.usage if answer is not None else Usage(),
+            failure=saying.failure,
             turn_id=turn_id,
             cost_usd=cost,
-            tool_calls=answer.tool_calls,
+            tool_calls=answer.tool_calls if answer is not None else 0,
+            first_sound_ms=saying.first_sound_ms,
         )
 
     async def confirm(self, question: str) -> bool:
@@ -433,6 +529,9 @@ class Assistant:
         if self._withdrawn():
             return False
 
+        # Where the turn was: `THINKING`, or `SPEAKING` when the model had
+        # said something before it asked (2.8).
+        before = self._state
         self._enter(State.CONFIRMING)
         answer = await self._ask(f"{question} {self._said['confirm_hint']}")
         if answer is None:
@@ -440,7 +539,7 @@ class Assistant:
 
         # Back to where the turn was: the loop that asked is still running.
         if not self._withdrawn():
-            self._enter(State.THINKING)
+            self._enter(before)
         return answer is True
 
     async def _missed(self, heard: Heard) -> Turn:
@@ -507,73 +606,88 @@ class Assistant:
 
         return hear(await self._stt.transcribe(pcm, hint=self._locale.stt_language))
 
-    async def _answer(self, heard: str, turn_id: str) -> tuple[Answer, str | None]:
-        """The model's answer, or the sentence that explains why there is none.
-
-        The second value is the key of that sentence, for the log, and `None`
-        when the model answered. A turn that failed spent no tokens anybody
-        can account for: what the provider counted before it refused is not
-        reported to us, and guessing would put a number in the cost report
-        that nothing backs.
-        """
-        try:
-            answer = await asyncio.wait_for(
-                self._agent.reply(heard, turn_id=turn_id, confirm=self.confirm),
-                self._thinking_timeout,
-            )
-        except TimeoutError:
-            return self._instead("took_too_long")
-        except AuthenticationError:
-            # Never retried and never failed over: the key will not start
-            # working on its own, and quietly using another model would put the
-            # user on a bill they did not agree to (section 3.2).
-            return self._instead("key_invalid")
-        except (ProviderError, OSError):
-            # OSError as well as our own: a socket that was refused below the
-            # adapter's transport never reaches it to be translated.
-            return self._instead("unreachable")
-
-        return answer, None
-
-    def _instead(self, key: str) -> tuple[Answer, str]:
-        """The sentence said in place of an answer, shaped as an answer with
-        nothing behind it, and the key of it for the log."""
-        return Answer(text=self._said[key], usage=Usage(), finish_reason=None), key
-
-    def _record(self, turn_id: str, answer: Answer, failure: str | None) -> float | None:
-        """The turn's tokens to `usage_log`, priced (section 6).
-
-        A turn that failed reports no tokens and is not a row: a row of
-        zeros would read as a free turn, which is the mistake `logs.py`
-        already refuses to make. Without a tracker - most tests - nothing
-        is written and nothing costs anything.
-        """
-        if self._tracker is None or failure is not None:
-            return None
-        return self._tracker.record(turn_id, answer.usage)
-
-    def _worded(self, answer: Answer, failure: str | None) -> str:
-        """What is said out loud: the answer, with the day's warning before
-        it and the cut-off notice after it (section 3.11).
+    async def _answering(self, heard: str, turn_id: str, saying: _Saying) -> AsyncGenerator[str]:
+        """Everything the turn says, in the order it is said: the day's
+        warning first, the model's words as they come with the filler among
+        them, and last either the cut-off notice or the sentence that says
+        why the answer stopped (sections 3.11 and 3.2).
 
         The warning comes first because the answer may be long and the
         warning is the one sentence the user has to act on. The notice
-        comes last because that is where the cut is. A turn that failed
-        gets neither: its one sentence is already the whole of what there
-        is to say.
-        """
-        if failure is not None:
-            return answer.text
+        comes last because that is where the cut is. A failure's sentence
+        comes after whatever was already said: a connection that dropped in
+        the second request of a tool turn has left half an answer behind,
+        and the user has heard it. Nothing is said after a press.
 
-        parts: list[str] = []
+        A turn that failed spent no tokens anybody can account for: what
+        the provider counted before it refused is not reported to us, and
+        guessing would put a number in the cost report that nothing backs.
+        """
         warning = None if self._tracker is None else self._tracker.warning()
         if warning is not None:
-            parts.append(self._said[warning])
-        if answer.text:
-            parts.append(answer.text)
-        if answer.cut_off:
-            parts.append(self._said["answer_cut_off"])
-        return " ".join(parts)
+            yield saying.add(f"{self._said[warning]} ")
+
+        tool_round = asyncio.Event()
+        stream = self._agent.stream_reply(
+            heard, turn_id=turn_id, confirm=self.confirm, on_tool_round=tool_round.set
+        )
+        pieces = _as_they_come(
+            stream,
+            tool_round=tool_round,
+            pressed=self._pressed,
+            filler=self._filler,
+            delay=self._filler_delay,
+            asking=lambda: self._state is State.CONFIRMING,
+        )
+        try:
+            async with aclosing(pieces):
+                # The minute of section 3.1 rule 6 is the time to the first
+                # word. After it the model finishes at its own pace: a long
+                # answer read out loud is not a turn that hung, and a key
+                # press ends one that did.
+                first = await asyncio.wait_for(anext(pieces, None), self._thinking_timeout)
+                if first is not None:
+                    yield saying.add(first)
+                    async for piece in pieces:
+                        yield saying.add(piece)
+        except TimeoutError:
+            saying.failure = "took_too_long"
+        except AuthenticationError:
+            # Never retried and never failed over: the key will not start
+            # working on its own, and quietly using another model would put
+            # the user on a bill they did not agree to (section 3.2).
+            saying.failure = "key_invalid"
+        except (ProviderError, OSError):
+            # OSError as well as our own: a socket that was refused below the
+            # adapter's transport never reaches it to be translated.
+            saying.failure = "unreachable"
+
+        if self._withdrawn():
+            return
+        if saying.failure is not None:
+            yield saying.add(saying.own(self._said[saying.failure]))
+            return
+        answer = self._agent.last_answer
+        if answer is not None and answer.cut_off:
+            yield saying.add(saying.own(self._said["answer_cut_off"]))
+
+    def _filler(self) -> str:
+        """The next of the pack's fillers, in turn."""
+        chosen = self._fillers[self._fillers_said % len(self._fillers)]
+        self._fillers_said += 1
+        return chosen
+
+    def _record(self, turn_id: str, answer: Answer | None, failure: str | None) -> float | None:
+        """The turn's tokens to `usage_log`, priced (section 6).
+
+        A turn that failed or was cut short reports no tokens and is not a
+        row: a row of zeros would read as a free turn, which is the mistake
+        `logs.py` already refuses to make. Without a tracker - most tests -
+        nothing is written and nothing costs anything.
+        """
+        if self._tracker is None or failure is not None or answer is None:
+            return None
+        return self._tracker.record(turn_id, answer.usage)
 
     async def _stopped(self, heard: str) -> Turn:
         """`hard_stop` and a limit passed: what the user hears instead of an answer.
@@ -596,11 +710,21 @@ class Assistant:
         is every way of not saying yes that is not worth one: silence, a no,
         the key going down while the question was still being read.
         """
-        await self._play(prompt)
+        await self._play(_one(prompt))
         if self._withdrawn():
             return False
 
-        pcm = await self._capture.listen_for(CONFIRM_WINDOW_SECONDS)
+        # The window has to hear. An answer under way keeps the microphone
+        # deaf (`_play`); it is opened for the window and closed again after
+        # it - and `unmute` is also what lets the room's echo of the
+        # question pass before the window listens (`audio/capture.py`).
+        if self._playing:
+            self._capture.unmute()
+        try:
+            pcm = await self._capture.listen_for(CONFIRM_WINDOW_SECONDS)
+        finally:
+            if self._playing:
+                self._capture.mute()
         if pcm is None or self._withdrawn():
             return False
 
@@ -610,32 +734,58 @@ class Assistant:
         return read_answer(heard.text, yes=self._yes, no=self._no)
 
     async def _speak(self, said: str) -> None:
+        """Says one sentence of the assistant's own: the time, an apology,
+        a limit."""
         if not said or self._withdrawn():
             return
 
         self._enter(State.SPEAKING)
-        await self._play(said)
+        await self._play(_one(said))
 
-    async def _play(self, said: str) -> None:
-        """Says `said` through the sound card, with the microphone deaf meanwhile.
+    async def _speak_all(self, pieces: AsyncGenerator[str], saying: _Saying) -> None:
+        """Says what `pieces` yields, from the first of them on (2.8).
+
+        `SPEAKING` from the first piece - not before, since a model that
+        answers with nothing is not something to open the sound card for -
+        and nothing at all once the user has moved on.
+        """
+        async with aclosing(pieces):
+            first = await anext(pieces, None)
+            if first is None or self._withdrawn():
+                return
+
+            self._enter(State.SPEAKING)
+            await self._play(_chain(first, pieces), on_first_sound=saying.first_sound)
+
+    async def _play(
+        self, pieces: AsyncIterator[str], *, on_first_sound: Callable[[], None] | None = None
+    ) -> None:
+        """Says `pieces` through the sound card, with the microphone deaf meanwhile.
 
         Deaf for exactly as long as there is something for it to mishear, and
         in a `finally` because an answer that failed halfway through must not
-        leave the assistant unable to hear at all.
+        leave the assistant unable to hear at all. The question a tool asks
+        is played from inside the answer's own stream (2.8): the microphone
+        is deafened once, by the outermost of the two, and listens again
+        when that one is done.
         """
-        self._capture.mute()
+        if self._playing == 0:
+            self._capture.mute()
+        self._playing += 1
         try:
-            await self._speaker.play(
-                self._tts.stream(_one(said), voice=self._voice),
-                sample_rate=self._tts.sample_rate,
-            )
+            buffers = self._tts.stream(pieces, voice=self._voice)
+            if on_first_sound is not None:
+                buffers = _marking_first(buffers, on_first_sound)
+            await self._speaker.play(buffers, sample_rate=self._tts.sample_rate)
         except PlaybackError as failure:
             # The answer is on the screen and in the turn; only the sound of
             # it was lost. A headset switched off between two questions is
             # not a bug, so it is a line in the log rather than the program.
             logger.warning("playback failed: {problem}", problem=failure)
         finally:
-            self._capture.unmute()
+            self._playing -= 1
+            if self._playing == 0:
+                self._capture.unmute()
 
     # ----------------------------------------------------------------------
     # Where it is
@@ -662,6 +812,7 @@ class Assistant:
         # capture keeps it as the answer (`Capture.listen_for`).
         was_talking = self._state in (State.SPEAKING, State.CONFIRMING)
         self._enter(State.LISTENING)
+        self._pressed.set()
         if was_talking:
             self._speaker.stop()
 
@@ -778,10 +929,100 @@ def _spaced(text: str) -> str:
 
 
 async def _one(said: str) -> AsyncIterator[str]:
-    """The whole answer as a stream of one.
-
-    Phase 1 waits for the model to finish before it speaks (section 4 budgets
-    for it), so there is nothing to stream yet. `tts.base.sentences` regroups
-    whatever arrives, so phase 2.8 changes this line and nothing else.
-    """
+    """A sentence of the assistant's own - a question, the time, an
+    apology - as a stream of one. The model's answer is no longer one of
+    these (2.8): it comes through `_as_they_come`, a piece at a time."""
     yield said
+
+
+async def _chain(first: str, rest: AsyncIterator[str]) -> AsyncIterator[str]:
+    """`first`, then `rest`: the piece already taken to see whether there
+    was one, put back in front of the others."""
+    yield first
+    async for piece in rest:
+        yield piece
+
+
+async def _marking_first(
+    buffers: AsyncIterator[bytes], mark: Callable[[], None]
+) -> AsyncIterator[bytes]:
+    """`buffers`, with `mark` called as the first of them goes by: the
+    moment the first sound is made, give or take the sound card."""
+    marked = False
+    async for buffer in buffers:
+        if buffer and not marked:
+            mark()
+            marked = True
+        yield buffer
+
+
+async def _as_they_come(
+    stream: AsyncGenerator[str],
+    *,
+    tool_round: asyncio.Event,
+    pressed: asyncio.Event,
+    filler: Callable[[], str],
+    delay: float,
+    asking: Callable[[], bool],
+) -> AsyncGenerator[str]:
+    """The model's words as they come, with the filler among them, ending
+    the moment the key goes down (2.8).
+
+    Three things can happen while the next piece is waited for. It arrives,
+    and is handed on. A tool round begins - then the piece has `delay` more
+    to arrive, and when it has not the filler is said in its place, once per
+    turn and never while a question is being asked (`asking`), because the
+    user is answering it. Or the key goes down - then the stream is left
+    where it stands, the request with it (`Agent.stream_reply`), and nothing
+    more is said.
+
+    The stream is read in a task of its own, so that the wait can be for
+    whichever of the three comes first; the task is always waited out before
+    the stream is closed, because an async generator cannot be closed while
+    another task is still inside it.
+    """
+    began = asyncio.ensure_future(tool_round.wait())
+    withdrawn = asyncio.ensure_future(pressed.wait())
+    filler_due = True
+    said_any = False
+    try:
+        async with aclosing(stream):
+            while True:
+                upcoming = asyncio.create_task(_pull(stream))
+                try:
+                    watched: set[asyncio.Future[Any]] = {upcoming, withdrawn}
+                    if filler_due:
+                        watched.add(began)
+                    done, _ = await asyncio.wait(watched, return_when=asyncio.FIRST_COMPLETED)
+                    if upcoming not in done and withdrawn not in done:
+                        # The round began. `delay` more for a word to come.
+                        done, _ = await asyncio.wait({upcoming, withdrawn}, timeout=delay)
+                        filler_due = False
+                        if upcoming not in done and withdrawn not in done and not asking():
+                            yield f" {filler()} " if said_any else f"{filler()} "
+                            said_any = True
+                    if withdrawn.done() and not upcoming.done():
+                        await _gone(upcoming)
+                        return
+                    piece = await upcoming
+                except BaseException:
+                    await _gone(upcoming)
+                    raise
+                if piece is None or withdrawn.done():
+                    return
+                said_any = True
+                yield piece
+    finally:
+        began.cancel()
+        withdrawn.cancel()
+
+
+async def _pull(stream: AsyncGenerator[str]) -> str | None:
+    return await anext(stream, None)
+
+
+async def _gone(task: asyncio.Future[Any]) -> None:
+    """Cancels `task` and waits until it is gone, whatever it ends with."""
+    task.cancel()
+    with contextlib.suppress(asyncio.CancelledError, Exception):
+        await task

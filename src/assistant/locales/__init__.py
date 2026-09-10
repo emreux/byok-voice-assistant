@@ -80,6 +80,12 @@ class Locale:
     yes_words: tuple[str, ...] = ()
     no_words: tuple[str, ...] = ()
 
+    # What is said while a tool takes its time, from `[speech] filler`
+    # (design.md section 4, 2.8): said in turn, one per turn. They fall
+    # back like the yes and no words, to the English beside the code that
+    # says them (`app.py`).
+    fillers: tuple[str, ...] = ()
+
     # The short commands answered without the model, from `[intents]`
     # (design.md section 4): the English name of the intent, to the phrases
     # that mean it in this language. They fall back like the yes and no
@@ -129,6 +135,7 @@ def load(code: str | None = None, *, directory: Path | None = None) -> Locale:
         stt_vocabulary=_text(_table(pack, "stt"), "vocabulary_hint").strip(),
         yes_words=_words(_table(pack, "speech"), "yes_words"),
         no_words=_words(_table(pack, "speech"), "no_words"),
+        fillers=_words(_table(pack, "speech"), "filler"),
         intents=_word_lists(_table(pack, "intents")),
         probe_question=_text(_table(pack, "probe"), "question").strip(),
     )

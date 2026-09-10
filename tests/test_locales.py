@@ -339,8 +339,26 @@ def test_turkish_knows_its_yes_and_no() -> None:
     assert not set(pack.yes_words) & set(pack.no_words)
 
 
-def test_the_template_offers_the_two_lists_a_translator_has_to_fill() -> None:
-    assert set(read(PACKAGED / "_template.toml")["speech"]) == {"yes_words", "no_words"}
+def test_the_template_offers_the_three_lists_a_translator_has_to_fill() -> None:
+    assert set(read(PACKAGED / "_template.toml")["speech"]) == {"yes_words", "no_words", "filler"}
+
+
+def test_turkish_has_something_to_say_while_a_tool_takes_its_time() -> None:
+    """The filler of section 4 (2.8): a pack without one is heard saying
+    the English one in the middle of a Turkish answer."""
+    assert load("tr").fillers
+
+
+def test_the_fillers_come_from_the_pack_in_the_order_they_are_listed(tmp_path: Path) -> None:
+    write(tmp_path, "de", '[speech]\nfiller = [" Moment... ", "Ich schaue nach..."]\n')
+
+    assert load("de", directory=tmp_path).fillers == ("Moment...", "Ich schaue nach...")
+
+
+def test_a_pack_without_fillers_leaves_them_to_the_code(tmp_path: Path) -> None:
+    write(tmp_path, "de", '[speech]\nyes_words = ["ja"]\n')
+
+    assert load("de", directory=tmp_path).fillers == ()
 
 
 def test_the_yes_and_no_words_come_from_the_pack(tmp_path: Path) -> None:
