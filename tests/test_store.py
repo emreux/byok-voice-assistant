@@ -11,7 +11,8 @@ The second migration (2.4) is the first real one: a database at version 1
 with rows in it comes up to version 2 with the rows intact and a column
 beside them. With it come the fingerprint of a call's arguments, the query
 that answers "did this run a moment ago", and the `usage_log` the bill is
-kept in.
+kept in. The third (2.6) is the `settings` table: one value per key, where
+the probe keeps what it found out about a model.
 
 Every test opens its own database, in memory or under `tmp_path`; the one
 under `%LOCALAPPDATA%` is never touched.
@@ -35,6 +36,7 @@ from assistant.store.repos import (
     SUMMARY_CHARS,
     AuditRepo,
     EarlierCall,
+    SettingsRepo,
     UsageRepo,
     args_hash,
 )
@@ -277,6 +279,76 @@ def test_a_database_from_before_the_second_migration_comes_up_with_its_rows() ->
         assert rows(connection)[1]["args_hash"] == args_hash(CALL.arguments)
     finally:
         connection.close()
+
+
+# --------------------------------------------------------------------------
+# The third migration (2.6): settings
+# --------------------------------------------------------------------------
+
+
+def test_the_third_migration_adds_the_settings_table(database: sqlite3.Connection) -> None:
+    columns = {row["name"] for row in database.execute("PRAGMA table_info(settings)")}
+
+    assert "settings" in tables(database)
+    assert columns == {"key", "value"}
+
+
+def test_a_database_from_before_the_third_migration_comes_up_with_its_rows() -> None:
+    """The owner's database was at version 2 with turns in it on 2026-09-10;
+    they are all still there afterwards, and the new table is empty."""
+    connection = sqlite3.connect(":memory:")
+    connection.row_factory = sqlite3.Row
+    try:
+        for number, script in enumerate(MIGRATIONS[:2], start=1):
+            connection.executescript(f"BEGIN;\n{script}\nPRAGMA user_version = {number};\nCOMMIT;")
+        UsageRepo(connection).insert(
+            turn_id="t1", provider="gemini", model="x", usage=Usage(1, 2), cost_usd=None
+        )
+
+        assert migrate(connection) == len(MIGRATIONS)
+
+        assert len(UsageRepo(connection).by_model_since(0)) == 1
+        assert SettingsRepo(connection).get("probe:gemini:x") is None
+    finally:
+        connection.close()
+
+
+def test_nothing_written_reads_as_none(database: sqlite3.Connection) -> None:
+    assert SettingsRepo(database).get("anything") is None
+
+
+def test_a_value_written_is_read_back_under_its_key(database: sqlite3.Connection) -> None:
+    settings = SettingsRepo(database)
+
+    settings.set("probe:gemini:x", '{"ok": true}')
+
+    assert settings.get("probe:gemini:x") == '{"ok": true}'
+    assert settings.get("probe:gemini:y") is None
+
+
+def test_writing_a_key_again_replaces_the_value(database: sqlite3.Connection) -> None:
+    """One value per key: a verdict refreshed a week later is the verdict,
+    not a second row beside the first."""
+    settings = SettingsRepo(database)
+
+    settings.set("k", "old")
+    settings.set("k", "new")
+
+    assert settings.get("k") == "new"
+    assert database.execute("SELECT COUNT(*) FROM settings").fetchone()[0] == 1
+
+
+def test_a_value_survives_the_connection(tmp_path: Path) -> None:
+    path = tmp_path / "assistant.db"
+    first = open_database(path)
+    SettingsRepo(first).set("k", "ş")
+    first.close()
+
+    second = open_database(path)
+    try:
+        assert SettingsRepo(second).get("k") == "ş"
+    finally:
+        second.close()
 
 
 def test_the_fingerprint_does_not_depend_on_the_order_of_the_arguments() -> None:

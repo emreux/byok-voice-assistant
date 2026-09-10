@@ -3,9 +3,8 @@
 A repository is the only code that knows a table's columns; everything else
 calls a method named after what happened. `AuditRepo` is the `tool_audit`
 table of 2.1d; `UsageRepo` is the `usage_log` of 2.4, where every turn's
-tokens go with their price. `SettingsRepo` arrives with the probe of 2.6 and
-is not sketched here, because a class nobody calls is a class nobody can
-tell is right.
+tokens go with their price; `SettingsRepo` is the `settings` of 2.6, one
+value per key, where the probe keeps its verdict on a model.
 
 **A call is written down before it runs.** `start` opens the row with
 `status = 'started'` and no `finished_at`; `finish` closes it as `ok` or
@@ -49,6 +48,7 @@ __all__ = [
     "EarlierCall",
     "ModelUsage",
     "Outcome",
+    "SettingsRepo",
     "UsageRepo",
     "args_hash",
 ]
@@ -261,6 +261,35 @@ class UsageRepo:
             )
             for row in rows
         ]
+
+
+class SettingsRepo:
+    """The `settings` table: one value per key, kept between runs (2.6).
+
+    What the program found out for itself and does not want to find out
+    again on every start - not what the user chose, which is `config.toml`.
+    The value is text and means whatever the writer meant by it; the probe
+    writes JSON, and reads it back itself (`llm/probe.py`).
+    """
+
+    def __init__(self, connection: sqlite3.Connection) -> None:
+        self._connection = connection
+
+    def get(self, key: str) -> str | None:
+        """The value under `key`, or `None` if nothing was ever written there."""
+        row = self._connection.execute(
+            "SELECT value FROM settings WHERE key = ?", (key,)
+        ).fetchone()
+        return None if row is None else str(row["value"])
+
+    def set(self, key: str, value: str) -> None:
+        """Writes `value` under `key`, over whatever was there."""
+        with self._connection:
+            self._connection.execute(
+                "INSERT INTO settings (key, value) VALUES (?, ?)"
+                " ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                (key, value),
+            )
 
 
 def args_hash(arguments: Mapping[str, Any]) -> str:

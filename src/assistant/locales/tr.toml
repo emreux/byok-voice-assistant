@@ -27,6 +27,13 @@ get_time = ["saat kaç", "saat kaçta"]
 stop = ["dur", "sus", "kes"]
 cancel = ["iptal", "vazgeç", "boş ver"]
 
+[probe]
+# The one question the setup wizard puts to a model to see whether it calls
+# a tool (design.md 3.2): it has to be something the model cannot answer
+# from memory, so that the only good answer is to call get_current_time.
+# In Turkish, so that the same request shows the model understands it.
+question = "İstanbul'da saat kaç?"
+
 [tts.voice]
 # Tolga is the voice Windows itself ships for Turkish. It lives in the
 # Speech_OneCore registry hive, which `tts/sapi.py` reads on purpose.

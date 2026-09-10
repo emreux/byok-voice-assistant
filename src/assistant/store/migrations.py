@@ -12,8 +12,10 @@ Phase 2.1d opened the list with `tool_audit` alone. Phase 2.4 is the second
 entry, and the first real use of the mechanism: the owner's database was at
 version 1 with rows in it, and came up to version 2 with those rows intact
 and a new column beside them. The columns other steps need come the same way
-when those steps arrive - `source` for MCP in phase 5 - and `settings` with
-the probe of 2.6.
+when those steps arrive - `source` for MCP in phase 5. The third entry is
+`settings` (2.6): not the user's settings, which are `config.toml`, but what
+the program itself found out and wants to keep between runs - the probe's
+verdict on a model, so that it is not asked again on every start.
 """
 
 from __future__ import annotations
@@ -65,6 +67,18 @@ MIGRATIONS: tuple[str, ...] = (
         turn_id       TEXT    NOT NULL
     );
     CREATE INDEX usage_log_ts ON usage_log(ts);
+    """,
+    # 3 - settings: what the program found out for itself (section 3.2, 2.6).
+    # One row per key, the value one line of JSON; the probe writes
+    # `probe:<provider>:<model>` with the verdict and the time it was
+    # reached, and reads it back for a week. Nothing here is written by the
+    # user - their settings are `config.toml` (section 3.3), where a text
+    # editor can reach them.
+    """
+    CREATE TABLE settings (
+        key   TEXT PRIMARY KEY,
+        value TEXT NOT NULL
+    );
     """,
 )
 

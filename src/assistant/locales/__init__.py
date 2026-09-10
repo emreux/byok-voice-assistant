@@ -88,6 +88,13 @@ class Locale:
     # (`agent/intents.py`), and `en.toml` carries none for that reason.
     intents: Mapping[str, tuple[str, ...]] = field(default_factory=dict)
 
+    # The question the setup wizard asks a model to see whether it calls a
+    # tool, from `[probe]` (design.md section 3.2, 2.6). In the pack's own
+    # language, so that one request also shows the model understands the
+    # user; it falls back like a sentence, to the English beside the code
+    # that asks it (`llm/probe.py`), and `en.toml` carries none.
+    probe_question: str = ""
+
     def voice(self, engine: str) -> str | None:
         """The voice this locale prefers for `engine`, if it names one."""
         return self.voices.get(engine) or None
@@ -123,6 +130,7 @@ def load(code: str | None = None, *, directory: Path | None = None) -> Locale:
         yes_words=_words(_table(pack, "speech"), "yes_words"),
         no_words=_words(_table(pack, "speech"), "no_words"),
         intents=_word_lists(_table(pack, "intents")),
+        probe_question=_text(_table(pack, "probe"), "question").strip(),
     )
 
 

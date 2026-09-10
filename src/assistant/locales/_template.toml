@@ -53,6 +53,15 @@ get_time = ["what time is it"]
 stop = ["stop"]
 cancel = ["cancel"]
 
+[probe]
+# The one question the setup wizard puts to a model to find out whether it
+# calls a tool: a model that answers this by calling the clock tool passes,
+# one that answers from memory does not. Keep it a question about the time
+# in some city, in your language - the same request then also shows the
+# model understands your language. Leave the table out and the English
+# question is used.
+question = "What time is it in Istanbul?"
+
 [tts.voice]
 # The preferred voice per speech engine, matched against the voices actually
 # installed on the machine. It is a preference, not an identifier: when it is

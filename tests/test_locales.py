@@ -25,6 +25,7 @@ from assistant import __main__ as cli
 from assistant import app, locales, setup_wizard
 from assistant.agent import policy
 from assistant.agent.intents import INTENTS
+from assistant.llm.probe import QUESTION
 from assistant.locales import FALLBACK_CODE, available, iso_code, load, system_code
 from assistant.ui import status
 
@@ -104,6 +105,7 @@ def test_english_is_not_written_down_twice() -> None:
     assert "ui" not in read(PACKAGED / "en.toml")
     assert "speech" not in read(PACKAGED / "en.toml")
     assert "intents" not in read(PACKAGED / "en.toml")
+    assert "probe" not in read(PACKAGED / "en.toml")
 
 
 def test_the_template_offers_every_sentence_a_translator_has_to_write() -> None:
@@ -417,3 +419,42 @@ def test_commands_of_the_wrong_shape_are_read_as_far_as_they_make_sense(tmp_path
     write(tmp_path, "de", '[intents]\nget_time = "wie spät"\nstop = ["halt", 3, ""]\ncancel = []\n')
 
     assert load("de", directory=tmp_path).intents == {"stop": ("halt",)}
+
+
+# --------------------------------------------------------------------------
+# The probe question (2.6)
+# --------------------------------------------------------------------------
+
+
+def test_turkish_asks_the_probe_question_in_turkish() -> None:
+    """Section 3.2 wanted one request to check tool calling and the user's
+    language together; the pack is what keeps that true without a Turkish
+    sentence in the code."""
+    assert load("tr").probe_question
+    assert load("tr").probe_question != QUESTION
+
+
+def test_the_template_offers_the_probe_question_a_translator_has_to_write() -> None:
+    assert set(read(PACKAGED / "_template.toml")["probe"]) == {"question"}
+
+
+def test_the_probe_question_comes_from_the_pack(tmp_path: Path) -> None:
+    write(tmp_path, "de", '[probe]\nquestion = " Wie spät ist es in Istanbul? "\n')
+
+    assert load("de", directory=tmp_path).probe_question == "Wie spät ist es in Istanbul?"
+
+
+def test_a_pack_without_one_leaves_the_question_to_the_code(tmp_path: Path) -> None:
+    """Like a sentence: English lends nothing, the constant beside the code
+    that asks (`llm/probe.py`) answers."""
+    write(tmp_path, "en", '[probe]\nquestion = "What time is it?"\n')
+
+    assert load("de", directory=tmp_path).probe_question == ""
+
+
+def test_a_question_of_the_wrong_shape_is_no_question(tmp_path: Path) -> None:
+    write(tmp_path, "de", '[probe]\nquestion = ["a", "b"]\n')
+    write(tmp_path, "fr", 'probe = "not a table"\n')
+
+    assert load("de", directory=tmp_path).probe_question == ""
+    assert load("fr", directory=tmp_path).probe_question == ""
