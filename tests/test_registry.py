@@ -16,9 +16,11 @@ import pytest
 from assistant.config import store_api_key
 from assistant.llm.base import LLMProvider
 from assistant.llm.gemini_adapter import GeminiAdapter
+from assistant.llm.openai_compat_adapter import OpenAICompatAdapter
 from assistant.llm.registry import (
     ADAPTERS,
     MissingAPIKeyError,
+    MissingBaseURLError,
     ProviderEntry,
     UnknownProviderError,
     UnsupportedAdapterError,
@@ -65,11 +67,44 @@ def test_the_shipped_catalogue_offers_gemini() -> None:
     assert entry.key_url is not None
 
 
+def test_the_shipped_catalogue_offers_the_openai_compatible_six() -> None:
+    """Section 3.2's list, each under the address the adapter speaks to."""
+    entries = load_catalog()
+
+    assert {p for p, e in entries.items() if e.adapter == "openai_compat"} == {
+        "openai",
+        "openrouter",
+        "groq",
+        "deepseek",
+        "ollama",
+        "custom",
+    }
+    assert entries["groq"].base_url == "https://api.groq.com/openai/v1"
+    assert entries["ollama"].requires_key is False
+    assert entries["custom"].base_url is None
+
+
+def test_every_paid_provider_says_where_its_key_comes_from() -> None:
+    """The wizard shows the address; an entry without one leaves the user
+    to search for it."""
+    for provider_id, entry in load_catalog().items():
+        if entry.requires_key and provider_id != "custom":
+            assert entry.key_url, f"{provider_id} has no key_url"
+
+
 def test_every_provider_offered_can_actually_be_built() -> None:
     """A catalogue entry naming an adapter from a later phase is a dead end
     the user only discovers after typing their key in."""
     for provider_id, entry in load_catalog().items():
         assert entry.adapter in ADAPTERS, f"{provider_id} names a missing adapter"
+
+
+def test_every_shipped_entry_builds_with_a_key_and_an_address(vault: MemoryKeyring) -> None:
+    """Built for real, adapter and all - only the network is never touched."""
+    for provider_id in load_catalog():
+        provider = create_provider(provider_id, api_key="k", base_url="http://x.test/v1")
+
+        assert isinstance(provider, LLMProvider), provider_id
 
 
 def test_the_catalogue_can_be_read_from_a_given_file(tmp_path: Path) -> None:
@@ -153,8 +188,49 @@ def test_an_unknown_provider_names_the_ones_that_exist() -> None:
 
 
 def test_a_provider_whose_adapter_is_not_written_yet_says_so() -> None:
-    """Phase 2 adds `openai_compat`; until then the entry must fail clearly."""
-    catalog = {"groq": ProviderEntry(id="groq", adapter="openai_compat", display_name="Groq")}
+    """Phase 4.5 adds `anthropic`; until then the entry must fail clearly."""
+    catalog = {"claude": ProviderEntry(id="claude", adapter="anthropic", display_name="Claude")}
 
-    with pytest.raises(UnsupportedAdapterError, match="openai_compat"):
-        create_provider("groq", api_key="test-key", catalog=catalog)
+    with pytest.raises(UnsupportedAdapterError, match="anthropic"):
+        create_provider("claude", api_key="test-key", catalog=catalog)
+
+
+# --------------------------------------------------------------------------
+# The OpenAI-compatible entries (2.7)
+# --------------------------------------------------------------------------
+
+
+def test_an_openai_compatible_entry_becomes_the_one_adapter_under_its_address() -> None:
+    provider = create_provider("groq", api_key="gsk-test")
+
+    assert isinstance(provider, OpenAICompatAdapter)
+    assert provider.id == "openai_compat"
+
+
+def test_a_local_server_is_built_without_a_key(vault: MemoryKeyring) -> None:
+    """Ollama: `requires_key = false` in the catalogue, nothing in the
+    Credential Manager, and it still builds."""
+    provider = create_provider("ollama")
+
+    assert isinstance(provider, OpenAICompatAdapter)
+
+
+def test_the_custom_entry_needs_an_address_and_says_so_without_one(vault: MemoryKeyring) -> None:
+    """`custom` has no address of its own: the wizard asks for one and
+    `config.toml` keeps it. Before that it is refused in a sentence that
+    names the fix, like a missing key is."""
+    with pytest.raises(MissingBaseURLError, match="assistant setup"):
+        create_provider("custom", api_key="k")
+
+
+def test_an_address_given_by_the_caller_outranks_the_catalogue_s() -> None:
+    """How `custom` gets its address - and, for any entry, how a test or
+    a proxy points it somewhere else."""
+    provider = create_provider("custom", api_key="k", base_url="http://localhost:1234/v1")
+
+    assert isinstance(provider, OpenAICompatAdapter)
+
+
+def test_an_empty_address_from_the_caller_is_no_address() -> None:
+    with pytest.raises(MissingBaseURLError):
+        create_provider("custom", api_key="k", base_url="")

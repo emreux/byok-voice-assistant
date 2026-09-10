@@ -4,11 +4,12 @@
 # change: `adapter` names one of the adapters in `llm/`, and everything else is
 # data the setup command shows or the adapter needs.
 #
-# Phase 1 ships one adapter, so this lists one provider. Phase 2.7 adds
-# `openai_compat` and with it OpenAI, OpenRouter, Groq, DeepSeek, Ollama and
-# every other OpenAI-compatible endpoint; phase 4.5 adds Anthropic. An entry
-# whose `adapter` does not exist yet would be offered to the user and then fail
-# after they typed their key in, so entries arrive with their adapter.
+# Phase 1 shipped one adapter and one provider. Phase 2.7 added
+# `openai_compat`, and with it every server that speaks OpenAI's chat API
+# under its own address: the six entries below, and any other through
+# `custom`. Phase 4.5 adds Anthropic. An entry whose `adapter` does not
+# exist yet would be offered to the user and then fail after they typed
+# their key in, so entries arrive with their adapter.
 #
 # Fields:
 #   adapter          which adapter class builds it            (required)
@@ -23,3 +24,41 @@
 adapter      = "gemini"
 display_name = "Google Gemini"
 key_url      = "https://aistudio.google.com/apikey"
+
+[openai]
+adapter      = "openai_compat"
+display_name = "OpenAI"
+base_url     = "https://api.openai.com/v1"
+key_url      = "https://platform.openai.com/api-keys"
+
+[openrouter]
+adapter      = "openai_compat"
+display_name = "OpenRouter"
+base_url     = "https://openrouter.ai/api/v1"
+key_url      = "https://openrouter.ai/keys"
+
+[groq]
+adapter      = "openai_compat"
+display_name = "Groq"
+base_url     = "https://api.groq.com/openai/v1"
+key_url      = "https://console.groq.com/keys"
+
+[deepseek]
+adapter      = "openai_compat"
+display_name = "DeepSeek"
+base_url     = "https://api.deepseek.com/v1"
+key_url      = "https://platform.deepseek.com/api_keys"
+
+# A local server: no key, and nothing to ask the user for.
+[ollama]
+adapter      = "openai_compat"
+display_name = "Ollama (local)"
+base_url     = "http://localhost:11434/v1"
+requires_key = false
+
+# Any other OpenAI-compatible server - LM Studio, vLLM, a proxy of your
+# own. No `base_url` here: the setup command asks for it and keeps it in
+# `config.toml`.
+[custom]
+adapter      = "openai_compat"
+display_name = "Other OpenAI-compatible server"

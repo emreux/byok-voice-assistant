@@ -9,23 +9,30 @@ never stored, gets a sentence telling them what to do instead of a traceback.
 The key is fetched from the Windows Credential Manager at the last moment and
 handed straight to the adapter. It is never stored on the entry, never logged,
 and never written back to disk.
+
+Since 2.7 most of the catalogue is one adapter under different addresses:
+`openai_compat` with the entry's `base_url`. The one entry with no address
+of its own, `custom`, gets it from the caller - the wizard asked the user
+for it and `config.toml` kept it - and is refused, in a sentence, without.
 """
 
 from __future__ import annotations
 
 import tomllib
 from collections.abc import Callable, Mapping
-from dataclasses import dataclass, fields
+from dataclasses import dataclass, fields, replace
 from importlib import resources
 from pathlib import Path
 
 from assistant.config import load_api_key
 from assistant.llm.base import LLMProvider
 from assistant.llm.gemini_adapter import GeminiAdapter
+from assistant.llm.openai_compat_adapter import OpenAICompatAdapter
 
 __all__ = [
     "ADAPTERS",
     "MissingAPIKeyError",
+    "MissingBaseURLError",
     "ProviderEntry",
     "RegistryError",
     "UnknownProviderError",
@@ -53,6 +60,10 @@ class MissingAPIKeyError(RegistryError):
     """The provider needs a key and the Credential Manager has none."""
 
 
+class MissingBaseURLError(RegistryError):
+    """The entry has no address and none was given: `custom` before setup."""
+
+
 @dataclass(frozen=True, slots=True)
 class ProviderEntry:
     """One row of the catalogue, as the setup command and the adapters see it."""
@@ -77,8 +88,17 @@ def _build_gemini(entry: ProviderEntry, api_key: str) -> LLMProvider:
     return GeminiAdapter(api_key=api_key)
 
 
+def _build_openai_compat(entry: ProviderEntry, api_key: str) -> LLMProvider:
+    if not entry.base_url:
+        raise MissingBaseURLError(
+            f"no server address stored for {entry.id!r} - run 'assistant setup' to enter one"
+        )
+    return OpenAICompatAdapter(api_key=api_key, base_url=entry.base_url)
+
+
 ADAPTERS: dict[str, AdapterBuilder] = {
     "gemini": _build_gemini,
+    "openai_compat": _build_openai_compat,
 }
 
 
@@ -103,12 +123,15 @@ def create_provider(
     *,
     api_key: str | None = None,
     catalog: Mapping[str, ProviderEntry] | None = None,
+    base_url: str | None = None,
 ) -> LLMProvider:
     """Builds the adapter for `provider_id`.
 
     `api_key` is for the setup command, which has to validate a key before it
     is stored and so cannot read it back from the Credential Manager yet.
-    Everywhere else the key comes from there.
+    Everywhere else the key comes from there. `base_url` is the address the
+    user gave for an entry that has none of its own (`custom`); given, it
+    outranks the catalogue's.
     """
     entries = load_catalog() if catalog is None else catalog
 
@@ -116,6 +139,8 @@ def create_provider(
     if entry is None:
         offered = ", ".join(sorted(entries)) or "nothing"
         raise UnknownProviderError(f"no provider {provider_id!r}; providers.toml offers: {offered}")
+    if base_url:
+        entry = replace(entry, base_url=base_url)
 
     builder = ADAPTERS.get(entry.adapter)
     if builder is None:

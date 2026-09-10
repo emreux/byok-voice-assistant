@@ -54,12 +54,13 @@ from assistant.llm.base import (
 )
 from tests.contract import COMPLAINT, Adapter, Calls, Nothing, Refuses, Says, Spends, Starts, Stops
 from tests.test_gemini_adapter import GEMINI
+from tests.test_openai_adapter import OPENAI_COMPAT
 
 PROVIDER_SDKS = frozenset({"google", "openai", "anthropic", "litellm"})
 
 # One entry per adapter this build can construct. Phase 2.7 appends the
 # OpenAI-compatible one and phase 4.5 the Anthropic one; the tests do not move.
-ADAPTERS = [GEMINI]
+ADAPTERS = [GEMINI, OPENAI_COMPAT]
 
 
 @pytest.fixture(params=ADAPTERS, ids=lambda adapter: adapter.name)
