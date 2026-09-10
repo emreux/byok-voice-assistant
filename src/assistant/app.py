@@ -203,9 +203,13 @@ FILLERS = ("One moment, let me check...",)
 # How long a tool round may stay silent before the filler is said. A native
 # tool returns in 5-50 ms and the model's next first token takes 400-1500
 # ms after it (section 4), so this is the model's silence that is covered,
-# not the tool's; below it the answer is on its way and a "one moment"
-# would only push it back. The right number is measured, not argued.
-FILLER_DELAY_SECONDS = 0.3
+# not the tool's. Measured 2026-09-10 with Gemini 3.5 Flash-Lite: the whole
+# second request took 640 ms, and a filler said at 300 ms - 2.6 s of audio -
+# held the answer back until it had been read out, so the user waited 3.5 s
+# for a time that was ready at 1.3 s. Above a second the round is slow for
+# some other reason - a page being fetched, an MCP server - and that is the
+# silence worth saying something about.
+FILLER_DELAY_SECONDS = 1.0
 
 # The last link of the chain of section 3.12: what is said when no locale pack
 # offers a translation. Keys are unique across the whole project - the pack has

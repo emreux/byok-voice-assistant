@@ -92,3 +92,8 @@ enable_error_code = ["redundant-expr", "truthy-bool", "ignore-without-code"]
 testpaths = ["tests"]
 asyncio_mode = "auto"
 addopts = "-q --strict-markers --strict-config"
+# `test_latency.py` (design.md section 4, 2.8): our own code's share of a turn,
+# under a loose local bound now that there is no CI to compare `main` against.
+markers = [
+    "latency: our own code's share of a turn, under a loose local bound",
+]
