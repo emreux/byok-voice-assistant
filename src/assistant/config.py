@@ -117,6 +117,11 @@ class LLMSettings(BaseModel):
 
     primary: str = ""
 
+    # The address of the server, for the one catalogue entry that has none
+    # of its own (`custom`, 2.7): the wizard asked for it and keeps it here.
+    # Empty for every other provider, whose address is in `providers.toml`.
+    base_url: str = ""
+
     @field_validator("primary")
     @classmethod
     def _must_name_a_provider(cls, value: str) -> str:

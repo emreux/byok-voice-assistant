@@ -26,6 +26,7 @@ from assistant.llm.registry import (
     UnsupportedAdapterError,
     create_provider,
     load_catalog,
+    needs_base_url,
 )
 from tests.conftest import MemoryKeyring
 
@@ -234,3 +235,14 @@ def test_an_address_given_by_the_caller_outranks_the_catalogue_s() -> None:
 def test_an_empty_address_from_the_caller_is_no_address() -> None:
     with pytest.raises(MissingBaseURLError):
         create_provider("custom", api_key="k", base_url="")
+
+
+def test_only_an_addressed_entry_without_an_address_needs_asking() -> None:
+    """What the wizard asks: `custom` is asked where it is; Groq has its
+    address in the file; Gemini speaks to one vendor and has no address to
+    ask for."""
+    entries = load_catalog()
+
+    assert needs_base_url(entries["custom"]) is True
+    assert needs_base_url(entries["groq"]) is False
+    assert needs_base_url(entries["gemini"]) is False

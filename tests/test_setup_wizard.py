@@ -69,15 +69,22 @@ class FakeProvider:
     ]
     tool_callers: ClassVar[set[str]] = {"fast", "smart"}
     refusing: ClassVar[set[str]] = set()
+    # A server that is not running: every request fails to reach it.
+    down: ClassVar[bool] = False
 
-    def __init__(self, api_key: str) -> None:
+    def __init__(self, api_key: str, *, keyless: bool = False, base_url: str | None = None) -> None:
         self.api_key = api_key
+        # Built for an entry that needs no key: an empty key is then right.
+        self.keyless = keyless
+        self.base_url = base_url
         # What the probe asked, as (model, question, tool names).
         self.probed: list[tuple[str, str, list[str]]] = []
 
     async def validate_credentials(self) -> bool:
-        if self.api_key == OFFLINE_KEY:
+        if self.api_key == OFFLINE_KEY or self.down:
             raise ProviderError("fake could not be reached (ConnectError)")
+        if self.keyless:
+            return self.api_key == ""
         return self.api_key == GOOD_KEY
 
     async def list_models(self) -> list[ModelInfo]:
@@ -133,6 +140,9 @@ class ScriptedPrompter:
     async def secret(self, key: str) -> str | None:
         return self._answer(key)
 
+    async def ask(self, key: str) -> str | None:
+        return self._answer(key)
+
     def _answer(self, key: str) -> str | None:
         assert key in TEXT, f"the wizard asked {key!r}, which has no text"
         self.asked.append(key)
@@ -160,7 +170,7 @@ def fake_adapter(monkeypatch: pytest.MonkeyPatch) -> list[FakeProvider]:
     built: list[FakeProvider] = []
 
     def build(entry: ProviderEntry, api_key: str) -> FakeProvider:
-        provider = FakeProvider(api_key)
+        provider = FakeProvider(api_key, keyless=not entry.requires_key, base_url=entry.base_url)
         built.append(provider)
         return provider
 
@@ -275,6 +285,125 @@ async def test_only_providers_this_build_can_construct_are_offered(
 
     assert prompter.offered["provider"] == ["gemini", "openrouter"]
     assert load_settings().llm.provider == "openrouter"
+
+
+# --------------------------------------------------------------------------
+# A provider that needs no key, and one that needs an address (2.7)
+# --------------------------------------------------------------------------
+
+
+def local_catalog() -> dict[str, ProviderEntry]:
+    """Ollama, as the catalogue has it: no key, an address of its own."""
+    return {
+        "ollama": ProviderEntry(
+            id="ollama",
+            adapter="fake",
+            display_name="Ollama",
+            base_url="http://localhost:11434/v1",
+            requires_key=False,
+        )
+    }
+
+
+def custom_catalog() -> dict[str, ProviderEntry]:
+    """`custom`, as the catalogue has it: a key, and no address."""
+    return {"custom": ProviderEntry(id="custom", adapter="openai_compat", display_name="Other")}
+
+
+@pytest.fixture
+def addressed(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Lets the fake adapter stand in for the one that needs an address, so
+    the wizard asks the question the registry says it must."""
+    monkeypatch.setitem(ADAPTERS, "openai_compat", ADAPTERS["fake"])
+
+
+async def test_a_provider_that_needs_no_key_is_not_asked_for_one(
+    config_home: Path, vault: MemoryKeyring
+) -> None:
+    """A local Ollama has nothing to authenticate with. The server is asked
+    whether it answers, and nothing goes to the Credential Manager."""
+    prompter = ScriptedPrompter(locale="tr", model="fast")
+
+    exit_code = await run_setup(prompter, catalog=local_catalog())
+
+    said = [key for key, _ in prompter.said]
+    assert exit_code == 0
+    assert "api_key" not in prompter.asked
+    assert "api_key_keep" not in prompter.asked
+    assert "checking_server" in said
+    assert "key_url" not in said
+    assert vault.vault == {}
+    assert load_settings().llm.primary == "ollama:fast"
+
+
+async def test_a_local_server_that_does_not_answer_ends_the_wizard(
+    config_home: Path, vault: MemoryKeyring, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """There is no key to ask for again: the user starts the server and
+    comes back. Nothing is written."""
+    monkeypatch.setattr(FakeProvider, "down", True)
+    prompter = ScriptedPrompter(locale="tr")
+
+    exit_code = await run_setup(prompter, catalog=local_catalog())
+
+    said = [key for key, _ in prompter.said]
+    assert exit_code != 0
+    assert "provider_unreachable" in said
+    assert not config_path().exists()
+
+
+async def test_a_custom_server_is_asked_for_its_address_and_the_address_is_kept(
+    config_home: Path, vault: MemoryKeyring, fake_adapter: list[FakeProvider], addressed: None
+) -> None:
+    """The one entry the catalogue gives no address for. The answer reaches
+    the adapter and `config.toml`, beside the model, where a text editor
+    can reach it."""
+    prompter = complete_run(base_url="http://localhost:1234/v1")
+
+    exit_code = await run_setup(prompter, catalog=custom_catalog())
+
+    assert exit_code == 0
+    assert "base_url" in prompter.asked
+    assert fake_adapter[-1].base_url == "http://localhost:1234/v1"
+    assert load_settings().llm.primary == "custom:fast"
+    assert load_settings().llm.base_url == "http://localhost:1234/v1"
+
+
+async def test_an_empty_address_is_asked_again(
+    config_home: Path, vault: MemoryKeyring, addressed: None
+) -> None:
+    prompter = complete_run(base_url=["", "   ", " http://localhost:1234/v1 "])
+
+    exit_code = await run_setup(prompter, catalog=custom_catalog())
+
+    assert exit_code == 0
+    assert prompter.asked.count("base_url") == 3
+    assert load_settings().llm.base_url == "http://localhost:1234/v1"
+
+
+async def test_a_provider_with_an_address_of_its_own_is_not_asked_for_one(
+    config_home: Path, vault: MemoryKeyring, fake_adapter: list[FakeProvider]
+) -> None:
+    """Gemini speaks to one vendor, Groq's address is in the catalogue:
+    neither is a question, and nothing about an address lands in the file."""
+    prompter = complete_run()
+
+    await run_setup(prompter, catalog=fake_catalog())
+
+    assert "base_url" not in prompter.asked
+    assert load_settings().llm.base_url == ""
+
+
+async def test_the_address_is_asked_before_the_key(
+    config_home: Path, vault: MemoryKeyring, addressed: None
+) -> None:
+    """Where the server is comes before what it is told; a key typed for a
+    server the wizard cannot yet reach would be checked against nothing."""
+    prompter = complete_run(base_url="http://localhost:1234/v1")
+
+    await run_setup(prompter, catalog=custom_catalog())
+
+    assert prompter.asked.index("base_url") < prompter.asked.index("api_key")
 
 
 # --------------------------------------------------------------------------

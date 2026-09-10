@@ -163,6 +163,24 @@ def test_a_model_name_may_contain_colons_and_slashes() -> None:
     assert LLMSettings(primary="openrouter:google/gemini-2.5-flash").provider == "openrouter"
 
 
+def test_the_server_address_round_trips_through_the_file(config_home: Path) -> None:
+    """`custom` has no address in the catalogue; the one the wizard asked
+    for lives here, beside the model (2.7)."""
+    save_settings(
+        Settings(llm=LLMSettings(primary="custom:llama3", base_url="http://localhost:1234/v1"))
+    )
+
+    assert load_settings().llm.base_url == "http://localhost:1234/v1"
+
+
+def test_no_address_by_default(config_home: Path) -> None:
+    """Every other provider's address is in `providers.toml`, and a file
+    written before there was an address still loads."""
+    save_settings(Settings(llm=LLMSettings(primary="gemini:x")))
+
+    assert load_settings().llm.base_url == ""
+
+
 def test_a_primary_without_a_provider_is_refused() -> None:
     """Left unchecked this reads as a provider named after the model, with no model."""
     with pytest.raises(ValueError, match="provider:model"):

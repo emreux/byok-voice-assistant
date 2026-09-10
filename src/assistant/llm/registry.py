@@ -39,6 +39,7 @@ __all__ = [
     "UnsupportedAdapterError",
     "create_provider",
     "load_catalog",
+    "needs_base_url",
 ]
 
 CATALOG_FILE_NAME = "providers.toml"
@@ -100,6 +101,16 @@ ADAPTERS: dict[str, AdapterBuilder] = {
     "gemini": _build_gemini,
     "openai_compat": _build_openai_compat,
 }
+
+# The adapters that speak to an address rather than to one vendor. An entry
+# of one of these with no `base_url` in the catalogue - `custom` - has to be
+# asked for one, and the wizard asks; the others have theirs in the file.
+_ADDRESSED = frozenset({"openai_compat"})
+
+
+def needs_base_url(entry: ProviderEntry) -> bool:
+    """Whether the wizard has to ask the user where this provider is."""
+    return entry.adapter in _ADDRESSED and not entry.base_url
 
 
 def load_catalog(path: Path | None = None) -> dict[str, ProviderEntry]:

@@ -318,6 +318,37 @@ def test_the_model_that_answers_is_the_one_that_was_configured(
     assert wiring.agents == [("gemini", MODEL)]
 
 
+def test_the_address_in_the_settings_reaches_the_provider(
+    config_home: Path, vault: MemoryKeyring, wiring: Wiring
+) -> None:
+    """`custom` has no address in the catalogue; the one setup kept in
+    `config.toml` is what the adapter is built under (2.7)."""
+    save_settings(
+        Settings(
+            llm=LLMSettings(primary="custom:llama3", base_url="http://localhost:1234/v1"),
+            locale=LocaleSettings(code="tr"),
+        )
+    )
+    store_api_key("custom", "any")
+
+    assert main(["run"]) == 0
+    assert wiring.agents == [("openai_compat", "llama3")]
+
+
+def test_a_custom_server_without_an_address_is_a_sentence_rather_than_a_traceback(
+    config_home: Path, vault: MemoryKeyring, wiring: Wiring, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A `config.toml` edited by hand to `custom:...` with no address: the
+    user can fix it, so it is a sentence that names the fix, before anything
+    slow is loaded."""
+    save_settings(Settings(llm=LLMSettings(primary="custom:llama3")))
+    store_api_key("custom", "any")
+
+    assert main(["run"]) == 1
+    assert "assistant setup" in capsys.readouterr().out
+    assert "speech model" not in wiring.happened
+
+
 def test_the_language_that_was_chosen_is_the_one_it_speaks(
     configured: Path, wiring: Wiring
 ) -> None:

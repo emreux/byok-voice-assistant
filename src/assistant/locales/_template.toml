@@ -87,6 +87,10 @@ api_key = "Paste your API key (nothing is shown as you type)"
 api_key_keep = "Paste your API key, or press Enter to keep the one already stored"
 key_needed = "This provider needs a key before it will answer."
 checking_key = "Checking the key..."
+# Asked for a server the catalogue has no address for, and said while a
+# server that needs no key is tried.
+base_url = "The server's address - the OpenAI-compatible base URL, ending in /v1"
+checking_server = "Checking that the server answers..."
 bad_key = "That key did not work - mistyped, revoked, or out of credit."
 provider_unreachable = "The provider could not be reached. Check the connection and try again."
 loading_models = "Asking which models the key can reach..."

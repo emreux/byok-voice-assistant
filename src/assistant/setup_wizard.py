@@ -28,9 +28,13 @@ not taken - the list is offered again. The verdict on the model that was
 taken goes to the `settings` table, which makes this the first thing to
 touch the database on a fresh machine.
 
-Phase 2 adds what the catalogue already has room for: a provider that needs no
-key at all (Ollama) and one that needs a `base_url`. Both are questions about
-a `ProviderEntry` field, so they arrive with the adapter that makes them real.
+**Two providers are questions about a catalogue field (2.7).** One that
+needs no key - a local Ollama - is not asked for one: the server is asked
+whether it answers, and that is all. One that has no address of its own -
+`custom`, any OpenAI-compatible server - is asked where it is, and the
+address goes to `config.toml` beside the model, where a text editor can
+reach it. Neither question names an adapter here: the registry says which
+entries need an address, the catalogue says which need a key.
 """
 
 from __future__ import annotations
@@ -56,7 +60,13 @@ from assistant.config import (
 )
 from assistant.llm import probe
 from assistant.llm.base import LLMProvider, ModelInfo, ProviderError
-from assistant.llm.registry import ADAPTERS, ProviderEntry, create_provider, load_catalog
+from assistant.llm.registry import (
+    ADAPTERS,
+    ProviderEntry,
+    create_provider,
+    load_catalog,
+    needs_base_url,
+)
 from assistant.store.db import open_database
 from assistant.store.repos import SettingsRepo
 
@@ -96,6 +106,11 @@ class Prompter(Protocol):
         """Reads a line without echoing it, or `None` if the user walked away."""
         ...
 
+    async def ask(self, key: str) -> str | None:
+        """Reads a line the user can see - an address, not a secret - or
+        `None` if the user walked away."""
+        ...
+
 
 # The last link of the fallback chain of section 3.12: what the wizard says
 # when no locale pack offers a translation. English lives here, beside the code
@@ -112,6 +127,8 @@ TEXT: dict[str, str] = {
     "api_key_keep": "Paste your API key, or press Enter to keep the one already stored",
     "key_needed": "This provider needs a key before it will answer.",
     "checking_key": "Checking the key...",
+    "base_url": "The server's address - the OpenAI-compatible base URL, ending in /v1",
+    "checking_server": "Checking that the server answers...",
     "bad_key": "That key did not work - mistyped, revoked, or out of credit.",
     "provider_unreachable": (
         "The provider could not be reached. Check the connection and try again."
@@ -197,10 +214,18 @@ async def _ask(
     prompter.say("welcome")
     provider_id, entry = await _pick_provider(prompter, buildable)
     locale = _answered(await prompter.choose("locale", _languages()))
+    base_url = await _address(prompter, entry)
 
-    if entry.key_url is not None:
-        prompter.say("key_url", url=entry.key_url)
-    provider, api_key = await _working_key(prompter, provider_id, entries)
+    if entry.requires_key:
+        if entry.key_url is not None:
+            prompter.say("key_url", url=entry.key_url)
+        provider, api_key = await _working_key(prompter, provider_id, entries, base_url=base_url)
+    else:
+        api_key = ""
+        answering = await _answering_server(prompter, provider_id, entries, base_url=base_url)
+        if answering is None:
+            return _GAVE_UP
+        provider = answering
 
     prompter.say("loading_models")
     models = await provider.list_models()
@@ -212,10 +237,11 @@ async def _ask(
     )
 
     # Everything above could still be abandoned; from here it is written down.
-    store_api_key(provider_id, api_key)
+    if api_key:
+        store_api_key(provider_id, api_key)
     path = save_settings(
         Settings(
-            llm=LLMSettings(primary=f"{provider_id}:{model}"),
+            llm=LLMSettings(primary=f"{provider_id}:{model}", base_url=base_url or ""),
             locale=LocaleSettings(code=locale),
         )
     )
@@ -238,10 +264,52 @@ async def _pick_provider(
     return chosen, buildable[chosen]
 
 
+async def _address(prompter: Prompter, entry: ProviderEntry) -> str | None:
+    """Where the server is, for an entry the catalogue gives no address for
+    (`custom`); `None` for every other, whose address is in the file. An
+    empty answer is asked again - there is no default to fall back on."""
+    if not needs_base_url(entry):
+        return None
+
+    while True:
+        typed = _answered(await prompter.ask("base_url")).strip()
+        if typed:
+            return typed
+
+
+async def _answering_server(
+    prompter: Prompter,
+    provider_id: str,
+    entries: Mapping[str, ProviderEntry],
+    *,
+    base_url: str | None,
+) -> LLMProvider | None:
+    """A provider that needs no key, checked once: does the server answer?
+
+    There is no key to ask for again, so a server that cannot be reached
+    ends the wizard with the sentence that says so - the user starts the
+    server and comes back. A server that turns out to want a key after all
+    is told about in those words; the catalogue said it would not.
+    """
+    prompter.say("checking_server")
+    provider = create_provider(provider_id, api_key="", catalog=entries, base_url=base_url)
+    try:
+        accepted = await provider.validate_credentials()
+    except ProviderError:
+        prompter.say("provider_unreachable")
+        return None
+    if not accepted:
+        prompter.say("key_needed")
+        return None
+    return provider
+
+
 async def _working_key(
     prompter: Prompter,
     provider_id: str,
     entries: Mapping[str, ProviderEntry],
+    *,
+    base_url: str | None = None,
 ) -> tuple[LLMProvider, str]:
     """Asks for a key until the provider accepts one (section 3.3).
 
@@ -264,7 +332,7 @@ async def _working_key(
             continue
 
         prompter.say("checking_key")
-        provider = create_provider(provider_id, api_key=api_key, catalog=entries)
+        provider = create_provider(provider_id, api_key=api_key, catalog=entries, base_url=base_url)
         try:
             accepted = await provider.validate_credentials()
         except ProviderError:
@@ -382,6 +450,9 @@ class TerminalPrompter:
 
     async def secret(self, key: str) -> str | None:
         return _as_answer(await questionary.password(self._text[key]).ask_async())
+
+    async def ask(self, key: str) -> str | None:
+        return _as_answer(await questionary.text(self._text[key]).ask_async())
 
 
 def _as_answer(value: object) -> str | None:

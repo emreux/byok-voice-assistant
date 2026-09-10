@@ -252,7 +252,7 @@ async def _talk(settings: Settings, pack: Locale, *, device: int | str | None = 
     # likeliest thing to be wrong, and the cheapest to find out about. The
     # database is next for the same reason - cheap, and a disk that refuses
     # is better found out about before Whisper has been loaded.
-    provider = create_provider(settings.llm.provider)
+    provider = create_provider(settings.llm.provider, base_url=settings.llm.base_url or None)
     database = open_database()
     # The table of section 3.11, once, for everyone who reads a row of it:
     # the loop, the gate, the state machine's clock and the tracker.
