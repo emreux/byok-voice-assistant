@@ -34,7 +34,10 @@ gate that needs it is built first - neither can be built holding the other.
 **The system prompt is not part of the conversation.** It is prepended to each
 request instead of living in the history, which keeps it out of reach of the
 window and byte-identical from turn to turn - the one thing prompt caching
-needs (architecture guide section 2).
+needs (architecture guide section 2). It may be handed in as a source rather
+than a sentence (2.10): the user's remembered facts live outside this file
+and are read into the prompt at every request, so a fact kept a moment ago
+is in the next request, and the bytes still change only when the facts do.
 
 **The words leave as they arrive** (2.8, architecture guide section 11).
 `stream_reply` hands each piece of text out the moment the provider produced
@@ -81,6 +84,7 @@ __all__ = [
     "Confirm",
     "Dispatch",
     "OnToolRound",
+    "PromptSource",
     "decline",
     "window",
 ]
@@ -100,6 +104,12 @@ Confirm = Callable[[str], Awaitable[bool]]
 async def decline(question: str) -> bool:
     """Nobody to ask means no - never a quiet yes."""
     return False
+
+
+# The system prompt, when part of it lives outside this file: called at
+# every request, and expected to answer the same bytes until something
+# actually changed (2.10, `store/memory.py`).
+PromptSource = Callable[[], str]
 
 
 # Told, once per round, that the loop is about to run the model's calls: the
@@ -167,7 +177,7 @@ class Agent:
         provider: LLMProvider,
         *,
         model: str,
-        system_prompt: str = SYSTEM_PROMPT,
+        system_prompt: str | PromptSource = SYSTEM_PROMPT,
         tools: ToolRegistry | None = None,
         dispatch: Dispatch | None = None,
         limits: Limits | None = None,
@@ -178,7 +188,7 @@ class Agent:
             raise ValueError("tools were offered without a gate to run them through")
         self._provider = provider
         self._model = model
-        self._system = Message.system(system_prompt)
+        self._system_prompt = system_prompt
         self._tools = tools
         self._dispatch = dispatch
         self._limits = limits if limits is not None else Limits()
@@ -291,6 +301,12 @@ class Agent:
     def _offered(self) -> list[ToolSpec]:
         return [] if self._tools is None else self._tools.specs()
 
+    def _system(self) -> Message:
+        """The system prompt as of now: the sentence given, or what the
+        source answers today."""
+        source = self._system_prompt
+        return Message.system(source() if callable(source) else source)
+
     async def _ask(
         self, conversation: list[Message], tools: list[ToolSpec], got: _Reply
     ) -> AsyncGenerator[str]:
@@ -307,7 +323,7 @@ class Agent:
         spoken: list[str] = []
         calls: list[ToolCall] = []
         stream = self._provider.stream(
-            [self._system, *conversation],
+            [self._system(), *conversation],
             tools,
             model=self._model,
             max_tokens=self._limits.output_tokens,

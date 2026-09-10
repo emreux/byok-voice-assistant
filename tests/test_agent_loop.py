@@ -297,6 +297,35 @@ async def test_every_request_starts_with_the_very_same_bytes() -> None:
     assert [call.messages[0] for call in provider.calls] == [Message.system(SYSTEM_PROMPT)] * 3
 
 
+async def test_the_prompt_may_be_a_source_read_at_every_request() -> None:
+    """The user's facts live outside the loop (2.10). A fact kept a moment
+    ago is in the very next request, not the next start."""
+    facts = ["Bana Emre de."]
+    provider = ScriptedProvider(*answers(2))
+    conversation = Agent(provider, model=MODEL, system_prompt=lambda: "\n".join(["BASE", *facts]))
+
+    await conversation.reply("selam")
+    facts.append("Kahveyi sade içerim.")
+    await conversation.reply("bir daha")
+
+    assert provider.calls[0].messages[0] == Message.system("BASE\nBana Emre de.")
+    assert provider.calls[1].messages[0] == Message.system(
+        "BASE\nBana Emre de.\nKahveyi sade içerim."
+    )
+
+
+async def test_a_source_that_answers_the_same_keeps_the_bytes_the_same() -> None:
+    """The cache of architecture guide section 2 goes on hitting between
+    the changes."""
+    provider = ScriptedProvider(*answers(3))
+    conversation = Agent(provider, model=MODEL, system_prompt=lambda: "BASE")
+
+    for number in range(3):
+        await conversation.reply(f"soru {number}")
+
+    assert [call.messages[0] for call in provider.calls] == [Message.system("BASE")] * 3
+
+
 # --------------------------------------------------------------------------
 # When the turn goes wrong
 # --------------------------------------------------------------------------

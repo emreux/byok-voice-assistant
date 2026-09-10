@@ -179,6 +179,7 @@ def _run(*, device: str | None = None) -> int:
     from assistant.audio.capture import MicrophoneUnavailableError, device_choice
     from assistant.llm.registry import RegistryError
     from assistant.logs import setup_logging
+    from assistant.store.memory import MemoryFileError
     from assistant.stt.local_whisper import ModelUnavailableError
 
     settings = load_settings()
@@ -202,9 +203,16 @@ def _run(*, device: str | None = None) -> int:
     setup_logging()
     # What the user can fix and the program cannot: a key that is gone, a
     # voice that is not installed, weights that could not be fetched, a
-    # microphone that would not open. Each is one sentence and exit code 1.
-    # Anything else is a bug in this project and keeps its traceback.
-    fixable = (RegistryError, NoVoiceError, ModelUnavailableError, MicrophoneUnavailableError)
+    # microphone that would not open, a memory file edited into something
+    # that does not parse. Each is one sentence and exit code 1. Anything
+    # else is a bug in this project and keeps its traceback.
+    fixable = (
+        RegistryError,
+        NoVoiceError,
+        ModelUnavailableError,
+        MicrophoneUnavailableError,
+        MemoryFileError,
+    )
     # The flag for one evening with a headset; the settings for every other
     # day; the system default when neither says anything.
     microphone = device_choice(device if device is not None else settings.audio.input_device)
@@ -226,14 +234,17 @@ async def _talk(settings: Settings, pack: Locale, *, device: int | str | None = 
     """Builds the pieces and lets the state machine drive them."""
     from assistant.agent.core import Agent
     from assistant.agent.limits import Limits
+    from assistant.agent.prompts import SYSTEM_PROMPT
     from assistant.app import Assistant
     from assistant.audio.capture import HandsFree, SystemMicrophone
     from assistant.audio.player import SystemSpeaker
     from assistant.audio.vad import Endpoint, SileroVAD
     from assistant.llm.registry import create_provider
     from assistant.store.db import open_database
+    from assistant.store.memory import UserMemory
     from assistant.store.repos import AuditRepo, SettingsRepo, UsageRepo
     from assistant.stt.local_whisper import LocalWhisper
+    from assistant.tools import memory as memory_tools
     from assistant.tools.media import media_control
     from assistant.tools.registry import ToolRegistry
     from assistant.tools.system import (
@@ -253,6 +264,11 @@ async def _talk(settings: Settings, pack: Locale, *, device: int | str | None = 
     # database is next for the same reason - cheap, and a disk that refuses
     # is better found out about before Whisper has been loaded.
     provider = create_provider(settings.llm.provider, base_url=settings.llm.base_url or None)
+    # What the user asked to be kept, and the assistant's name (section
+    # 3.7, 2.10): read once here, written by the two tools below, and read
+    # into the prompt at every request. Before the database for the same
+    # reason as the provider - a file edited into nonsense is a sentence.
+    memory = UserMemory.load()
     database = open_database()
     # The table of section 3.11, once, for everyone who reads a row of it:
     # the loop, the gate, the state machine's clock and the tracker.
@@ -276,8 +292,23 @@ async def _talk(settings: Settings, pack: Locale, *, device: int | str | None = 
             )
             # The tools on offer, by name, in one place. Every one of them
             # runs through the gate below and nowhere else (section 3.9).
+            # `forget` is declared with the question it asks, in the pack's
+            # words: the first question of phase 2 a user actually hears.
             tools = ToolRegistry(
-                [get_current_time, open_app_for(catalog), open_url, open_settings, media_control]
+                [
+                    get_current_time,
+                    open_app_for(catalog),
+                    open_url,
+                    open_settings,
+                    media_control,
+                    memory_tools.remember_for(memory),
+                    memory_tools.forget_for(
+                        memory,
+                        confirm_prompt=pack.say(
+                            "forget_confirm", memory_tools.TEXT["forget_confirm"]
+                        ),
+                    ),
+                ]
             )
             # Loading Whisper takes seconds of four cores. Doing it now rather
             # than at the first press is what keeps the first sentence from
@@ -302,6 +333,10 @@ async def _talk(settings: Settings, pack: Locale, *, device: int | str | None = 
                 agent=Agent(
                     provider,
                     model=settings.llm.model,
+                    # The frozen prompt with the user's facts behind it, read
+                    # at every request so that a fact just kept is in the
+                    # next one; `prompts.py` stays without an import.
+                    system_prompt=lambda: memory.prompt(SYSTEM_PROMPT),
                     tools=tools,
                     dispatch=gate,
                     limits=limits,

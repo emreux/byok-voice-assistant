@@ -50,6 +50,7 @@ from assistant.llm import probe
 from assistant.llm.base import ProviderError, ToolCall, Usage
 from assistant.llm.probe import ProbeResult, remember, remembered
 from assistant.store import db
+from assistant.store.memory import MEMORY_FILE_NAME
 from assistant.store.repos import SettingsRepo, UsageRepo
 from assistant.stt import local_whisper
 from assistant.tools import system
@@ -95,6 +96,8 @@ class Wiring:
     # What the agent was handed to work with: the names of the tools on
     # offer, and the gate they run through.
     tools: list[list[str]] = field(default_factory=list)
+    registries: list[Any] = field(default_factory=list)
+    prompts: list[Any] = field(default_factory=list)
     gates: list[Any] = field(default_factory=list)
     limits: list[Any] = field(default_factory=list)
     microphones: list[Any] = field(default_factory=list)
@@ -138,6 +141,8 @@ def wiring(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Wiring:
         def __init__(self, provider: Any, *, model: str, **rest: Any) -> None:
             seen.agents.append((provider.id, model))
             seen.tools.append([spec.name for spec in rest["tools"].specs()])
+            seen.registries.append(rest["tools"])
+            seen.prompts.append(rest["system_prompt"])
             seen.gates.append(rest["dispatch"])
             seen.limits.append(rest["limits"])
 
@@ -414,7 +419,15 @@ def test_every_tool_of_phase_two_is_on_offer(configured: Path, wiring: Wiring) -
     main(["run"])
 
     assert wiring.tools == [
-        ["get_current_time", "open_app", "open_url", "open_settings", "media_control"]
+        [
+            "get_current_time",
+            "open_app",
+            "open_url",
+            "open_settings",
+            "media_control",
+            "remember",
+            "forget",
+        ]
     ]
 
 
@@ -480,6 +493,80 @@ def test_the_fast_path_is_handed_the_same_gate_as_the_loop(
 
     [gate] = wiring.gates
     assert wiring.built[-1]["dispatch"] is gate
+
+
+# --------------------------------------------------------------------------
+# run: what the user asked to be kept (2.10)
+# --------------------------------------------------------------------------
+
+
+def remembered_by_hand(configured: Path, body: str) -> Path:
+    path = configured / MEMORY_FILE_NAME
+    path.write_text(body, encoding="utf-8")
+    return path
+
+
+def test_what_the_user_asked_to_be_kept_is_in_front_of_every_request(
+    configured: Path, wiring: Wiring
+) -> None:
+    """Section 3.7: the file is read at startup and the prompt the loop
+    is handed carries it - behind the frozen prompt, which stays as it is."""
+    from assistant.agent.prompts import SYSTEM_PROMPT
+
+    remembered_by_hand(
+        configured, '[assistant]\nname = "Ada"\n\n[user]\nfacts = ["Bana Emre de."]\n'
+    )
+
+    main(["run"])
+
+    [source] = wiring.prompts
+    prompt = source()
+    assert prompt.startswith(SYSTEM_PROMPT)
+    assert "Bana Emre de." in prompt
+    assert "Ada" in prompt
+
+
+def test_with_nothing_remembered_the_prompt_is_the_frozen_one_byte_for_byte(
+    configured: Path, wiring: Wiring
+) -> None:
+    from assistant.agent.prompts import SYSTEM_PROMPT
+
+    main(["run"])
+
+    [source] = wiring.prompts
+    assert source() == SYSTEM_PROMPT
+
+
+def test_a_memory_file_that_does_not_parse_is_a_sentence_rather_than_a_traceback(
+    configured: Path, wiring: Wiring, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A hand edit gone wrong. The user can fix it; the program must not
+    write an empty file over it, and must not load a speech model first."""
+    path = remembered_by_hand(configured, "[user]\nfacts = [oops\n")
+
+    assert main(["run"]) == 1
+
+    assert "speech model" not in wiring.happened
+    assert path.read_text(encoding="utf-8") == "[user]\nfacts = [oops\n"
+    assert said("cannot_start", "tr").split("{")[0] in capsys.readouterr().out
+
+
+def test_forget_asks_its_question_in_the_language_of_the_pack(
+    configured: Path, wiring: Wiring
+) -> None:
+    """The first question of phase 2 a user actually hears (2.3, 2.10)."""
+    from assistant.tools import memory as memory_tools
+
+    main(["run"])
+
+    [registry] = wiring.registries
+    forget = registry.get("forget")
+    assert forget is not None
+    assert forget.risk == "confirm"
+    assert forget.confirm_prompt == locales.load("tr").say(
+        "forget_confirm", memory_tools.TEXT["forget_confirm"]
+    )
+    assert forget.confirm_prompt != memory_tools.TEXT["forget_confirm"]
 
 
 # --------------------------------------------------------------------------

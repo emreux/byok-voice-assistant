@@ -83,6 +83,9 @@ spend_stopped = "Harcama sınırı aşıldı, bu yüzden modele sormuyorum."
 time_is = "Saat {hour} {minute}."
 # Added by the gate to a risky tool's question when the same call ran a
 # moment ago (design.md 3.11). {ago} is one of the two spans below.
+# Asked before a remembered fact is removed (2.10); {fact} is the fact as
+# the model named it. The hint on how to answer is added after it.
+forget_confirm = "'{fact}' kaydı unutulacak."
 duplicate_done = "Bunu {ago} önce zaten yaptın."
 duplicate_uncertain = "Bunu {ago} önce denedin, sonucu belirsiz kaldı."
 seconds_ago = "{count} saniye"

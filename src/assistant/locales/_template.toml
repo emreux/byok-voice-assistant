@@ -131,6 +131,9 @@ spend_stopped = "The spending limit has been passed, so I am not asking the mode
 # Said in answer to "what time is it" without the model. {hour} and {minute}
 # are two numbers, 14 and 3, which the voice reads out.
 time_is = "It is {hour} {minute}."
+# Asked before something the user asked to be remembered is forgotten again;
+# {fact} is the fact itself. "Say yes or no." is added after it.
+forget_confirm = "'{fact}' will be forgotten."
 # Added to a risky tool's question when the same thing was done, or may have
 # been, a moment ago. {ago} is filled with one of the two spans below.
 duplicate_done = "You already did this {ago} ago."
