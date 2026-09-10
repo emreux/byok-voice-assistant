@@ -20,6 +20,7 @@ from __future__ import annotations
 import asyncio
 import sqlite3
 import sys
+import time
 from collections.abc import Iterable, Iterator
 from dataclasses import dataclass, field
 from io import StringIO
@@ -45,9 +46,11 @@ from assistant.config import (
     save_settings,
     store_api_key,
 )
-from assistant.llm.base import ToolCall, Usage
+from assistant.llm import probe
+from assistant.llm.base import ProviderError, ToolCall, Usage
+from assistant.llm.probe import ProbeResult, remember, remembered
 from assistant.store import db
-from assistant.store.repos import UsageRepo
+from assistant.store.repos import SettingsRepo, UsageRepo
 from assistant.stt import local_whisper
 from assistant.tools import system
 from assistant.tools.system import AppCatalog, AppEntry
@@ -57,6 +60,8 @@ from tests.conftest import MemoryKeyring
 
 MODEL = "gemini-2.5-flash"
 TURN = Turn(heard="saat kaç", said="Üç buçuk.", usage=Usage(300, 10))
+# What the probe of 2.6 answers at startup unless a test says otherwise.
+PASSED = ProbeResult(ok=True, first_token_ms=12.0)
 
 
 @pytest.fixture(autouse=True)
@@ -97,6 +102,11 @@ class Wiring:
     # What the speech model was told to expect (2.2).
     vocabularies: list[list[str]] = field(default_factory=list)
     stop: BaseException | None = None
+    # The probe of 2.6 at startup: what it was asked, as (provider id,
+    # model, question), and what it answers.
+    probes: list[tuple[str, str, str]] = field(default_factory=list)
+    verdict: ProbeResult = field(default_factory=lambda: PASSED)
+    probe_refusal: Exception | None = None
 
 
 @pytest.fixture
@@ -153,6 +163,14 @@ def wiring(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Wiring:
             parts["on_state"](State.THINKING)
             parts["on_turn"](TURN)
 
+    async def probed(provider: Any, model: str, *, question: str) -> ProbeResult:
+        seen.happened.append("probe")
+        seen.probes.append((provider.id, model, question))
+        if seen.probe_refusal is not None:
+            raise seen.probe_refusal
+        return seen.verdict
+
+    monkeypatch.setattr(probe, "probe_tool_support", probed)
     monkeypatch.setattr(local_whisper, "LocalWhisper", FakeWhisper)
     monkeypatch.setattr(system.AppCatalog, "load", catalogue_here)
     monkeypatch.setattr(capture, "SystemMicrophone", FakeMicrophone)
@@ -348,10 +366,12 @@ def test_the_speech_model_is_ready_before_the_assistant_is(
     """Loading Whisper at the first press would swallow the first sentence.
     The database comes first of all: cheap, and a disk that refuses is
     better found out about before two seconds of four cores are spent. The
-    app catalogue comes before the speech model, which is told its names."""
+    probe of 2.6 comes next, for the same reason: one request on the
+    network, and worth knowing about before the load. The app catalogue
+    comes before the speech model, which is told its names."""
     main(["run"])
 
-    assert wiring.happened == ["database", "app catalogue", "speech model", "assistant"]
+    assert wiring.happened == ["database", "probe", "app catalogue", "speech model", "assistant"]
 
 
 # --------------------------------------------------------------------------
@@ -429,6 +449,122 @@ def test_the_fast_path_is_handed_the_same_gate_as_the_loop(
 
     [gate] = wiring.gates
     assert wiring.built[-1]["dispatch"] is gate
+
+
+# --------------------------------------------------------------------------
+# run: the verdict on the model (2.6)
+# --------------------------------------------------------------------------
+
+
+def unwrapped(printed: str) -> str:
+    """What was printed, with the line breaks the eighty-column terminal
+    put into a long sentence taken out again."""
+    return " ".join(printed.split())
+
+
+def stored_verdict() -> ProbeResult | None:
+    connection = sqlite3.connect(db.database_path())
+    connection.row_factory = sqlite3.Row
+    try:
+        return remembered(SettingsRepo(connection), "gemini", MODEL)
+    finally:
+        connection.close()
+
+
+def write_verdict(result: ProbeResult, *, age: float) -> None:
+    """A verdict `age` seconds old, as setup would have left it."""
+    connection = db.open_database()
+    try:
+        remember(SettingsRepo(connection), "gemini", MODEL, result, now=time.time() - age)
+    finally:
+        connection.close()
+
+
+def test_a_model_nobody_has_tested_is_probed_at_startup_and_the_verdict_kept(
+    configured: Path, wiring: Wiring
+) -> None:
+    """Setup wrote nothing - an older build, or a database that was deleted.
+    The question is asked once and the answer kept, so that the next start
+    does not ask again."""
+    assert main(["run"]) == 0
+    assert main(["run"]) == 0
+
+    assert [(p, m) for p, m, _ in wiring.probes] == [("gemini", MODEL)]
+    assert stored_verdict() == PASSED
+
+
+def test_the_probe_asks_in_the_language_of_the_pack(configured: Path, wiring: Wiring) -> None:
+    main(["run"])
+
+    [(_, _, question)] = wiring.probes
+    assert question == locales.load("tr").probe_question
+
+
+def test_the_model_is_checked_before_the_speech_model_is_loaded(
+    configured: Path, wiring: Wiring
+) -> None:
+    """One request on the network, before two seconds of loading are spent
+    on a model that may turn out not to call tools."""
+    main(["run"])
+
+    assert wiring.happened.index("probe") < wiring.happened.index("speech model")
+
+
+def test_a_fresh_verdict_is_not_asked_again(configured: Path, wiring: Wiring) -> None:
+    write_verdict(ProbeResult(ok=True, first_token_ms=800.0), age=3 * 86400)
+
+    main(["run"])
+
+    assert wiring.probes == []
+
+
+def test_a_verdict_a_week_old_is_asked_again(configured: Path, wiring: Wiring) -> None:
+    """Section 3.2: the provider may have changed what is behind the name."""
+    write_verdict(ProbeResult(ok=True, first_token_ms=800.0), age=8 * 86400)
+
+    main(["run"])
+
+    assert len(wiring.probes) == 1
+    assert stored_verdict() == PASSED
+
+
+def test_a_model_that_fails_the_probe_is_a_warning_and_not_a_refusal_to_start(
+    configured: Path, wiring: Wiring, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The user may have chosen it knowing; it still answers questions. But
+    they are told, in their language, on a line that stays."""
+    wiring.verdict = ProbeResult(ok=False, reason="no_tool_call_emitted", first_token_ms=5.0)
+
+    assert main(["run"]) == 0
+
+    assert "assistant" in wiring.happened
+    assert said("model_no_tools") in unwrapped(capsys.readouterr().out)
+
+
+def test_a_kept_verdict_that_failed_is_warned_about_on_every_start(
+    configured: Path, wiring: Wiring, capsys: pytest.CaptureFixture[str]
+) -> None:
+    write_verdict(ProbeResult(ok=False, reason="no_tool_call_emitted"), age=60)
+
+    main(["run"])
+
+    assert wiring.probes == []
+    assert said("model_no_tools") in unwrapped(capsys.readouterr().out)
+
+
+def test_a_provider_that_cannot_be_asked_at_startup_is_left_to_the_first_turn(
+    configured: Path, wiring: Wiring, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Offline at startup is not a bad model. Nothing is written down, no
+    warning is shown, and the first turn says what is wrong in its own
+    words (`app.py`)."""
+    wiring.probe_refusal = ProviderError("gemini could not be reached (ConnectError)")
+
+    assert main(["run"]) == 0
+
+    assert "assistant" in wiring.happened
+    assert stored_verdict() is None
+    assert said("model_no_tools") not in unwrapped(capsys.readouterr().out)
 
 
 def test_the_database_is_built_where_the_data_lives(configured: Path, wiring: Wiring) -> None:

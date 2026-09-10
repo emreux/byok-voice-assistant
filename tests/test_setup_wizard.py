@@ -9,10 +9,16 @@ ordinary bookkeeping.
 Nothing here draws on a screen. `run_setup` talks to a `Prompter`, and this
 suite hands it a scripted one, so a wizard run is a function call with a
 recorded transcript rather than a session someone has to sit through.
+
+Since 2.6 the wizard also sends the chosen model one request to see whether
+it calls a tool, and refuses one that does not. The fake provider below
+answers that request from a class attribute, so a test can say which of
+its models call tools and which only talk.
 """
 
 from __future__ import annotations
 
+import sqlite3
 from collections.abc import AsyncIterator, Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from pathlib import Path
@@ -35,9 +41,13 @@ from assistant.config import (
     save_settings,
     store_api_key,
 )
-from assistant.llm.base import Delta, Message, ModelInfo, ProviderError, ToolSpec
+from assistant.llm.base import Delta, Message, ModelInfo, ProviderError, ToolCall, ToolSpec
+from assistant.llm.probe import NO_TOOL_CALL, QUESTION, ProbeResult, remembered
 from assistant.llm.registry import ADAPTERS, ProviderEntry
 from assistant.setup_wizard import TEXT, Option, TerminalPrompter, run_setup, wording
+from assistant.store import db
+from assistant.store.db import open_database
+from assistant.store.repos import SettingsRepo
 from tests.conftest import MemoryKeyring
 
 GOOD_KEY = "good-key"
@@ -47,16 +57,23 @@ OFFLINE_KEY = "offline"
 
 
 class FakeProvider:
-    """A provider that accepts one key and offers two models."""
+    """A provider that accepts one key, offers two models, and answers the
+    probe of 2.6 for each of them as the class attributes say: a model in
+    `tool_callers` calls the clock, one in `refusing` makes the provider
+    refuse the request, any other only talks."""
 
     id = "fake"
     models: ClassVar[list[ModelInfo]] = [
         ModelInfo(id="fast", display_name="Fast"),
         ModelInfo(id="smart", display_name="Smart"),
     ]
+    tool_callers: ClassVar[set[str]] = {"fast", "smart"}
+    refusing: ClassVar[set[str]] = set()
 
     def __init__(self, api_key: str) -> None:
         self.api_key = api_key
+        # What the probe asked, as (model, question, tool names).
+        self.probed: list[tuple[str, str, list[str]]] = []
 
     async def validate_credentials(self) -> bool:
         if self.api_key == OFFLINE_KEY:
@@ -66,7 +83,7 @@ class FakeProvider:
     async def list_models(self) -> list[ModelInfo]:
         return list(self.models)
 
-    def stream(
+    async def stream(
         self,
         messages: list[Message],
         tools: list[ToolSpec],
@@ -75,7 +92,16 @@ class FakeProvider:
         temperature: float | None = None,
         max_tokens: int = 4096,
     ) -> AsyncIterator[Delta]:
-        raise NotImplementedError("the wizard never sends a message")
+        self.probed.append((model, messages[-1].content, [tool.name for tool in tools]))
+        if model in self.refusing:
+            raise ProviderError("fake refused the request (429): slow down")
+        if model in self.tool_callers:
+            yield Delta(
+                tool_call=ToolCall(id="c1", name="get_current_time", arguments={"city": "x"})
+            )
+        else:
+            yield Delta(text="It is about three.")
+        yield Delta(finish_reason="stop")
 
 
 class ScriptedPrompter:
@@ -128,9 +154,35 @@ def fake_catalog(*provider_ids: str) -> dict[str, ProviderEntry]:
 
 
 @pytest.fixture(autouse=True)
-def fake_adapter(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Registers an adapter that answers without a network."""
-    monkeypatch.setitem(ADAPTERS, "fake", lambda entry, api_key: FakeProvider(api_key))
+def fake_adapter(monkeypatch: pytest.MonkeyPatch) -> list[FakeProvider]:
+    """Registers an adapter that answers without a network, and keeps every
+    provider it built so a test can read what the wizard asked of it."""
+    built: list[FakeProvider] = []
+
+    def build(entry: ProviderEntry, api_key: str) -> FakeProvider:
+        provider = FakeProvider(api_key)
+        built.append(provider)
+        return provider
+
+    monkeypatch.setitem(ADAPTERS, "fake", build)
+    return built
+
+
+@pytest.fixture(autouse=True)
+def own_database(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Path:
+    """The wizard opens the machine's database to write the verdict on the
+    model (2.6). Here that is a file under this test's directory."""
+    path = tmp_path / "data" / "assistant.db"
+    monkeypatch.setattr(db, "database_path", lambda: path)
+    return path
+
+
+@pytest.fixture
+def verdicts() -> Iterator[sqlite3.Connection]:
+    """A database handed to the wizard, so that what it wrote can be read."""
+    connection = open_database(":memory:")
+    yield connection
+    connection.close()
 
 
 def complete_run(**overrides: str | list[str | None] | None) -> ScriptedPrompter:
@@ -215,7 +267,7 @@ async def test_only_providers_this_build_can_construct_are_offered(
     only discover after typing their key in."""
     catalog: Mapping[str, ProviderEntry] = {
         **fake_catalog("gemini", "openrouter"),
-        "groq": ProviderEntry(id="groq", adapter="openai_compat", display_name="Groq"),
+        "claude": ProviderEntry(id="claude", adapter="anthropic", display_name="Claude"),
     }
     prompter = complete_run(provider="openrouter")
 
@@ -369,6 +421,152 @@ def test_every_question_has_words_whatever_language_the_wizard_starts_in(
     be one nobody has translated - which is what `TEXT` is for."""
     assert set(wording()) == set(TEXT)
     assert all(sentence.strip() for sentence in wording().values())
+
+
+# --------------------------------------------------------------------------
+# The tool-use probe (2.6)
+# --------------------------------------------------------------------------
+
+
+async def test_a_model_that_does_not_call_tools_cannot_be_chosen(
+    config_home: Path, vault: MemoryKeyring, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The most valuable thirty lines of section 3.2: the model is offered
+    again until one that calls the tool is picked, and only that one is
+    written down."""
+    monkeypatch.setattr(FakeProvider, "tool_callers", {"smart"})
+    prompter = complete_run(model=["fast", "smart"])
+
+    exit_code = await run_setup(prompter, catalog=fake_catalog())
+
+    said = [key for key, _ in prompter.said]
+    assert exit_code == 0
+    assert prompter.asked.count("model") == 2
+    assert said.count("tools_failed") == 1
+    assert said.count("tools_ok") == 1
+    assert load_settings().llm.primary == "gemini:smart"
+
+
+async def test_a_model_that_calls_tools_is_taken_at_the_first_answer(
+    config_home: Path, vault: MemoryKeyring
+) -> None:
+    prompter = complete_run()
+
+    await run_setup(prompter, catalog=fake_catalog())
+
+    said = [key for key, _ in prompter.said]
+    assert prompter.asked.count("model") == 1
+    assert "tools_failed" not in said
+    assert said.index("probing_tools") < said.index("tools_ok") < said.index("saved")
+
+
+async def test_the_first_token_time_is_shown_as_a_whole_number(
+    config_home: Path, vault: MemoryKeyring
+) -> None:
+    prompter = complete_run()
+
+    await run_setup(prompter, catalog=fake_catalog())
+
+    [fields] = [fields for key, fields in prompter.said if key == "tools_ok"]
+    assert str(fields["ms"]).isdigit()
+
+
+async def test_the_probe_asks_in_the_language_that_was_just_chosen(
+    config_home: Path, vault: MemoryKeyring, fake_adapter: list[FakeProvider]
+) -> None:
+    """Section 3.2 wanted the question in the user's language, so that one
+    request checks tool calling and understanding together; the pack is
+    where the language comes from (section 3.12)."""
+    await run_setup(complete_run(locale="tr"), catalog=fake_catalog())
+
+    [(model, question, tools)] = fake_adapter[-1].probed
+    assert model == "fast"
+    assert question == locales.load("tr").probe_question
+    assert question != QUESTION
+    assert tools == ["get_current_time"]
+
+
+async def test_the_probe_falls_back_to_the_english_question(
+    config_home: Path, vault: MemoryKeyring, fake_adapter: list[FakeProvider]
+) -> None:
+    """`en.toml` carries no question; the constant beside the code asks."""
+    await run_setup(complete_run(locale="en"), catalog=fake_catalog())
+
+    [(_, question, _)] = fake_adapter[-1].probed
+    assert question == QUESTION
+
+
+async def test_the_verdict_on_the_chosen_model_is_written_down(
+    config_home: Path, vault: MemoryKeyring, verdicts: sqlite3.Connection
+) -> None:
+    """So that `assistant run` need not ask the same question for a week."""
+    await run_setup(complete_run(model="smart"), catalog=fake_catalog(), database=verdicts)
+
+    found = remembered(SettingsRepo(verdicts), "gemini", "smart")
+    assert found is not None
+    assert found.ok is True
+    assert remembered(SettingsRepo(verdicts), "gemini", "fast") is None
+
+
+async def test_the_wizard_opens_the_machine_s_database_when_none_is_handed_over(
+    config_home: Path, vault: MemoryKeyring, own_database: Path
+) -> None:
+    """On a fresh machine the wizard is the first thing to touch the
+    database, and it has to build it - with its schema - to write into it."""
+    await run_setup(complete_run(), catalog=fake_catalog())
+
+    connection = open_database(own_database)
+    try:
+        found = remembered(SettingsRepo(connection), "gemini", "fast")
+    finally:
+        connection.close()
+    assert found is not None
+    assert found.ok is True
+
+
+async def test_a_provider_that_refuses_the_probe_has_said_nothing_about_the_model(
+    config_home: Path, vault: MemoryKeyring, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A rate limit or a bad day is not "this model cannot call tools":
+    that sentence would send the user away from a model that is fine. The
+    provider's own words are shown and the list is offered again."""
+    monkeypatch.setattr(FakeProvider, "refusing", {"smart"})
+    prompter = complete_run(model=["smart", "fast"])
+
+    exit_code = await run_setup(prompter, catalog=fake_catalog())
+
+    said = [key for key, _ in prompter.said]
+    refusals = [fields for key, fields in prompter.said if key == "probe_refused"]
+    assert exit_code == 0
+    assert "tools_failed" not in said
+    assert "slow down" in str(refusals[0]["problem"])
+    assert load_settings().llm.primary == "gemini:fast"
+
+
+async def test_walking_away_from_the_probe_s_verdict_writes_nothing(
+    config_home: Path,
+    vault: MemoryKeyring,
+    monkeypatch: pytest.MonkeyPatch,
+    verdicts: sqlite3.Connection,
+) -> None:
+    """Every model the key reaches only talks; the user gives up at the
+    second question. Nothing is stored - not the key, not the settings,
+    not the failed verdict."""
+    monkeypatch.setattr(FakeProvider, "tool_callers", set())
+    prompter = complete_run(model=["fast", None])
+
+    exit_code = await run_setup(prompter, catalog=fake_catalog(), database=verdicts)
+
+    assert exit_code != 0
+    assert vault.vault == {}
+    assert not config_path().exists()
+    assert verdicts.execute("SELECT COUNT(*) FROM settings").fetchone()[0] == 0
+
+
+def test_the_failed_verdict_has_the_reason_of_section_3_2() -> None:
+    """What the probe writes down is what `assistant run` will read a week
+    later; the word is the one the design names."""
+    assert ProbeResult(ok=False, reason=NO_TOOL_CALL).reason == "no_tool_call_emitted"
 
 
 # --------------------------------------------------------------------------

@@ -134,6 +134,26 @@ def test_the_speech_model_is_loading_before_it_can_say_anything_else(screen: Scr
     assert TEXT["loading_speech"] in str(screen)
 
 
+def test_the_model_is_being_checked_before_anything_else_loads(screen: Screen) -> None:
+    """The probe of 2.6 takes a second or two on the network; the user is
+    told what the wait is."""
+    with line(screen) as status:
+        status.checking_model()
+
+    assert TEXT["checking_model"] in str(screen)
+
+
+def test_a_notice_stays_on_screen_when_the_state_moves_on(screen: Screen) -> None:
+    """The line is overwritten; a notice is not. It is for the one thing the
+    user should read once - that the model failed the probe."""
+    with line(screen) as status:
+        status.notice("The model does not call tools.")
+        status.state(State.LISTENING)
+        status.state(State.IDLE)
+
+    assert "The model does not call tools." in str(screen)
+
+
 def test_the_hotkey_is_spelled_the_way_a_keyboard_is() -> None:
     """`pynput` writes it for a parser; the user reads it off their keyboard."""
     assert spell(DEFAULT_HOTKEY) == "Ctrl+Alt+Space"

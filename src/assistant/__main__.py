@@ -53,9 +53,9 @@ if TYPE_CHECKING:
     from assistant.agent.core import Confirm, Dispatch
     from assistant.agent.limits import Limits
     from assistant.app import Turn
-    from assistant.llm.base import ToolCall
+    from assistant.llm.base import LLMProvider, ToolCall
     from assistant.locales import Locale
-    from assistant.store.repos import AuditRepo, ModelUsage
+    from assistant.store.repos import AuditRepo, ModelUsage, SettingsRepo
     from assistant.tools.registry import ToolRegistry
     from assistant.ui.status import StatusLine
 
@@ -71,6 +71,13 @@ TEXT: dict[str, str] = {
     "not_set_up": "Nothing is set up yet. Run 'assistant setup' first.",
     "cannot_start": "The assistant cannot start: {problem}",
     "stopped": "Stopped.",
+    # The probe of 2.6, run again at startup when its verdict is a week
+    # old: a model that fails is warned about and used anyway, because the
+    # user may have chosen it knowing (section 3.2).
+    "model_no_tools": (
+        "The model does not call tools, and most of what the assistant does depends on that. "
+        "Run 'assistant setup' to choose another."
+    ),
     # `assistant cost` (section 6): two small tables, today and this month,
     # one row per model. The amounts are written by the code as `$0.0004` -
     # number formatting is the locale formatter of phase 3, and until then a
@@ -225,7 +232,7 @@ async def _talk(settings: Settings, pack: Locale, *, device: int | str | None = 
     from assistant.audio.vad import Endpoint, SileroVAD
     from assistant.llm.registry import create_provider
     from assistant.store.db import open_database
-    from assistant.store.repos import AuditRepo, UsageRepo
+    from assistant.store.repos import AuditRepo, SettingsRepo, UsageRepo
     from assistant.stt.local_whisper import LocalWhisper
     from assistant.tools.media import media_control
     from assistant.tools.registry import ToolRegistry
@@ -254,6 +261,11 @@ async def _talk(settings: Settings, pack: Locale, *, device: int | str | None = 
         detector = SileroVAD()
 
         with StatusLine(pack) as screen:
+            # Setup's verdict on the model, refreshed when it is a week old
+            # (section 3.2, 2.6). Before the speech model: one request on
+            # the network, and worth knowing about before two seconds of
+            # loading are spent.
+            await _model_checked(provider, settings, SettingsRepo(database), pack, screen)
             screen.starting()
             # The apps this machine can open, read once: a few seconds of
             # files and a PowerShell process, on a thread (2.2). Before the
@@ -314,6 +326,52 @@ async def _talk(settings: Settings, pack: Locale, *, device: int | str | None = 
             await assistant.run()
     finally:
         database.close()
+
+
+async def _model_checked(
+    provider: LLMProvider,
+    settings: Settings,
+    verdicts: SettingsRepo,
+    pack: Locale,
+    screen: StatusLine,
+) -> None:
+    """Makes sure there is a verdict on the model that answers, and says so
+    on screen when it is a bad one.
+
+    Setup wrote one; a week later it is asked again here, because the
+    provider may have changed what is behind the name (section 3.2). A model
+    that fails is a warning and not a refusal to start: the user may have
+    chosen it knowing, and it still answers questions. A provider that
+    cannot be asked right now is left to the first turn, which has its own
+    sentences for that (`app.py`) - and the verdict there was is kept.
+    """
+    from loguru import logger
+
+    from assistant.llm import probe
+    from assistant.llm.base import ProviderError
+
+    provider_id, model = settings.llm.provider, settings.llm.model
+    verdict = probe.remembered(verdicts, provider_id, model)
+    if verdict is None:
+        screen.checking_model()
+        try:
+            verdict = await probe.probe_tool_support(
+                provider, model, question=pack.probe_question or probe.QUESTION
+            )
+        except ProviderError as refusal:
+            logger.warning("the model could not be checked at startup: {why}", why=refusal)
+            return
+        probe.remember(verdicts, provider_id, model, verdict)
+        logger.info(
+            "probe {provider}:{model}: ok={ok}, first token {ms} ms",
+            provider=provider_id,
+            model=model,
+            ok=verdict.ok,
+            ms=None if verdict.first_token_ms is None else round(verdict.first_token_ms),
+        )
+
+    if not verdict.ok:
+        screen.notice(pack.say("model_no_tools", TEXT["model_no_tools"]))
 
 
 def _gate(

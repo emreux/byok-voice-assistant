@@ -92,6 +92,13 @@ provider_unreachable = "The provider could not be reached. Check the connection 
 loading_models = "Asking which models the key can reach..."
 no_models = "The key works, but it reaches no model. Check the provider's console."
 model = "Which model should answer?"
+# The tool-use test of design.md 3.2: the chosen model is sent one question
+# with one tool, and is only accepted if it calls the tool. {ms} is how long
+# its first token took; {problem} is the provider's own words.
+probing_tools = "Checking whether the model calls tools..."
+tools_ok = "The model calls tools - first token in {ms} ms."
+tools_failed = "This model does not call tools, and most of what the assistant does depends on that. Choose another model."
+probe_refused = "The model could not be tested: {problem}. Choose another model, or try again."
 saved = "Ready. Settings: {path} - the key itself is in the Windows Credential Manager."
 cancelled = "Setup cancelled. Nothing was changed."
 
@@ -127,6 +134,8 @@ minutes_ago = "{count} minutes"
 hold_to_talk = "Hold {hotkey} to talk, or press {toggle} to keep listening. Ctrl+C stops."
 hands_free = "Listening - just talk. {toggle} stops listening, Ctrl+C stops everything."
 loading_speech = "Loading the speech model..."
+# Shown while the tool-use test of 3.2 is repeated at startup, once a week.
+checking_model = "Checking whether the model calls tools..."
 state_idle = "ready"
 state_listening = "listening"
 state_transcribing = "writing it down"
@@ -142,6 +151,8 @@ not_caught = "(not caught - confidence {confidence})"
 not_set_up = "Nothing is set up yet. Run 'assistant setup' first."
 cannot_start = "The assistant cannot start: {problem}"
 stopped = "Stopped."
+# Said at startup when the tool-use test failed; the assistant runs anyway.
+model_no_tools = "The model does not call tools, and most of what the assistant does depends on that. Run 'assistant setup' to choose another."
 
 # Shown by `assistant cost`: two small tables, today and this month, one row
 # per model. The amounts are written by the code as `$0.0004`.

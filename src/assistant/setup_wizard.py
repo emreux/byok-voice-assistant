@@ -19,6 +19,15 @@ names as the end of the chain. That is also why the tests can script a wizard
 run without repeating a single sentence, and why adding a language changes no
 line of this file.
 
+**A model is not taken at its word (2.6).** Every model can be asked a
+question; not every one can be asked to do something, and the one that
+cannot fails silently, in prose, at two in the morning. So the model the
+user picks is sent one request with one tool before it is accepted
+(`llm/probe.py`, section 3.2), and a model that does not call the tool is
+not taken - the list is offered again. The verdict on the model that was
+taken goes to the `settings` table, which makes this the first thing to
+touch the database on a fresh machine.
+
 Phase 2 adds what the catalogue already has room for: a provider that needs no
 key at all (Ollama) and one that needs a `base_url`. Both are questions about
 a `ProviderEntry` field, so they arrive with the adapter that makes them real.
@@ -26,6 +35,7 @@ a `ProviderEntry` field, so they arrive with the adapter that makes them real.
 
 from __future__ import annotations
 
+import sqlite3
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from typing import Protocol
@@ -44,8 +54,11 @@ from assistant.config import (
     save_settings,
     store_api_key,
 )
+from assistant.llm import probe
 from assistant.llm.base import LLMProvider, ModelInfo, ProviderError
 from assistant.llm.registry import ADAPTERS, ProviderEntry, create_provider, load_catalog
+from assistant.store.db import open_database
+from assistant.store.repos import SettingsRepo
 
 __all__ = ["TEXT", "Option", "Prompter", "TerminalPrompter", "run_setup", "wording"]
 
@@ -106,6 +119,15 @@ TEXT: dict[str, str] = {
     "loading_models": "Asking which models the key can reach...",
     "no_models": "The key works, but it reaches no model. Check the provider's console.",
     "model": "Which model should answer?",
+    "probing_tools": "Checking whether the model calls tools...",
+    "tools_ok": "The model calls tools - first token in {ms} ms.",
+    "tools_failed": (
+        "This model does not call tools, and most of what the assistant does depends on that. "
+        "Choose another model."
+    ),
+    "probe_refused": (
+        "The model could not be tested: {problem}. Choose another model, or try again."
+    ),
     "saved": "Ready. Settings: {path} - the key itself is in the Windows Credential Manager.",
     "cancelled": "Setup cancelled. Nothing was changed.",
 }
@@ -143,16 +165,25 @@ async def run_setup(
     prompter: Prompter,
     *,
     catalog: Mapping[str, ProviderEntry] | None = None,
+    database: sqlite3.Connection | None = None,
 ) -> int:
-    """Asks the questions, then writes the answers. Returns a process exit code."""
+    """Asks the questions, then writes the answers. Returns a process exit code.
+
+    `database` is where the verdict on the model goes; left out, the
+    machine's own is opened for it at the end, and closed again.
+    """
     try:
-        return await _ask(prompter, catalog)
+        return await _ask(prompter, catalog, database)
     except _WalkedAwayError:
         prompter.say("cancelled")
         return _GAVE_UP
 
 
-async def _ask(prompter: Prompter, catalog: Mapping[str, ProviderEntry] | None) -> int:
+async def _ask(
+    prompter: Prompter,
+    catalog: Mapping[str, ProviderEntry] | None,
+    database: sqlite3.Connection | None,
+) -> int:
     entries = load_catalog() if catalog is None else catalog
     buildable = {
         provider_id: entry for provider_id, entry in entries.items() if entry.adapter in ADAPTERS
@@ -176,7 +207,9 @@ async def _ask(prompter: Prompter, catalog: Mapping[str, ProviderEntry] | None) 
     if not models:
         prompter.say("no_models")
         return _GAVE_UP
-    model = _answered(await prompter.choose("model", [_offer(m) for m in models]))
+    model, verdict = await _model_that_calls_tools(
+        prompter, provider, models, question=_probe_question(locale)
+    )
 
     # Everything above could still be abandoned; from here it is written down.
     store_api_key(provider_id, api_key)
@@ -186,6 +219,7 @@ async def _ask(prompter: Prompter, catalog: Mapping[str, ProviderEntry] | None) 
             locale=LocaleSettings(code=locale),
         )
     )
+    _remember(database, provider_id, model, verdict)
     prompter.say("saved", path=path)
     return _OK
 
@@ -243,6 +277,61 @@ async def _working_key(
         # Whatever was in the vault has just been proved useless, so it stops
         # being offered - otherwise Enter would retry the same dead key.
         stored = None
+
+
+async def _model_that_calls_tools(
+    prompter: Prompter, provider: LLMProvider, models: Sequence[ModelInfo], *, question: str
+) -> tuple[str, probe.ProbeResult]:
+    """Offers the models until one is chosen that passes the probe (section 3.2).
+
+    The probe is one request: the question, and the one canonical tool. A
+    model that answers in prose is said to have failed and the list is
+    offered again - it is not stored, not marked "chat only", not taken
+    with a warning, because everything the assistant does from 2.1 on
+    depends on the answer being a call. A provider that refuses the
+    request has said nothing about the model, so that is a different
+    sentence with the provider's own words in it, and the list again.
+    """
+    options = [_offer(m) for m in models]
+
+    while True:
+        model = _answered(await prompter.choose("model", options))
+        prompter.say("probing_tools")
+        try:
+            verdict = await probe.probe_tool_support(provider, model, question=question)
+        except ProviderError as refusal:
+            prompter.say("probe_refused", problem=refusal)
+            continue
+
+        if verdict.ok:
+            prompter.say("tools_ok", ms=_whole(verdict.first_token_ms))
+            return model, verdict
+        prompter.say("tools_failed")
+
+
+def _probe_question(locale: str) -> str:
+    """The question in the language just chosen, or the English beside the
+    code: the chain of section 3.12, for a sentence the model reads."""
+    return locales.load(locale).probe_question or probe.QUESTION
+
+
+def _whole(milliseconds: float | None) -> str:
+    """`812`, for a number that is shown once and not calculated with."""
+    return "?" if milliseconds is None else f"{milliseconds:.0f}"
+
+
+def _remember(
+    database: sqlite3.Connection | None, provider_id: str, model: str, verdict: probe.ProbeResult
+) -> None:
+    """Writes the verdict to `settings`, so that `assistant run` need not ask
+    again for a week. On a fresh machine this is the first thing to touch
+    the database, which is why the wizard opens it - and closes it - here."""
+    connection = open_database() if database is None else database
+    try:
+        probe.remember(SettingsRepo(connection), provider_id, model, verdict)
+    finally:
+        if database is None:
+            connection.close()
 
 
 def _offer(model: ModelInfo) -> Option:

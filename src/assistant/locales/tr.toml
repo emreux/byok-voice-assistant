@@ -55,6 +55,10 @@ provider_unreachable = "Sağlayıcıya ulaşılamadı. Bağlantını kontrol edi
 loading_models = "Anahtarın erişebildiği modeller soruluyor..."
 no_models = "Anahtar çalışıyor ama hiçbir modele erişemiyor. Sağlayıcının konsolunu kontrol et."
 model = "Hangi model cevap versin?"
+probing_tools = "Modelin araç çağırıp çağıramadığı sınanıyor..."
+tools_ok = "Model araç çağırabiliyor — ilk yanıt {ms} ms'de geldi."
+tools_failed = "Bu model araç çağıramıyor; asistanın işlerinin çoğu buna bağlı. Başka bir model seç."
+probe_refused = "Model sınanamadı: {problem}. Başka bir model seç ya da tekrar dene."
 saved = "Hazır. Ayarlar: {path} — anahtarın kendisi Windows Kimlik Bilgisi Yöneticisi'nde."
 cancelled = "Kurulum iptal edildi. Hiçbir şey değiştirilmedi."
 
@@ -84,6 +88,7 @@ minutes_ago = "{count} dakika"
 hold_to_talk = "Konuşmak için {hotkey} basılı tut, ya da {toggle} ile dinlemede kal. Ctrl+C durdurur."
 hands_free = "Dinliyorum - konuşman yeterli. {toggle} dinlemeyi kapatır, Ctrl+C her şeyi."
 loading_speech = "Konuşma modeli yükleniyor..."
+checking_model = "Modelin araç çağırıp çağıramadığı sınanıyor..."
 state_idle = "hazır"
 state_listening = "dinliyor"
 state_transcribing = "yazıya döküyor"
@@ -99,6 +104,7 @@ not_caught = "(anlaşılmadı - güven {confidence})"
 not_set_up = "Henüz kurulum yapılmamış. Önce 'assistant setup' çalıştır."
 cannot_start = "Asistan başlayamıyor: {problem}"
 stopped = "Durduruldu."
+model_no_tools = "Model araç çağıramıyor; asistanın işlerinin çoğu buna bağlı. Başka bir model seçmek için 'assistant setup' çalıştır."
 
 # Shown by `assistant cost` (design.md section 6): two small tables, today
 # and this month, one row per model. Amounts are written by the code, as

@@ -54,6 +54,7 @@ TEXT: dict[str, str] = {
     "hold_to_talk": "Hold {hotkey} to talk, or press {toggle} to keep listening. Ctrl+C stops.",
     "hands_free": "Listening - just talk. {toggle} stops listening, Ctrl+C stops everything.",
     "loading_speech": "Loading the speech model...",
+    "checking_model": "Checking whether the model calls tools...",
     "state_idle": "ready",
     "state_listening": "listening",
     "state_transcribing": "writing it down",
@@ -137,6 +138,20 @@ class StatusLine:
         """Whisper is loading. It takes seconds, and a blank terminal during
         them reads as a program that failed to start."""
         self._show(self._said["loading_speech"], "yellow", hint=False)
+
+    def checking_model(self) -> None:
+        """The probe of 2.6 is asking the model one question: a second or two
+        on the network, before anything else is loaded."""
+        self._show(self._said["checking_model"], "yellow", hint=False)
+
+    def notice(self, message: str) -> None:
+        """Writes `message` above the line, where it stays.
+
+        For the one thing the user should read once and not have overwritten
+        by the next state: that the model failed the probe (2.6). Worded by
+        the caller, because the sentence is the caller's.
+        """
+        self._console.print(Text(message, style="yellow"))
 
     def state(self, state: State) -> None:
         self._show(self._said[label_key(state)], _STYLES.get(state, ""))
