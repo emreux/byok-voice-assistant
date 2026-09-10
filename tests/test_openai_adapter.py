@@ -20,7 +20,7 @@ the bottom that lets the contract suite drive it.
 from __future__ import annotations
 
 import json
-from collections.abc import AsyncIterator, Sequence
+from collections.abc import AsyncGenerator, AsyncIterator, Sequence
 from types import SimpleNamespace
 from typing import Any, Literal
 
@@ -125,6 +125,33 @@ def usage_chunk(prompt: int, output: int, cached: int = 0) -> ChatCompletionChun
     return chunk(usage=counted, with_choice=False)
 
 
+class FakeStream:
+    """What `create(stream=True)` hands back: iterated for its chunks, and
+    closed - as the SDK's `AsyncStream` is - by leaving an `async with`."""
+
+    def __init__(
+        self, chunks: list[ChatCompletionChunk], error: Exception | None, error_after: int
+    ) -> None:
+        self._chunks = chunks
+        self._error = error
+        self._error_after = error_after
+        self.closed = False
+
+    async def __aiter__(self) -> AsyncIterator[ChatCompletionChunk]:
+        for number, piece in enumerate(self._chunks):
+            if self._error is not None and number == self._error_after:
+                raise self._error
+            yield piece
+        if self._error is not None:
+            raise self._error
+
+    async def __aenter__(self) -> FakeStream:
+        return self
+
+    async def __aexit__(self, *_: object) -> None:
+        self.closed = True
+
+
 class FakeCompletions:
     """Stands in for `client.chat.completions`, recording what the adapter sent."""
 
@@ -140,21 +167,16 @@ class FakeCompletions:
         # being refused outright; anything else is a stream that dies part way.
         self.error_after = error_after
         self.sent: dict[str, Any] = {}
+        self.streams: list[FakeStream] = []
 
-    async def create(self, **request: Any) -> AsyncIterator[ChatCompletionChunk]:
+    async def create(self, **request: Any) -> FakeStream:
         self.sent = request
         if self.error is not None and not self.error_after:
             raise self.error
 
-        async def chunks() -> AsyncIterator[ChatCompletionChunk]:
-            for number, piece in enumerate(self.chunks):
-                if self.error is not None and number == self.error_after:
-                    raise self.error
-                yield piece
-            if self.error is not None:
-                raise self.error
-
-        return chunks()
+        stream = FakeStream(self.chunks, self.error, self.error_after)
+        self.streams.append(stream)
+        return stream
 
 
 class FakeModels:
@@ -366,6 +388,43 @@ async def test_the_chunk_that_only_announces_the_role_is_nothing() -> None:
     adapter = adapter_for(FakeCompletions([chunk(role="assistant"), text_chunk("hi")]))
 
     assert [d.text for d in await collect(adapter)] == ["hi"]
+
+
+async def test_the_sdk_s_stream_is_closed_once_it_has_been_read() -> None:
+    """Left to the garbage collector, the connection underneath is closed at
+    the shutdown of the event loop, with a complaint on stderr and a
+    connection held until then (measured 2026-09-10)."""
+    completions = FakeCompletions([text_chunk("hi"), finish_chunk()])
+
+    await collect(adapter_for(completions))
+
+    assert [stream.closed for stream in completions.streams] == [True]
+
+
+async def test_the_sdk_s_stream_is_closed_when_the_reader_walks_away() -> None:
+    """A consumer that stops after the first delta - a turn cancelled by a
+    key press - leaves nothing open either."""
+    completions = FakeCompletions([text_chunk("one"), text_chunk("two"), finish_chunk()])
+    adapter = adapter_for(completions)
+
+    stream = adapter.stream([Message.user("m")], [], model="m")
+    assert isinstance(stream, AsyncGenerator)
+    first = await anext(stream)
+    await stream.aclose()
+
+    assert first.text == "one"
+    assert [stream.closed for stream in completions.streams] == [True]
+
+
+async def test_the_sdk_s_stream_is_closed_when_it_dies_part_way() -> None:
+    completions = FakeCompletions(
+        [text_chunk("Tür")], error=httpx2.ReadError("connection closed"), error_after=1
+    )
+
+    with pytest.raises(ProviderError):
+        await collect(adapter_for(completions))
+
+    assert [stream.closed for stream in completions.streams] == [True]
 
 
 async def test_the_reason_generation_stopped_passes_through_in_the_server_s_word() -> None:

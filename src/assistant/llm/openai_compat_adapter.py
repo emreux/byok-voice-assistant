@@ -27,6 +27,13 @@ other, the assistant's earlier calls go back as `tool_calls` on its own
 message, and a result goes back under the role `tool` with the id of the
 call it answers.
 
+The SDK's stream is closed when this one is done with it, whether it was
+read to the end or abandoned. Left to the garbage collector, the connection
+underneath is closed at the shutdown of the event loop instead, and
+`httpcore2` complains out loud about it (measured 2026-09-10: "generator
+didn't stop after athrow()" on stderr after every run) - and until then the
+connection is held.
+
 An empty key is sent as a placeholder: the SDK refuses to be built without
 one, and a local Ollama has none to give. Refusals arrive as the SDK's own
 exceptions - a 401 or 403 for the key, any other status for the request,
@@ -161,21 +168,24 @@ class OpenAICompatAdapter:
         usage: Usage | None = None
 
         try:
-            async for chunk in chunks:
-                for delta in _text(chunk):
-                    yield delta
-                _gather(chunk, gathering)
+            # `async with` closes the SDK's stream - and the connection under
+            # it - on the way out, however the way out is taken.
+            async with chunks:
+                async for chunk in chunks:
+                    for delta in _text(chunk):
+                        yield delta
+                    _gather(chunk, gathering)
 
-                reason = _finish_reason(chunk)
-                if reason is not None:
-                    finish_reason = reason
-                    # Generation is over, so every call is whole: this is
-                    # the moment they are emitted, and the only one.
-                    for call in _finished(gathering):
-                        yield Delta(tool_call=call)
-                counted = _usage(chunk)
-                if counted is not None:
-                    usage = counted
+                    reason = _finish_reason(chunk)
+                    if reason is not None:
+                        finish_reason = reason
+                        # Generation is over, so every call is whole: this
+                        # is the moment they are emitted, and the only one.
+                        for call in _finished(gathering):
+                            yield Delta(tool_call=call)
+                    counted = _usage(chunk)
+                    if counted is not None:
+                        usage = counted
         except openai.APIError as refusal:
             # Half an answer had already been yielded. The turn is abandoned
             # either way, and `agent/core.py` throws the half away with it.
