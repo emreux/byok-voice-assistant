@@ -9,7 +9,7 @@ then the answer - and the answer is whatever the model says once it stops
 asking. Phase 1 ran this once per turn, with nothing to go round for; phase
 2.1c gave it its `while`.
 
-Four decisions here are worth more than the code that implements them.
+Five decisions here are worth more than the code that implements them.
 
 **A turn is not a message.** The window of section 3.7 keeps the last twelve
 *turns*, where a turn is what the user said plus everything that followed it.
@@ -36,6 +36,17 @@ request instead of living in the history, which keeps it out of reach of the
 window and byte-identical from turn to turn - the one thing prompt caching
 needs (architecture guide section 2).
 
+**The words leave as they arrive** (2.8, architecture guide section 11).
+`stream_reply` hands each piece of text out the moment the provider produced
+it, so that `app.py` has the first sentence spoken while the model is still
+writing the second. What the turn came to as a whole - the text, what it
+cost over every request, how it ended, how many tools ran - is only known
+once the stream is over, and is left in `last_answer` for whoever read it;
+`reply` is that reader, for a caller with no use for the pieces. A tool
+round is announced through `on_tool_round` the moment the loop turns to run
+one: that is when the silence a tool costs begins, and the clock of the
+filler in `app.py` starts on it.
+
 The loop has no exit of its own, so it does not count for itself: the limits
 of section 3.11 live beside this file in `limits.py`, and a `TurnGuard` is
 asked before every call. Beside this file rather than inside an adapter,
@@ -45,13 +56,22 @@ the three would be forgotten (invariant 3).
 
 from __future__ import annotations
 
-from collections.abc import Awaitable, Callable, Sequence
-from dataclasses import dataclass
+from collections.abc import AsyncGenerator, AsyncIterator, Awaitable, Callable, Sequence
+from contextlib import aclosing
+from dataclasses import dataclass, field
 from typing import Protocol
 
 from assistant.agent.limits import Limits, TurnGuard
 from assistant.agent.prompts import SYSTEM_PROMPT
-from assistant.llm.base import LLMProvider, Message, ToolCall, ToolSpec, Usage, was_cut_off
+from assistant.llm.base import (
+    Delta,
+    LLMProvider,
+    Message,
+    ToolCall,
+    ToolSpec,
+    Usage,
+    was_cut_off,
+)
 from assistant.tools.registry import ToolRegistry
 
 __all__ = [
@@ -60,6 +80,7 @@ __all__ = [
     "Answer",
     "Confirm",
     "Dispatch",
+    "OnToolRound",
     "decline",
     "window",
 ]
@@ -79,6 +100,12 @@ Confirm = Callable[[str], Awaitable[bool]]
 async def decline(question: str) -> bool:
     """Nobody to ask means no - never a quiet yes."""
     return False
+
+
+# Told, once per round, that the loop is about to run the model's calls: the
+# moment a turn goes quiet for as long as the tool takes. `app.py` starts the
+# filler's clock on it (2.8); the loop itself reads nothing back.
+OnToolRound = Callable[[], None]
 
 
 class Dispatch(Protocol):
@@ -113,14 +140,18 @@ class Answer:
     tool_calls: int = 0
 
 
-@dataclass(frozen=True, slots=True)
+@dataclass(slots=True)
 class _Reply:
-    """What one request came back with, before the loop decides what to do."""
+    """What one request came back with, once its stream has ended.
 
-    text: str
-    tool_calls: tuple[ToolCall, ...]
-    usage: Usage
-    finish_reason: str | None
+    Filled in by `_ask` as the stream goes by, because the words are handed
+    out on the way and an async generator cannot also hand back a value.
+    """
+
+    text: str = ""
+    tool_calls: tuple[ToolCall, ...] = ()
+    usage: Usage = field(default_factory=Usage)
+    finish_reason: str | None = None
 
 
 class Agent:
@@ -152,6 +183,9 @@ class Agent:
         self._dispatch = dispatch
         self._limits = limits if limits is not None else Limits()
         self._history: list[Message] = []
+        # What the last turn came to, filled in when its stream ends and
+        # `None` while one is running (`stream_reply`).
+        self.last_answer: Answer | None = None
 
     async def reply(self, said: str, *, turn_id: str = "", confirm: Confirm = decline) -> Answer:
         """Answers one thing the user said, running whatever tools it takes,
@@ -160,7 +194,47 @@ class Agent:
         `confirm` is who a tool that wants a yes asks. Left out, the answer
         is no: a tool that needs asking about is a tool that does not run
         until somebody can be asked.
+
+        The pieces of the answer are of no interest here: this is
+        `stream_reply` read to its end, for a caller that wants the whole.
         """
+        async for _ in self.stream_reply(said, turn_id=turn_id, confirm=confirm):
+            pass
+        if self.last_answer is None:
+            # The stream sets it before it ends, so this cannot happen -
+            # and is said rather than typed away, so that a change to the
+            # stream cannot make this hand back the previous turn's answer.
+            raise RuntimeError("the turn ended without an answer")
+        return self.last_answer
+
+    async def stream_reply(
+        self,
+        said: str,
+        *,
+        turn_id: str = "",
+        confirm: Confirm = decline,
+        on_tool_round: OnToolRound | None = None,
+    ) -> AsyncGenerator[str]:
+        """Answers one thing the user said, handing the words out as they come.
+
+        Every piece of text the model produces is yielded the moment it
+        arrives - the words of a tool round too, when it has any: a model
+        that says "let me look" before it looks means them to be heard.
+        Once the stream ends, `last_answer` holds what the turn came to:
+        the whole text, what it cost over every request, how it ended, and
+        how many tools ran. Until then it is `None`, so that a reader who
+        stopped early cannot mistake the previous turn's answer for this
+        one's.
+
+        `on_tool_round` is called each time the loop turns to run the
+        model's calls, before the first of them is dispatched: the moment
+        the silence a tool costs begins (2.8).
+
+        A reader that walks away - the key going down, the turn timing
+        out - closes the provider's stream with it, and nothing is
+        remembered, exactly as for a turn that failed.
+        """
+        self.last_answer = None
         conversation = window([*self._history, Message.user(said)])
         spent = Usage()
         ran = 0
@@ -170,7 +244,13 @@ class Agent:
             # Past the limit the model is offered nothing, so the only thing
             # left for it to do is answer.
             offered = [] if guard.exhausted else self._offered()
-            got = await self._ask(conversation, offered)
+            got = _Reply()
+            # `aclosing`: a reader that leaves this generator leaves `_ask`
+            # too, and with it the provider's stream, rather than letting
+            # the garbage collector find them.
+            async with aclosing(self._ask(conversation, offered, got)) as pieces:
+                async for text in pieces:
+                    yield text
             spent = spent + got.usage
 
             # Nothing asked for, no gate to ask it of, or a call made after
@@ -178,6 +258,8 @@ class Agent:
             if not got.tool_calls or self._dispatch is None or not offered:
                 break
 
+            if on_tool_round is not None:
+                on_tool_round()
             conversation.append(Message.assistant(got.text, got.tool_calls))
             for call in got.tool_calls:
                 # The guard answers first: a call over the limit, or the same
@@ -198,7 +280,7 @@ class Agent:
         # results - is remembered with it, so the model knows what it did.
         if got.text:
             self._history = [*conversation, Message.assistant(got.text)]
-        return Answer(
+        self.last_answer = Answer(
             text=got.text,
             usage=spent,
             finish_reason=got.finish_reason,
@@ -209,40 +291,58 @@ class Agent:
     def _offered(self) -> list[ToolSpec]:
         return [] if self._tools is None else self._tools.specs()
 
-    async def _ask(self, conversation: list[Message], tools: list[ToolSpec]) -> _Reply:
-        """Runs one request to the end and gathers the stream into one reply.
+    async def _ask(
+        self, conversation: list[Message], tools: list[ToolSpec], got: _Reply
+    ) -> AsyncGenerator[str]:
+        """Runs one request, yielding its text as it streams, and leaves the
+        rest of what came back in `got` once the stream has ended.
 
-        The whole reply is waited for before anything is spoken (section 4
-        says so and budgets for it); sentence-by-sentence speech is 2.8, and
-        `tts.base` already has the regrouping it needs. The output token
-        limit of section 3.11 goes to the provider here, which is where an
-        answer can actually be stopped.
+        The output token limit of section 3.11 goes to the provider here,
+        which is where an answer can actually be stopped. The provider's
+        stream is closed however this one ends: an adapter's stream is an
+        async generator holding a connection, and a reader that walked away
+        would otherwise leave the request running until the connection was
+        collected.
         """
         spoken: list[str] = []
         calls: list[ToolCall] = []
-        usage = Usage()
-        finish_reason: str | None = None
-
-        async for delta in self._provider.stream(
+        stream = self._provider.stream(
             [self._system, *conversation],
             tools,
             model=self._model,
             max_tokens=self._limits.output_tokens,
-        ):
-            if delta.text:
-                spoken.append(delta.text)
-            if delta.tool_call is not None:
-                calls.append(delta.tool_call)
-            # Both arrive at most once per stream and each adapter promises it -
-            # a running total added up would bill the request several times over.
-            if delta.usage is not None:
-                usage = delta.usage
-            if delta.finish_reason is not None:
-                finish_reason = delta.finish_reason
-
-        return _Reply(
-            text="".join(spoken), tool_calls=tuple(calls), usage=usage, finish_reason=finish_reason
         )
+        try:
+            async for delta in stream:
+                if delta.text:
+                    spoken.append(delta.text)
+                    yield delta.text
+                if delta.tool_call is not None:
+                    calls.append(delta.tool_call)
+                # Both arrive at most once per stream and each adapter promises
+                # it - a running total added up would bill the request several
+                # times over.
+                if delta.usage is not None:
+                    got.usage = delta.usage
+                if delta.finish_reason is not None:
+                    got.finish_reason = delta.finish_reason
+        finally:
+            await _close(stream)
+
+        got.text = "".join(spoken)
+        got.tool_calls = tuple(calls)
+
+
+async def _close(stream: AsyncIterator[Delta]) -> None:
+    """Closes a provider's stream, when it is the kind that can be closed.
+
+    The protocol promises an iterator and every adapter hands back an async
+    generator; closing it is what ends the request underneath. An iterator
+    with nothing to close is left alone.
+    """
+    aclose = getattr(stream, "aclose", None)
+    if aclose is not None:
+        await aclose()
 
 
 def window(conversation: Sequence[Message], *, turns: int = WINDOW_TURNS) -> list[Message]:

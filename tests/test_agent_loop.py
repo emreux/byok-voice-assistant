@@ -28,6 +28,12 @@ whole, so a dropped connection, the sixty second `THINKING` timeout of section
 through `Limits` and are kept by a guard the loop asks before every call;
 what the guard decides is `test_limits.py`'s, what the loop does with the
 decision is here.
+
+**The words leave as they arrive** (2.8). `stream_reply` yields each piece
+of text the moment the provider produced it, announces a tool round the
+moment the loop turns to run one, and leaves the whole answer behind only
+once the stream has ended; a reader that walks away closes the provider's
+stream with it. `reply` is that stream read to its end.
 """
 
 from __future__ import annotations
@@ -38,11 +44,12 @@ import inspect
 from collections.abc import AsyncIterator, Callable, Sequence
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 
 import pytest
 
 from assistant.agent import prompts
-from assistant.agent.core import WINDOW_TURNS, Agent, Confirm, decline, window
+from assistant.agent.core import WINDOW_TURNS, Agent, Answer, Confirm, decline, window
 from assistant.agent.limits import DUPLICATE_CALL, TOOL_LIMIT_REACHED, Limits
 from assistant.agent.prompts import (
     BREVITY,
@@ -90,6 +97,10 @@ class ScriptedProvider:
     def __init__(self, *turns: Sequence[Step]) -> None:
         self._turns = list(turns)
         self.calls: list[Request] = []
+        # How many of its streams are still open: entered and neither
+        # exhausted nor closed. A reader that walked away and left one is
+        # a request still running.
+        self.open_streams = 0
 
     async def validate_credentials(self) -> bool:
         return True
@@ -111,15 +122,19 @@ class ScriptedProvider:
         )
         turn = self._turns.pop(0) if self._turns else [Delta(text="Tamam.")]
 
-        for item in turn:
-            if isinstance(item, BaseException):
-                raise item
-            if isinstance(item, int | float):
-                await asyncio.sleep(item)
-            elif callable(item):
-                item()
-            else:
-                yield item
+        self.open_streams += 1
+        try:
+            for item in turn:
+                if isinstance(item, BaseException):
+                    raise item
+                if isinstance(item, int | float):
+                    await asyncio.sleep(item)
+                elif callable(item):
+                    item()
+                else:
+                    yield item
+        finally:
+            self.open_streams -= 1
 
 
 def answers(count: int) -> list[list[Delta]]:
@@ -747,3 +762,137 @@ async def test_the_calls_the_gate_ran_are_counted_for_the_log() -> None:
     answer = await with_tools(provider, gate).reply("dön dur")
 
     assert answer.tool_calls == 2
+
+
+# --------------------------------------------------------------------------
+# The words as they come (2.8): the stream, and what is known when it ends
+# --------------------------------------------------------------------------
+
+
+async def streamed(agent: Agent, said: str, **rest: Any) -> list[str]:
+    """Every piece the stream handed out, in order."""
+    return [piece async for piece in agent.stream_reply(said, **rest)]
+
+
+async def test_the_words_come_out_piece_by_piece_in_the_order_the_model_wrote_them() -> None:
+    """The point of 2.8: the first sentence is spoken while the model is
+    still writing the second. An empty delta is not a piece."""
+    provider = ScriptedProvider([Delta(text="Saat "), Delta(), Delta(text="üç.")])
+
+    pieces = await streamed(Agent(provider, model=MODEL), "saat kaç?")
+
+    assert pieces == ["Saat ", "üç."]
+
+
+async def test_the_answer_as_a_whole_is_known_once_the_stream_has_ended() -> None:
+    spent = Usage(input_tokens=302, output_tokens=8)
+    provider = ScriptedProvider([Delta(text="Üç."), Delta(usage=spent, finish_reason="STOP")])
+    agent = Agent(provider, model=MODEL)
+
+    await streamed(agent, "saat kaç?")
+
+    assert agent.last_answer == Answer(text="Üç.", usage=spent, finish_reason="STOP")
+
+
+async def test_the_answer_is_not_known_before_the_stream_has_ended() -> None:
+    """A reader that stopped early must not be handed the previous turn's
+    answer and take it for this one's."""
+    provider = ScriptedProvider([Delta(text="Bir.")], [Delta(text="İki."), Delta(text="Üç.")])
+    agent = Agent(provider, model=MODEL)
+    await agent.reply("bir")
+
+    stream = agent.stream_reply("iki")
+    first = await anext(stream)
+    known = agent.last_answer
+    await stream.aclose()
+
+    assert (first, known) == ("İki.", None)
+
+
+async def test_reply_is_the_stream_read_to_its_end() -> None:
+    provider = ScriptedProvider([Delta(text="Mer"), Delta(text="haba.")])
+    agent = Agent(provider, model=MODEL)
+
+    answer = await agent.reply("selam")
+
+    assert answer.text == "Merhaba."
+    assert agent.last_answer == answer
+
+
+async def test_the_words_of_a_tool_round_are_handed_out_too() -> None:
+    """A model that says "let me look" before it looks means it to be
+    heard - and the whole answer still counts the tool it ran."""
+    gate = FakeGate()
+    provider = ScriptedProvider([Delta(text="Bakıyorum."), asks("clock")], [Delta(text="Üç.")])
+    agent = with_tools(provider, gate)
+
+    pieces = await streamed(agent, "saat kaç?")
+
+    assert pieces == ["Bakıyorum.", "Üç."]
+    assert agent.last_answer is not None
+    assert (agent.last_answer.text, agent.last_answer.tool_calls) == ("Üç.", 1)
+
+
+async def test_a_tool_round_is_announced_before_its_first_call_is_run() -> None:
+    """Once per round, and before the gate is asked: the silence the tool
+    costs begins here, and the filler of `app.py` is timed from it."""
+    gate = FakeGate()
+    provider = ScriptedProvider(
+        [asks("clock", "c1"), asks("calendar", "c2")],
+        [asks("clock", "c3", n=3)],
+        [Delta(text="Üç.")],
+    )
+    announced: list[int] = []
+
+    await streamed(
+        with_tools(provider, gate),
+        "saat kaç?",
+        on_tool_round=lambda: announced.append(len(gate.calls)),
+    )
+
+    assert announced == [0, 2]
+
+
+async def test_a_turn_without_a_tool_round_announces_none() -> None:
+    provider = ScriptedProvider([Delta(text="Üç.")])
+    announced: list[int] = []
+
+    await streamed(with_tools(provider), "saat kaç?", on_tool_round=lambda: announced.append(1))
+
+    assert announced == []
+
+
+async def test_a_reader_that_walks_away_leaves_nothing_behind() -> None:
+    """The key went down while the model was writing (`app.py`). The turn
+    did not happen, exactly as a turn that failed did not."""
+    provider = ScriptedProvider([Delta(text="Uzun "), Delta(text="cevap")], [Delta(text="Selam.")])
+    agent = Agent(provider, model=MODEL)
+
+    stream = agent.stream_reply("anlat")
+    await anext(stream)
+    await stream.aclose()
+    await agent.reply("selam")
+
+    assert provider.calls[-1].turns == [Message.user("selam")]
+
+
+async def test_the_provider_s_stream_is_closed_with_the_reader() -> None:
+    """The adapter's stream holds the connection. Left to the garbage
+    collector, the request would run on after the reader stopped listening
+    - and the reader stops listening exactly when the user is talking."""
+    provider = ScriptedProvider([Delta(text="bir"), Delta(text="iki"), Delta(text="üç")])
+    stream = Agent(provider, model=MODEL).stream_reply("say")
+
+    await anext(stream)
+    while_reading = provider.open_streams
+    await stream.aclose()
+
+    assert (while_reading, provider.open_streams) == (1, 0)
+
+
+async def test_a_stream_read_to_its_end_leaves_no_stream_open_either() -> None:
+    provider = ScriptedProvider([asks("clock")], [Delta(text="Üç.")])
+
+    await streamed(with_tools(provider), "saat kaç?")
+
+    assert provider.open_streams == 0
