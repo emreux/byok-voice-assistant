@@ -11,6 +11,7 @@ into the microphone loudly enough to be taken for a question.
     uv run python scripts/bench_mic.py --quiet    # the room alone
     uv run python scripts/bench_mic.py --echo     # what the speakers put back
     uv run python scripts/bench_mic.py --list-devices   # which microphones there are
+    uv run python scripts/bench_mic.py --fixtures       # the endpoint over the recordings (2.9)
 
 `--all` is the one to run. It walks through the room, one distance, another
 distance and the echo, waits for you between them, loads Whisper once, and
@@ -40,6 +41,17 @@ silent take reported as a pass closes a risk that was never opened.
 you have finished pressing anything: a room measured while somebody is typing
 into it is not a room floor, and the first attempt at this measured one.
 
+**The two numbers of hands-free are measured, not inherited** (`--fixtures`,
+2.9). `SPEECH_THRESHOLD` and `SILENCE_SECONDS` in `audio/vad.py` were
+Silero's defaults, left at that on 2026-08-31 with the note "not measured".
+This mode runs the endpoint over the recorded fixtures of `fixtures/audio/`
+- each of them one sentence - with a grid of thresholds and silence windows,
+and says for each pair how many sentences came out whole, how many were cut
+in two, and how many never came out at all. A second of silence is appended
+to every recording, because a microphone goes on listening after the sentence
+and a file does not. The constants change only when a pair beats them on
+these numbers; otherwise the measurement is the reason they stay.
+
 Nothing is written to disk and no audio leaves the machine.
 """
 
@@ -51,6 +63,7 @@ import sys
 import time
 from collections.abc import AsyncIterator
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import TYPE_CHECKING
 
 import numpy as np
@@ -62,7 +75,13 @@ from assistant.audio.capture import (
     SystemMicrophone,
     device_choice,
 )
-from assistant.audio.vad import FRAME_SAMPLES, SPEECH_THRESHOLD, SileroVAD
+from assistant.audio.vad import (
+    FRAME_SAMPLES,
+    SILENCE_SECONDS,
+    SPEECH_THRESHOLD,
+    Endpoint,
+    SileroVAD,
+)
 from assistant.stt.base import NO_SPEECH_CEILING, SAMPLE_RATE, Audio, Transcript
 
 if TYPE_CHECKING:
@@ -73,6 +92,15 @@ SPOKEN = "Bir, iki, üç. Bu cümle mikrofonun ne duyduğunu ölçmek için okun
 # Long enough for the keyboard to stop and the room to settle, short enough
 # that nobody wonders whether the program has hung.
 SETTLE_SECONDS = 1.0
+
+# The grid `--fixtures` tries: the constants of `audio/vad.py` in the middle
+# of each, one step either way. Section 4 aims at a 350 ms window one day.
+THRESHOLDS = (0.4, 0.5, 0.6)
+SILENCES = (0.4, 0.6, 0.8)
+
+# What is appended to every fixture before the endpoint hears it: the
+# silence a microphone would go on delivering after the sentence.
+TAIL_SECONDS = 1.0
 
 
 @dataclass
@@ -407,6 +435,97 @@ async def _one(said: str) -> AsyncIterator[str]:
     yield said
 
 
+# --------------------------------------------------------------------------
+# The endpoint over the recordings (2.9)
+# --------------------------------------------------------------------------
+
+
+@dataclass
+class Split:
+    """What the endpoint made of one fixture at one setting: the sentences
+    it handed over, as (start, end) seconds within the recording."""
+
+    name: str
+    seconds: float
+    spans: list[tuple[float, float]] = field(default_factory=list)
+
+    @property
+    def whole(self) -> bool:
+        return len(self.spans) == 1
+
+    @property
+    def kept(self) -> float:
+        """How much of the recording came out inside a sentence."""
+        return min(1.0, sum(end - start for start, end in self.spans) / self.seconds)
+
+
+def split(pcm: Audio, *, endpoint: Endpoint, silence: float, name: str) -> Split:
+    """Feeds one recording to the endpoint the way the microphone would -
+    20 ms blocks, then the silence after it - and notes what came out."""
+    from assistant.audio.capture import CHUNK_FRAMES
+
+    endpoint.reset()
+    audio = np.concatenate((pcm, np.zeros(round(TAIL_SECONDS * SAMPLE_RATE), dtype=np.float32)))
+    result = Split(name=name, seconds=len(pcm) / SAMPLE_RATE)
+    fed = 0
+    for start in range(0, len(audio), CHUNK_FRAMES):
+        block = audio[start : start + CHUNK_FRAMES]
+        fed += len(block)
+        for sentence in endpoint.feed(block):
+            # The sentence closed once the silence after it was long enough,
+            # so its end is that long before the block that closed it.
+            end = fed / SAMPLE_RATE - silence
+            result.spans.append((max(0.0, end - len(sentence) / SAMPLE_RATE), end))
+    return result
+
+
+def fixtures_mode(directory: Path) -> int:
+    """The grid over every recording, and where the current pair stands."""
+    from bench_stt import load_fixtures
+
+    fixtures = load_fixtures(directory)
+    if not fixtures:
+        print(f"nothing to measure: no .wav with a .txt beside it in {directory}")
+        return 2
+
+    detector = SileroVAD()
+    print(f"{len(fixtures)} recordings, {TAIL_SECONDS:.0f} s of silence appended to each\n")
+    print(f"{'threshold':>9} {'silence':>8} {'whole':>6} {'split':>6} {'none':>5} {'kept':>6}")
+    current: list[Split] = []
+    for threshold in THRESHOLDS:
+        for silence in SILENCES:
+            endpoint = Endpoint(detector, threshold=threshold, silence_seconds=silence)
+            splits = [
+                split(fixture.pcm, endpoint=endpoint, silence=silence, name=fixture.wav.name)
+                for fixture in fixtures
+            ]
+            whole = sum(1 for one in splits if one.whole)
+            none = sum(1 for one in splits if not one.spans)
+            cut = len(splits) - whole - none
+            kept = sum(one.kept for one in splits) / len(splits)
+            current_pair = (threshold, silence) == (SPEECH_THRESHOLD, SILENCE_SECONDS)
+            marker = "  <- audio/vad.py" if current_pair else ""
+            print(
+                f"{threshold:>9.1f} {silence:>7.1f}s {whole:>6} {cut:>6} {none:>5} "
+                f"{kept:>6.0%}{marker}"
+            )
+            if marker:
+                current = splits
+
+    print(f"\nAt the current pair ({SPEECH_THRESHOLD}, {SILENCE_SECONDS} s), sentence by sentence:")
+    for one in current:
+        spans = ", ".join(f"{start:.2f}-{end:.2f} s" for start, end in one.spans)
+        spans = spans or "nothing came out"
+        print(f"  {one.name:<22} {one.seconds:>4.1f} s  ->  {spans}")
+
+    print(
+        "\nA pair is better than the current one only if it turns more recordings into"
+        " exactly one sentence, and no fewer into none. The silence window is also the"
+        " wait after every sentence (section 4): shorter is felt, longer is safe."
+    )
+    return 0
+
+
 def main() -> int:
     # The transcript below is in whatever language was spoken, and Windows
     # hands a redirected stream its legacy code page - which has no `ğ` in it.
@@ -438,7 +557,23 @@ def main() -> int:
     parser.add_argument(
         "--no-read", action="store_true", help="Skip the transcript, and measure levels only."
     )
+    parser.add_argument(
+        "--fixtures",
+        nargs="?",
+        const="",
+        default=None,
+        metavar="DIR",
+        help=(
+            "Run the endpoint over the recorded fixtures with a grid of thresholds and "
+            "silence windows (2.9); DIR defaults to fixtures/audio."
+        ),
+    )
     args = parser.parse_args()
+
+    if args.fixtures is not None:
+        from bench_stt import FIXTURES
+
+        return fixtures_mode(Path(args.fixtures) if args.fixtures else FIXTURES)
 
     if args.list_devices:
         import sounddevice  # type: ignore[import-untyped]
