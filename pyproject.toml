@@ -1,6 +1,6 @@
 [project]
 name = "assistant"
-version = "0.1.0"                       # phase 1: the voice loop (design.md section 8)
+version = "0.2.0"                       # phase 2: tools, the gate, memory, streaming speech (design.md section 8)
 description = "A Windows desktop voice assistant that runs on your own API key, model and language."
 readme = "README.md"
 license = { file = "LICENSE" }
