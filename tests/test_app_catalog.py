@@ -27,6 +27,7 @@ from assistant.tools.system import (
     AppEntry,
     scan_start_apps,
     scan_start_menu,
+    spoken_form,
     start_menu_folders,
 )
 
@@ -173,16 +174,137 @@ def test_nothing_near_means_no_suggestion(catalog: AppCatalog) -> None:
     assert catalog.closest("zzzz") == []
 
 
-def test_the_vocabulary_is_the_shortest_names_first(catalog: AppCatalog) -> None:
-    """A short name is one people say; the prompt has room for few. Equal
-    lengths keep the catalogue's order."""
-    assert catalog.vocabulary(limit=4) == ["IŞIK", "Spotify", "Notepad", "Google Chrome"]
+@pytest.mark.parametrize(
+    ("listed", "spoken"),
+    [
+        ("PyCharm 2026.2.1", "PyCharm"),
+        ("Python 3.13 (64-bit)", "Python"),
+        ("Outlook (classic)", "Outlook"),
+        ("IDLE (Python 3.13 64-bit)", "IDLE"),
+        ("Word 2016", "Word"),
+        ("Paint 3D", "Paint 3D"),
+        ("7-Zip", "7-Zip"),
+        ("Google Chrome", "Google Chrome"),
+        ("(x)", "(x)"),
+    ],
+)
+def test_the_spoken_form_drops_what_nobody_says(listed: str, spoken: str) -> None:
+    """A version, a year, a parenthesised tail: on the shortcut, never in the
+    mouth. A number that is part of the name stays, and a name that would
+    vanish entirely is kept as it is."""
+    assert spoken_form(listed) == spoken
+    assert AppEntry(listed, r"C:\x.lnk").spoken == spoken
 
 
-def test_the_vocabulary_stops_at_what_the_prompt_can_hold() -> None:
+def test_the_spoken_names_put_products_before_system_shortcuts() -> None:
+    """Capitalised names first - `dfrgui`, `services`, `computer` are what
+    the machine calls its utilities - then the shorter first, each spoken
+    form once, and no more than asked for."""
+    catalog = AppCatalog(
+        [
+            AppEntry("dfrgui", r"C:\dfrgui.lnk"),
+            AppEntry("Outlook (classic)", r"C:\Outlook (classic).lnk"),
+            AppEntry("PyCharm 2026.2.1", r"C:\PyCharm.lnk"),
+            AppEntry("Outlook", r"C:\Outlook.lnk"),
+            AppEntry("Run", r"C:\Run.lnk"),
+            AppEntry("FortiClient VPN", r"C:\FortiClient VPN.lnk"),
+        ]
+    )
+
+    assert catalog.spoken_names() == ["Run", "Outlook", "PyCharm", "FortiClient VPN", "dfrgui"]
+    assert catalog.spoken_names(limit=2) == ["Run", "Outlook"]
+
+
+def test_the_names_the_user_has_asked_for_come_first_as_the_catalogue_knows_them() -> None:
+    """The audit log's names are what the user said - "pay charm", "Teams" -
+    and they are resolved to the apps they opened; what resolves to nothing
+    is skipped, and nothing is offered twice."""
+    catalog = AppCatalog(
+        [
+            AppEntry("Run", r"C:\\Run.lnk"),
+            AppEntry("PyCharm 2026.2.1", r"C:\\PyCharm.lnk"),
+            AppEntry("Microsoft Teams", r"C:\\Teams.lnk"),
+            AppEntry("Google Chrome", r"C:\\Chrome.lnk"),
+        ]
+    )
+
+    offered = catalog.spoken_names(first=["Teams", "zzzz", "pay charm", "teams"])
+
+    assert offered == ["Microsoft Teams", "PyCharm", "Run", "Google Chrome"]
+    assert catalog.spoken_names(limit=1, first=["chrome"]) == ["Google Chrome"]
+
+
+def test_the_offer_is_larger_than_before_and_the_recogniser_fits_it() -> None:
+    """The count is an offer; what fits is measured in tokens where the
+    tokenizer is (`stt/local_whisper.py`)."""
     many = AppCatalog([AppEntry(f"App {n}", f"C:\\{n}.lnk") for n in range(PROMPT_NAMES * 3)])
 
-    assert len(many.vocabulary()) == PROMPT_NAMES
+    assert PROMPT_NAMES == 120
+    assert len(many.spoken_names()) == PROMPT_NAMES
+
+
+# --------------------------------------------------------------------------
+# What the user said, several words of it (2026-09-13)
+# --------------------------------------------------------------------------
+
+
+def test_two_words_are_not_claimed_by_one_generic_word_of_another_app() -> None:
+    """Measured 2026-09-13: "Text Editor" opened the Registry Editor because
+    the word "editor" alone is seven tenths of the phrase. A phrase is
+    matched against whole names; the model gets the near ones to ask about."""
+    catalog = AppCatalog(
+        [
+            AppEntry("Registry Editor", r"C:\regedit.lnk"),
+            AppEntry("Virtual Network Editor", r"C:\vmnet.lnk"),
+            AppEntry("Notepad", r"C:\Notepad.lnk"),
+        ]
+    )
+
+    assert catalog.find("Text Editor") is None
+    assert catalog.closest("Text Editor")[0] == "Registry Editor"
+
+
+@pytest.mark.parametrize(
+    ("spoken", "name"),
+    [
+        ("Pay Charm", "PyCharm 2026.2.1"),
+        ("Pay Charmage", "PyCharm 2026.2.1"),
+        ("Porti Client", "FortiClient VPN"),
+        ("Porti Client VPN", "FortiClient VPN"),
+        ("PyCharm 2026.2.1", "PyCharm 2026.2.1"),
+        ("pycharm", "PyCharm 2026.2.1"),
+        ("Tamsi", "Microsoft Teams"),
+    ],
+)
+def test_a_misheard_product_name_still_reaches_the_product(spoken: str, name: str) -> None:
+    """What the recogniser makes of a foreign name (2026-09-13's transcripts)
+    is matched against the name as people say it - no version - and the
+    long listed name is still found when it is said in full."""
+    catalog = AppCatalog(
+        [
+            AppEntry("PyCharm 2026.2.1", r"C:\PyCharm.lnk"),
+            AppEntry("FortiClient VPN", r"C:\FortiClient.lnk"),
+            AppEntry("Microsoft Teams", r"C:\Teams.lnk"),
+            AppEntry("Registry Editor", r"C:\regedit.lnk"),
+        ]
+    )
+
+    assert name_of(catalog.find(spoken)) == name
+
+
+def test_an_exact_listed_name_beats_the_spoken_alias_of_another() -> None:
+    """ "Outlook (classic)" is said "Outlook" too, and it is listed first; the
+    app actually called Outlook still wins its own name."""
+    catalog = AppCatalog(
+        [
+            AppEntry("Outlook (classic)", r"C:\Outlook (classic).lnk"),
+            AppEntry("Outlook", r"C:\Outlook.lnk"),
+        ]
+    )
+
+    assert len(catalog) == 2
+    assert name_of(catalog.find("outlook")) == "Outlook"
+    assert name_of(catalog.find("outlook classic")) == "Outlook (classic)"
 
 
 # --------------------------------------------------------------------------
@@ -354,3 +476,33 @@ async def test_loading_runs_every_scanner_in_order_and_off_the_event_loop() -> N
     assert catalog.names() == ["Spotify", "Hesap Makinesi"]
     assert len(threads) == 2
     assert threading.main_thread() not in threads
+
+
+async def test_refreshing_reads_the_machine_again_off_the_event_loop() -> None:
+    """An install ended (`tools/store.py`): the same scanners run again and
+    the catalogue the tools hold sees the new app."""
+    scans = 0
+    threads: list[threading.Thread] = []
+
+    def scanner() -> list[AppEntry]:
+        nonlocal scans
+        scans += 1
+        threads.append(threading.current_thread())
+        return INSTALLED[:1] if scans == 1 else INSTALLED[:2]
+
+    catalog = await AppCatalog.load(scanners=[scanner])
+    assert catalog.find("chrome") is None
+
+    await catalog.refresh()
+
+    assert (len(catalog), scans) == (2, 2)
+    assert name_of(catalog.find("chrome")) == "Google Chrome"
+    assert threading.main_thread() not in threads
+
+
+async def test_a_catalogue_built_by_hand_has_nothing_to_refresh_from() -> None:
+    catalog = AppCatalog(INSTALLED)
+
+    await catalog.refresh()
+
+    assert len(catalog) == 6

@@ -30,7 +30,14 @@ import numpy as np
 import pytest
 
 from assistant.stt.base import SAMPLE_RATE, Audio, STTProvider, Transcript, buffered_stream
-from assistant.stt.local_whisper import LocalWhisper, ModelUnavailableError
+from assistant.stt.local_whisper import (
+    COMPRESSION_CEILING,
+    PROMPT_TOKENS,
+    TOKENS_AT_LEAST,
+    TOKENS_PER_SECOND,
+    LocalWhisper,
+    ModelUnavailableError,
+)
 
 
 @dataclass
@@ -41,6 +48,27 @@ class FakeSegment:
     avg_logprob: float = -0.1
     tokens: list[int] = field(default_factory=lambda: [0, 1, 2])
     no_speech_prob: float = 0.05
+    # gzip's ratio on the text: about 1.3 for a sentence, well over 2.4 for
+    # "MAĞĞĞĞĞ..." - the library's own sign of a decoder going round in circles.
+    compression_ratio: float = 1.3
+
+
+class FakeEncoding:
+    def __init__(self, ids: list[int]) -> None:
+        self.ids = ids
+
+
+class FakeTokenizer:
+    """Counts words: what the real tokenizer does, coarsely, and enough to
+    see the budget being kept."""
+
+    def __init__(self) -> None:
+        self.encoded: list[str] = []
+
+    def encode(self, text: str, add_special_tokens: bool = True) -> FakeEncoding:
+        assert add_special_tokens is False
+        self.encoded.append(text)
+        return FakeEncoding(list(range(len(text.split()))))
 
 
 @dataclass
@@ -83,6 +111,7 @@ class FakeModel:
         # produces for speech and for silence respectively.
         self.kept_seconds = (1.0 if self.heard else 0.0) if kept_seconds is None else kept_seconds
         self.calls: list[tuple[Audio, dict[str, Any]]] = []
+        self.hf_tokenizer = FakeTokenizer()
 
     def transcribe(self, audio: Audio, **options: Any) -> tuple[Iterator[FakeSegment], FakeInfo]:
         self.calls.append((audio, options))
@@ -465,13 +494,14 @@ def test_the_local_model_is_an_stt_provider() -> None:
 
 
 # --------------------------------------------------------------------------
-# The vocabulary (2.2)
+# The prompt (2.2; a sentence, fitted by tokens, 2026-09-13)
 # --------------------------------------------------------------------------
 
 
 async def test_the_vocabulary_reaches_the_model_as_one_prompt() -> None:
     """Section 3.4's free trick: the names the decoder is told to expect,
-    joined into the one string the library takes. Blank terms are dropped."""
+    joined into the one string the library takes when the pack gives no
+    sentence to put them in. Blank terms are dropped."""
     model = FakeModel()
     stt = LocalWhisper(build=lambda: model, vocabulary=["aç, ayarlar", "Spotify", "  ", "Chrome"])
 
@@ -487,3 +517,126 @@ async def test_without_a_vocabulary_the_model_is_given_no_prompt() -> None:
     await stt.transcribe(silence())
 
     assert model.calls[0][1]["initial_prompt"] is None
+
+
+async def test_the_pack_s_sentence_carries_the_names_where_apps_is() -> None:
+    """A sentence in the user's language reads to the decoder as speech in
+    that language; a comma list does not (measured 2026-09-13, weakly)."""
+    model = FakeModel()
+    stt = LocalWhisper(
+        build=lambda: model,
+        vocabulary=["PyCharm", "Chrome"],
+        prompt="Bilgisayarımdaki uygulamalar: {apps}. Uygulamayı aç.",
+    )
+
+    await stt.transcribe(silence())
+
+    assert (
+        model.calls[0][1]["initial_prompt"]
+        == "Bilgisayarımdaki uygulamalar: PyCharm, Chrome. Uygulamayı aç."
+    )
+
+
+async def test_the_names_stop_where_the_window_ends_and_the_sentence_survives() -> None:
+    """The library keeps the *last* 223 tokens of a long prompt, which would
+    cut the sentence's own words off the front. So the fit is ours: names
+    are added in the offered order while the whole stays under the budget."""
+    model = FakeModel()
+    names = [f"App{n}" for n in range(PROMPT_TOKENS * 2)]
+    stt = LocalWhisper(build=lambda: model, vocabulary=names, prompt="Apps: {apps}. Open it.")
+
+    await stt.transcribe(silence())
+
+    prompt = model.calls[0][1]["initial_prompt"]
+    assert prompt.startswith("Apps: App0, App1,")
+    assert prompt.endswith(". Open it.")
+    assert len(prompt.split()) <= PROMPT_TOKENS
+    assert len(prompt.split()) >= PROMPT_TOKENS - 2
+    assert "App199" not in prompt
+    # Measured 2026-09-13 on the target CPU: about 0.65 s per hundred tokens
+    # of prompt (no prompt 2.25 s, 87 tokens 3.02 s, 198 tokens 3.55 s).
+    assert PROMPT_TOKENS == 120
+
+
+async def test_the_prompt_is_fitted_once_when_the_model_loads() -> None:
+    model = FakeModel()
+    stt = LocalWhisper(build=lambda: model, vocabulary=["A", "B"], prompt="Apps: {apps}.")
+
+    await stt.load()
+    encoded = len(model.hf_tokenizer.encoded)
+    await stt.transcribe(silence())
+    await stt.transcribe(silence())
+
+    assert encoded > 0
+    assert len(model.hf_tokenizer.encoded) == encoded
+
+
+async def test_a_sentence_without_the_placeholder_is_used_as_it_is() -> None:
+    """A pack that forgot `{apps}` still gets its sentence; the names go
+    after it, so neither is lost."""
+    model = FakeModel()
+    stt = LocalWhisper(build=lambda: model, vocabulary=["Chrome"], prompt="Open the app.")
+
+    await stt.transcribe(silence())
+
+    assert model.calls[0][1]["initial_prompt"] == "Open the app. Chrome"
+
+
+# --------------------------------------------------------------------------
+# One decode, so many tokens, and a loop is not words (2026-09-13)
+# --------------------------------------------------------------------------
+
+
+async def test_the_decoder_is_run_once_at_temperature_zero() -> None:
+    """Measured 2026-09-13 (`small`, Tolga's voice): the fallback ladder
+    decoded "PyCharm'ı aç" six times over 25-32 s and was still wrong; the
+    single decode is the same answer in 3 s."""
+    stt, model = whisper()
+
+    await stt.transcribe(silence())
+
+    assert model.calls[0][1]["temperature"] == 0.0
+
+
+async def test_the_decoder_may_write_only_as_much_as_the_audio_could_hold() -> None:
+    """A two-second command is not 448 tokens. `max_new_tokens` is what turns
+    a decoder going round in circles (13.7 s) into a short bad guess (4.8 s)
+    - which the next test then throws away."""
+    stt, model = whisper()
+
+    await stt.transcribe(silence(2.0))
+    await stt.transcribe(silence(0.0))
+
+    assert model.calls[0][1]["max_new_tokens"] == TOKENS_AT_LEAST + 2 * TOKENS_PER_SECOND
+    assert model.calls[1][1]["max_new_tokens"] == TOKENS_AT_LEAST
+    assert (TOKENS_AT_LEAST, TOKENS_PER_SECOND) == (24, 10)
+
+
+async def test_a_segment_that_goes_round_in_circles_is_not_words() -> None:
+    """ "TÜCHAR MAĞĞĞĞĞĞĞ..." has a compression ratio of four; it is dropped
+    like a hallucination, and what is left is speech nobody could read -
+    which `app.hear` answers with "say it again", not by asking the model."""
+    stt, _ = whisper(
+        segments=(
+            FakeSegment(" TÜCHAR MAĞĞĞĞĞĞĞĞĞĞĞĞĞĞĞĞĞ", compression_ratio=4.1, no_speech_prob=0.02),
+        )
+    )
+
+    transcript = await stt.transcribe(silence())
+
+    assert transcript.text == ""
+    assert transcript.no_speech_probability == pytest.approx(0.02)
+    assert COMPRESSION_CEILING == 2.4
+
+
+async def test_a_sentence_beside_a_loop_is_still_heard() -> None:
+    stt, _ = whisper(
+        segments=(
+            FakeSegment(" Saat kaç?", compression_ratio=1.1),
+            FakeSegment(" ĞĞĞĞĞĞĞĞĞĞĞĞĞĞ", compression_ratio=3.0),
+        )
+    )
+
+    transcript = await stt.transcribe(silence())
+
+    assert transcript.text == "Saat kaç?"

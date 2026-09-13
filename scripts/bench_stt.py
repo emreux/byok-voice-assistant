@@ -9,10 +9,12 @@ brought forward in phase 3.
     uv run python scripts/bench_stt.py --sizes small base   # some of them
     uv run python scripts/bench_stt.py --fixtures some/dir  # recordings elsewhere
     uv run python scripts/bench_stt.py --language en
+    uv run python scripts/bench_stt.py --sizes small --no-prompt   # what the prompt is worth
 
 Every `.wav` in `fixtures/audio/` that has a `.txt` beside it saying what was
 said is transcribed the way the assistant transcribes - `LocalWhisper`, int8,
-four threads, the pack's vocabulary hint - and what came back is scored
+four threads, the pack's sentence with this machine's app names in it, the
+same fit `assistant run` makes - and what came back is scored
 against the text with `jiwer`. Both sides are folded the same way first:
 case, accents and punctuation off, the way search folds (`store/normalize.py`),
 so that "Fatura." and "fatura" are one word and the rate measures hearing
@@ -47,6 +49,7 @@ from assistant.config import is_configured, load_settings
 from assistant.store.normalize import normalize_search
 from assistant.stt.base import SAMPLE_RATE, Audio
 from assistant.stt.local_whisper import LocalWhisper
+from assistant.tools.system import AppCatalog
 
 FIXTURES = Path(__file__).resolve().parents[1] / "fixtures" / "audio"
 SIZES = ("tiny", "base", "small", "medium")
@@ -142,16 +145,18 @@ def read_wav(path: Path) -> Audio:
 
 
 def stt_language() -> tuple[str, str]:
-    """The language to expect and the words to expect, from the pack the
-    assistant would use - the same chain `assistant run` follows."""
+    """The language to expect and the sentence to expect it in, from the
+    pack the assistant would use - the same chain `assistant run` follows."""
     settings = load_settings()
     code = settings.locale.code if is_configured() else locales.system_code()
     pack = locales.load(code)
-    return pack.stt_language, pack.stt_vocabulary
+    return pack.stt_language, pack.stt_prompt
 
 
-async def measure(size: str, fixtures: list[Fixture], *, language: str, hint: str) -> Result:
-    speech = LocalWhisper(model_size=size, vocabulary=[hint])
+async def measure(
+    size: str, fixtures: list[Fixture], *, language: str, prompt: str, names: list[str]
+) -> Result:
+    speech = LocalWhisper(model_size=size, vocabulary=names, prompt=prompt)
     started = time.perf_counter()
     await speech.load()
     result = Result(size=size, load_seconds=time.perf_counter() - started)
@@ -211,11 +216,21 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--sizes", nargs="+", default=list(SIZES), help="which model sizes")
     parser.add_argument("--fixtures", type=Path, default=FIXTURES, help="where the .wav files are")
     parser.add_argument("--language", default=None, help="ISO 639-1; default: the pack's")
+    parser.add_argument(
+        "--no-prompt",
+        action="store_true",
+        help="give the recogniser no prompt at all, to measure what the prompt is worth",
+    )
     args = parser.parse_args(argv)
 
-    language, hint = stt_language()
+    language, prompt = stt_language()
     if args.language:
         language = args.language
+    # This machine's apps, as the assistant would tell the recogniser about
+    # them - a few seconds of PowerShell, once.
+    names = [] if args.no_prompt else asyncio.run(AppCatalog.load()).spoken_names()
+    if args.no_prompt:
+        prompt = ""
 
     fixtures = load_fixtures(args.fixtures)
     if not fixtures:
@@ -223,9 +238,10 @@ def main(argv: list[str] | None = None) -> int:
         print("record some with scripts/bench_mic.py - see fixtures/audio/README.md")
         return 2
 
-    print(f"language {language!r}, vocabulary hint {hint!r}")
+    print(f"language {language!r}, prompt {prompt!r} with {len(names)} names offered")
     results = [
-        asyncio.run(measure(size, fixtures, language=language, hint=hint)) for size in args.sizes
+        asyncio.run(measure(size, fixtures, language=language, prompt=prompt, names=names))
+        for size in args.sizes
     ]
     report(results, fixtures)
     return 0

@@ -1,8 +1,8 @@
 """The machine's own tools: the time, an app, a site, a settings page (2.1c, 2.2).
 
-Nothing here opens anything. `_launch` and `_browse` are the two places the
-shell is reached, and each test replaces them and looks at what would have
-been opened - which is also how it is known that opening happens off the
+Nothing here opens anything. `shell.launch` and `shell.browse` are the two
+places Windows is reached, and each test replaces them and looks at what would
+have been opened - which is also how it is known that opening happens off the
 event loop. The time tool has its clock pinned the same way.
 """
 
@@ -14,8 +14,10 @@ from datetime import UTC, datetime, timedelta, timezone
 
 import pytest
 
+from assistant import shell
 from assistant.tools import system
 from assistant.tools.registry import Tool
+from assistant.tools.store import Install, Listing
 from assistant.tools.system import (
     SETTINGS_PAGES,
     AppCatalog,
@@ -50,8 +52,8 @@ class Opened:
 @pytest.fixture
 def opened(monkeypatch: pytest.MonkeyPatch) -> Opened:
     seen = Opened()
-    monkeypatch.setattr(system, "_launch", seen.launch)
-    monkeypatch.setattr(system, "_browse", seen.browse)
+    monkeypatch.setattr(shell, "launch", seen.launch)
+    monkeypatch.setattr(shell, "browse", seen.browse)
     return seen
 
 
@@ -155,6 +157,149 @@ async def test_an_app_nothing_is_near_is_reported_alone(open_app: Tool, opened: 
 
     assert opened.targets == []
     assert said == "No app called 'zzzz'."
+
+
+# --------------------------------------------------------------------------
+# open_app looks in the Store (2026-09-13)
+# --------------------------------------------------------------------------
+
+
+class FakeStore:
+    """The Store as `open_app` sees it: available or not, one canned answer,
+    and whether an install ended since."""
+
+    def __init__(
+        self, *, listing: Listing | None = None, available: bool = True, settled: bool = False
+    ) -> None:
+        self.listing = listing
+        self._available = available
+        self._settled = settled
+        self.searched: list[str] = []
+
+    @property
+    def available(self) -> bool:
+        return self._available
+
+    async def search(self, words: str) -> Listing | None:
+        self.searched.append(words)
+        return self.listing
+
+    async def install(self, store_id: str) -> Install:
+        raise AssertionError("open_app never installs")
+
+    def settled(self) -> bool:
+        return self._settled
+
+
+CHATGPT = Listing("ChatGPT", "9PLM9XGG6VKS", "OpenAI", "Freemium")
+
+
+def with_store(store: FakeStore, *, catalog: AppCatalog | None = None) -> Tool:
+    return open_app_for(
+        catalog
+        if catalog is not None
+        else AppCatalog([AppEntry("Spotify", r"C:\Start\Spotify.lnk")]),
+        store=store,
+        unknown_publisher="an unknown publisher",
+    )
+
+
+def test_the_description_tells_the_model_to_pass_the_name_as_heard(open_app: Tool) -> None:
+    """2026-09-13: the model turned "Pay Charmediter'ini" into "Text Editor"
+    and "Porti Client" into "Proton VPN" before calling; the matcher would
+    have found both as heard."""
+    description = open_app.spec.description
+
+    assert "exactly as it was transcribed" in description
+    assert "Never translate it" in description
+    assert "install_app" in description
+
+
+async def test_an_app_the_store_has_is_offered_for_install_with_its_publisher(
+    opened: Opened,
+) -> None:
+    store = FakeStore(listing=CHATGPT)
+
+    said = await with_store(store).run(name="ChatGPT")
+
+    assert opened.targets == []
+    assert store.searched == ["ChatGPT"]
+    assert said == (
+        "No app called 'ChatGPT' is installed. The Microsoft Store has 'ChatGPT' by OpenAI "
+        "(Freemium). To download it, call install_app(name='ChatGPT', store_id='9PLM9XGG6VKS', "
+        "publisher='OpenAI') - it asks the user first; do not ask them yourself."
+    )
+
+
+async def test_the_nearest_installed_names_are_still_offered_beside_the_store(
+    opened: Opened,
+) -> None:
+    store = FakeStore(listing=Listing("Spotter", "9ABCDEFGHIJK", "Someone", "Free"))
+
+    said = await with_store(store).run(name="spotter")
+
+    assert said.endswith("do not ask them yourself; closest installed names: Spotify.")
+
+
+async def test_a_publisher_the_store_did_not_name_is_said_to_be_unknown(opened: Opened) -> None:
+    """So that the spoken question never reads "'X' () will be downloaded"."""
+    store = FakeStore(listing=Listing("Foo", "9ABCDEFGHIJK", "", ""))
+
+    said = await with_store(store).run(name="foo")
+
+    assert "'Foo' by an unknown publisher (price not listed)" in said
+    assert "publisher='an unknown publisher'" in said
+
+
+async def test_an_app_that_costs_money_is_not_offered_for_install(opened: Opened) -> None:
+    store = FakeStore(listing=Listing("Pro Tool", "9ABCDEFGHIJK", "Vendor", "Paid"))
+
+    said = await with_store(store).run(name="pro tool")
+
+    assert said == (
+        "No app called 'pro tool' is installed. The Microsoft Store has 'Pro Tool' by Vendor, "
+        "but it costs money (Paid) and cannot be bought from here; the user can buy it in "
+        "the Store; closest installed names: Spotify."
+    )
+    assert "install_app" not in said
+
+
+async def test_an_app_the_store_does_not_have_is_reported_as_before(opened: Opened) -> None:
+    said = await with_store(FakeStore(listing=None)).run(name="zzzz")
+
+    assert said == "No app called 'zzzz'."
+
+
+async def test_without_winget_the_store_is_not_asked(opened: Opened) -> None:
+    store = FakeStore(listing=CHATGPT, available=False)
+
+    said = await with_store(store).run(name="ChatGPT")
+
+    assert said == "No app called 'ChatGPT'."
+    assert store.searched == []
+
+
+async def test_an_install_that_ended_since_makes_the_catalogue_look_again(
+    opened: Opened,
+) -> None:
+    """The download outlived its turn; the user asks again a minute later."""
+    catalog = AppCatalog([], scanners=[lambda: [AppEntry("ChatGPT", "shell:AppsFolder\\X!App")]])
+    store = FakeStore(listing=CHATGPT, settled=True)
+
+    said = await with_store(store, catalog=catalog).run(name="chatgpt")
+
+    assert said == "Opened ChatGPT."
+    assert opened.targets == ["shell:AppsFolder\\X!App"]
+    assert store.searched == []
+
+
+async def test_the_catalogue_answers_before_the_store_is_ever_asked(opened: Opened) -> None:
+    store = FakeStore(listing=CHATGPT)
+
+    said = await with_store(store).run(name="spotify")
+
+    assert said == "Opened Spotify."
+    assert store.searched == []
 
 
 # --------------------------------------------------------------------------

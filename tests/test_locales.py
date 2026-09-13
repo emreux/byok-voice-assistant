@@ -28,6 +28,8 @@ from assistant.agent.intents import INTENTS
 from assistant.llm.probe import QUESTION
 from assistant.locales import FALLBACK_CODE, available, iso_code, load, system_code
 from assistant.tools import memory as memory_tools
+from assistant.tools import store as store_tools
+from assistant.tools import system as system_tools
 from assistant.ui import status
 
 PACKAGED = Path(locales.__file__).parent
@@ -45,6 +47,8 @@ TABLES = {
     "__main__": cli.TEXT,
     "agent.policy": policy.TEXT,
     "tools.memory": memory_tools.TEXT,
+    "tools.system": system_tools.TEXT,
+    "tools.store": store_tools.TEXT,
 }
 SENTENCES = {key: text for table in TABLES.values() for key, text in table.items()}
 
@@ -309,23 +313,35 @@ def test_the_language_windows_is_in_can_be_asked_for() -> None:
 # --------------------------------------------------------------------------
 
 
-def test_every_shipped_pack_gives_the_recogniser_words_to_expect() -> None:
-    """The commands people say most, for Whisper's `initial_prompt` (3.4)."""
+def test_every_shipped_pack_tells_the_recogniser_what_to_expect_as_a_sentence() -> None:
+    """The prompt before each utterance (3.4): a sentence in the pack's
+    language with the installed apps' names in it, where `{apps}` is."""
     for pack in available():
-        assert pack.stt_vocabulary, f"{pack.code} gives the recogniser no vocabulary"
+        assert "{apps}" in pack.stt_prompt, f"{pack.code} gives the recogniser no prompt"
 
 
-def test_the_vocabulary_comes_from_the_pack_that_was_asked_for(tmp_path: Path) -> None:
-    write(tmp_path, "de", '[stt]\nlanguage = "de"\nvocabulary_hint = " öffnen, Einstellungen "\n')
+def test_the_prompt_comes_from_the_pack_that_was_asked_for(tmp_path: Path) -> None:
+    write(tmp_path, "de", '[stt]\nlanguage = "de"\nprompt = " Apps: {apps}. Öffnen. "\n')
 
-    assert load("de", directory=tmp_path).stt_vocabulary == "öffnen, Einstellungen"
+    assert load("de", directory=tmp_path).stt_prompt == "Apps: {apps}. Öffnen."
 
 
-def test_english_does_not_lend_its_vocabulary_either(tmp_path: Path) -> None:
+def test_english_does_not_lend_its_prompt_either(tmp_path: Path) -> None:
     """English command words would not help a German be understood."""
-    write(tmp_path, "en", '[stt]\nlanguage = "en"\nvocabulary_hint = "open, settings"\n')
+    write(tmp_path, "en", '[stt]\nlanguage = "en"\nprompt = "Apps: {apps}."\n')
 
-    assert load("de", directory=tmp_path).stt_vocabulary == ""
+    assert load("de", directory=tmp_path).stt_prompt == ""
+
+
+def test_the_turkish_pack_has_the_words_the_store_install_asks_with() -> None:
+    """`install_app`'s question (2026-09-13), with both of its blanks, and
+    the word for a publisher the Store did not name."""
+    pack = load("tr")
+
+    question = pack.say("store_install_confirm", "")
+    assert "{name}" in question
+    assert "{publisher}" in question
+    assert pack.say("unknown_publisher", "")
 
 
 # --------------------------------------------------------------------------

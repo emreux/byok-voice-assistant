@@ -17,7 +17,7 @@ Windows için masaüstü sesli asistan: **senin** API anahtarınla, **senin** se
 asistan  Bluetooth ayarları açılıyor.   443 girdi, 6 çıktı
     sen  Saat kaç?
 asistan  Saat 12 13.
-● hazır    Konuşmak için Ctrl+Alt+Space basılı tut, ya da Ctrl+Alt+H ile dinlemede kal. Ctrl+C durdurur.
+● hazır    Dinliyorum - konuşman yeterli. Ctrl+Alt+H dinlemeyi kapatır (konuşuyorsa susturur), Ctrl+C her şeyi.
 ```
 
 ## İki şey bu projenin amacı
@@ -44,6 +44,17 @@ bir şablonu kopyalayıp sağ tarafı çevirmek.
   tanıyıcının yazımı affediliyor, vazgeçmeden önce Windows'un İngilizce adları deneniyor),
   bir web adresi, Windows Ayarları'nın bir sayfası (Bluetooth, Wi-Fi, ekran, ses...). Medya
   tuşları: çal, duraklat, sonraki, önceki, ses.
+- **Müziği arayıp bulmuyor, çalıyor.** "Bir müzik aç", "Yaşar'dan Kumralım çal", "şu
+  videoyu aç" — şarkı ya da video önce aranıyor, sonra açılan adres doğrudan çalmaya
+  başlayan adres oluyor; hem de zaten giriş yapmış olduğunuz tarayıcıda — kendi ayrı
+  penceresinde, bir sonraki şarkı o pencereyi kapatıyor, beş şarkı beş sekme olmuyor. Model hiçbir
+  zaman `watch?v=` kimliği yazmıyor: o kimliği bilemez, uydurduğu ise "This video isn't
+  available anymore" açar. Varsayılan YouTube Music; Spotify kuruluysa kendi
+  uygulamasında başlıyor. Spotify'ın kataloğu bir developer uygulaması olmadan
+  aranamıyor ve Şubat 2026'dan beri o uygulama bu sürümün istemediği bir Premium
+  abonelik istiyor — o yüzden Spotify isteği kaydın ISRC kodunu Deezer'dan (anahtarsız)
+  bulup Spotify'ı o tek sonuçta açıyor, Deezer şarkıyı bilmiyorsa düz aramada; ve sen
+  çal'a basana kadar hiçbir şeyin başlamadığını açıkça söylüyor.
 - **Saati kimseye sormadan söylüyor.** "Saat kaç", "dur", "iptal" ve yerel paketinin
   listelediği diğer kısa komutlar modele hiç gitmiyor: bekleme yok, token yok. Saat yine
   kapıdan geliyor, modelin çağıracağı aynı araçtan.
@@ -54,6 +65,10 @@ bir şablonu kopyalayıp sağ tarafı çevirmek.
   `blocked` sen `config.toml`'da adını yazmadıkça hiç çalışmıyor, yazsan da soruyor.
   Modelin isteğinden çalışan araca giden tek bir yol var ve `tests/test_policy.py` riskli
   bir aracın onaysız çalışamayacağını kanıtlıyor.
+- **Olmayanı kurmayı teklif ediyor.** "X'i aç" dedin ve X yok: asistan Microsoft Store'a
+  bakıyor, X oradaysa soruyor — "'X' (yayıncısı) Microsoft Store'dan indirilecek. Evet ya
+  da hayır de." — ve yalnız evet dersen indiriyor (`winget` ile, sessizce), sonra açıyor.
+  Ücretli uygulama alınmıyor; para istediğini söylüyor.
 - **İstediğini aklında tutuyor.** "Bana Emre de", "adın Ada" —
   `%APPDATA%\assistant\memory.toml`'da, elle düzenleyebileceğin düz metin olarak; her
   isteğin önüne okunuyor, yeniden başlatınca da duruyor. En fazla kırk kayıt; dolunca
@@ -122,34 +137,30 @@ bir mikrofon seçmiştiysen sonra elle geri yaz.
 uv run assistant run
 ```
 
-Satır `hazır` diyene kadar bekle. Duyulmanın iki yolu var ve iki tuş da nerede olursan ol
-çalışıyor; terminalin önde olması gerekmiyor.
+Satır `hazır` diyene kadar bekle. Zaten dinliyor: konuş yeter. Yarım saniye kadar
+sustuğun her yerde o cümle bir tur oluyor; üç dört saniye sonra cevabın ilk cümlesini
+duyuyorsun, konuşulanlar da durum satırının üstünden akıp gidiyor.
 
-**`Ctrl+Alt+Space`'i basılı tut, konuş ve bırak.** Üç dört saniye sonra cevabın ilk
-cümlesini duyuyorsun, konuşulanlar da durum satırının üstünden akıp gidiyor. `Ctrl+C`
-durduruyor.
-
-**Ya da `Ctrl+Alt+H`'ye bir kez bas ve konuş.** Mikrofon açık kalıyor; yarım saniye kadar
-sustuğun her yerde o cümle bir tur oluyor. Bir daha basınca geri dönüyor. Durum satırı
-hangisinde olduğunu her zaman söylüyor.
+**`Ctrl+Alt+H` dinlemeyi kapatıp açar.** Nerede olursan ol çalışıyor — terminalin önde
+olması gerekmiyor — ve durum satırı hangi durumda olduğunu her zaman söylüyor. `Ctrl+C`
+programı durduruyor.
 
 Bilmeye değer şeyler:
 
-- **Basılı tutarken konuş.** Tuşu bırakmak kaydı bitiriyor. Saniyenin üçte birinden kısası
-  yanlışlıkla dokunulmuş tuş sayılıyor.
-- **Sözünü kesmek için tekrar bas.** Asistan hâlâ konuşuyorken `Ctrl+Alt+Space`'e basarsan
-  anında susuyor, beklediği isteği bırakıyor ve dinliyor. `Ctrl+Alt+H` kesmiyor; yalnız
-  modu değiştiriyor.
-- **Sorunca cevap ver.** Riskli bir araç sorusunu okuyor ve tuşsuz altı saniye dinliyor.
-  Evet ya da hayır de; ikisini de duymazsa bir kez daha soruyor, sonra sessizliği hayır
-  sayıyor.
-- **Eller serbest bütün odayı duyuyor.** Televizyon, telefon görüşmesi, konuşan başka biri:
-  her biri cevaplamaya çalışacağı bir tur. Başkalarının olduğu odada tuşu kullan. Yalnız
-  adına cevap veren uyandırma kelimesi v0.5.0.
+- **Saniyenin üçte birinden kısası** kelime değil gürültü sayılıyor.
+- **Sözünü kesmek için kapat.** Asistan hâlâ konuşuyorken `Ctrl+Alt+H`'ye basarsan anında
+  susuyor, beklediği isteği bırakıyor ve sessizleşiyor; devam etmek için bir daha bas.
+  Sesle henüz kesilemiyor — konuşurken mikrofon sağır, kendi kendine cevap vermesin diye.
+- **Sorunca cevap ver.** Riskli bir araç sorusunu okuyor ve altı saniye dinliyor. Evet ya
+  da hayır de; ikisini de duymazsa bir kez daha soruyor, sonra sessizliği hayır sayıyor.
+  Sorarken kapatmak hayır demek.
+- **Bütün odayı duyuyor.** Televizyon, telefon görüşmesi, konuşan başka biri: her biri
+  cevaplamaya çalışacağı bir tur. Başkalarının olduğu odada kapat. Yalnız adına cevap
+  veren uyandırma kelimesi v0.5.0.
 - **Kendini duymuyor.** Cevap sürdüğü sürece mikrofon sağır, artı odanın onu tekrar etmeyi
   bırakması için çeyrek saniye.
 - **Sessizlik cevaplanmıyor.** Tanıyıcıya kelimelerden ne kadar emin olduğu değil, kayıtta
-  konuşma olup olmadığı soruluyor: sessiz odada basılı tutulan tuş hiçbir şey demiyor,
+  konuşma olup olmadığı soruluyor: sessiz oda hiçbir şey demiyor,
   okunamayan cümleye "Seni anlayamadım, tekrar söyler misin?" deniyor, kelimeler ise
   dekoder ne kadar kararsız olursa olsun cevaplanıyor.
 
@@ -201,11 +212,18 @@ makineden çıkmıyor. `scripts/bench_stt.py` ve `scripts/bench_e2e.py` ikisini 
 kayıtlarında ölçüyor (bkz. `fixtures/audio/`).
 
 Whisper program açılırken bir kez yükleniyor, yaklaşık üç saniye, böylece ilk basış onu
-beklemiyor.
+beklemiyor. Tek seferde, sıfır sıcaklıkta çözüyor; sesin taşıyabileceği kadar token
+yazıyor; kendi etrafında dönen bir çözümü atıyor — böylece zor bir cümle otuz değil üç
+saniye sürüyor ve kimsenin söylemediği bir kelime yerine "tekrar söyler misin" geliyor.
+Her cümleden önce ona, senin dilinde, daha önce açtığın uygulamalar ve kalanların en kısa
+adları söyleniyor — penceresine sığdığı kadar.
 
 ## Verilerin nereye gidiyor
 
 - **Sesin makineden çıkmıyor.** Whisper yerelde çalışıyor; sağlayıcıya yalnız metin gidiyor.
+- **Sende olmayan bir uygulamanın adı Microsoft'a gidiyor.** "X'i aç" makinede X bulamazsa
+  X, `winget` üstünden Microsoft Store'da aranıyor. Başka hiçbir şey aranmıyor; `winget`
+  kurulu değilse hiçbir şey.
 - **API anahtarın hiçbir dosyaya yazılmıyor.** `keyring` üzerinden Windows Kimlik Bilgisi
   Yöneticisi'nde duruyor.
 - **Söylediğin yazılmıyor; asistanın yaptığı yazılıyor.**
@@ -234,6 +252,15 @@ protokolünü sağlayan bir adaptör yaz, test dosyasına bir `build` fonksiyonu
 `tests/test_llm_adapters.py` içindeki `ADAPTERS` listesine bir satır ekle. Sözleşme testi
 bundan sonra diğerlerine sorduğu her soruyu seninkine de soruyor, hiç değişmeden — ve
 sözleşmeden geçirilmemiş bir adaptör kaydedilirse test kırmızıya dönüyor.
+
+## Kendi aracını eklemek
+
+`%APPDATA%\assistant\tools\` klasörüne — `config.toml`'un yanına — `assistant.tools.registry`
+içindeki `@tool` ile bildirilmiş fonksiyonlar taşıyan bir `.py` dosyası koy; yerleşik araçlar
+nasıl yazılıyorsa öyle. Bir sonraki açılışta hazırlar: aynı süreçte, aynı izin kapısından
+geçerek, kendi risklerini kendileri söyleyerek çalışırlar ve senin makinende kalırlar — o
+klasördeki hiçbir şey bu deponun parçası değil. İçe aktarılamayan bir dosya çökme değil,
+günlükte bir satır olur.
 
 ## Geliştirme
 

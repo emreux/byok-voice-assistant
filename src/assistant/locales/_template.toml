@@ -25,12 +25,12 @@ name = "Your language"
 # assistant, not the one it shows them.
 language = "xx"
 
-# A few words the recogniser is told to expect before each sentence: the
-# commands people say most, in your language, separated by commas. It helps
-# the recogniser hear "open" as open rather than as something that sounds
-# like it. Keep it short - the program adds the names of the installed apps
-# after it, and the recogniser reads only so much. Leave it empty if unsure.
-vocabulary_hint = "open, settings, music, next, previous, time"
+# What the recogniser is told to expect before each sentence (design.md 3.4).
+# Write a short sentence in your language, not a list: the decoder is being
+# shown what speech in your language looks like. Put the commands people say
+# most in it, and keep {apps} where the names of the installed apps should
+# go - the program fills them in, as many as fit. Leave it empty if unsure.
+prompt = "Installed apps: {apps}. Open the app, open the site, show settings, play music, next song, what time is it?"
 
 [speech]
 # The words the assistant listens for after asking "shall I?" - the ones
@@ -134,6 +134,11 @@ time_is = "It is {hour} {minute}."
 # Asked before something the user asked to be remembered is forgotten again;
 # {fact} is the fact itself. "Say yes or no." is added after it.
 forget_confirm = "'{fact}' will be forgotten."
+# Asked before an app is downloaded from the Microsoft Store; {name} is the
+# app as the Store lists it and {publisher} who made it. The second sentence
+# is the word used for a publisher the Store did not name.
+store_install_confirm = "'{name}' ({publisher}) will be downloaded from the Microsoft Store."
+unknown_publisher = "unknown publisher"
 # Added to a risky tool's question when the same thing was done, or may have
 # been, a moment ago. {ago} is filled with one of the two spans below.
 duplicate_done = "You already did this {ago} ago."
@@ -143,8 +148,8 @@ minutes_ago = "{count} minutes"
 
 # Shown on screen while the assistant runs (item 1.11). The status line holds
 # the state and the hotkey together on one line, so keep these short.
-hold_to_talk = "Hold {hotkey} to talk, or press {toggle} to keep listening. Ctrl+C stops."
-hands_free = "Listening - just talk. {toggle} stops listening, Ctrl+C stops everything."
+paused = "Not listening. Press {toggle} to listen again. Ctrl+C stops."
+hands_free = "Listening - just talk. {toggle} stops listening (and cuts an answer short). Ctrl+C stops everything."
 loading_speech = "Loading the speech model..."
 # Shown while the tool-use test of 3.2 is repeated at startup, once a week.
 checking_model = "Checking whether the model calls tools..."

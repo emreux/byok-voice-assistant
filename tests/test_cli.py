@@ -104,6 +104,7 @@ class Wiring:
     databases: list[sqlite3.Connection] = field(default_factory=list)
     # What the speech model was told to expect (2.2).
     vocabularies: list[list[str]] = field(default_factory=list)
+    prompts_for_speech: list[str] = field(default_factory=list)
     stop: BaseException | None = None
     # The probe of 2.6 at startup: what it was asked, as (provider id,
     # model, question), and what it answers.
@@ -127,8 +128,9 @@ def wiring(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Wiring:
         return connection
 
     class FakeWhisper:
-        def __init__(self, *, vocabulary: Iterable[str] = ()) -> None:
+        def __init__(self, *, vocabulary: Iterable[str] = (), prompt: str = "") -> None:
             seen.vocabularies.append(list(vocabulary))
+            seen.prompts_for_speech.append(prompt)
 
         async def load(self) -> None:
             seen.happened.append("speech model")
@@ -425,19 +427,59 @@ def test_every_tool_of_phase_two_is_on_offer(configured: Path, wiring: Wiring) -
             "open_url",
             "open_settings",
             "media_control",
+            "play_music",
+            "play_video",
+            "open_media",
             "remember",
             "forget",
+            "install_app",
         ]
     ]
 
 
-def test_the_speech_model_is_told_the_locales_words_and_the_apps_names(
-    configured: Path, wiring: Wiring
-) -> None:
-    """Section 3.4: the pack's `vocabulary_hint` first, then the catalogue."""
+def test_a_tool_file_beside_the_settings_is_on_offer(configured: Path, wiring: Wiring) -> None:
+    """Section 3.9 (13 Sep 2026): the owner's own tools, read from
+    `%APPDATA%\\assistant\\tools`, join the same registry as everything else."""
+    folder = configured / "tools"
+    folder.mkdir()
+    (folder / "mine.py").write_text(
+        "from assistant.tools.registry import tool\n"
+        "\n"
+        "\n"
+        '@tool(risk="safe")\n'
+        "async def start_my_project() -> str:\n"
+        '    """Starts the owner\'s project."""\n'
+        '    return "started"\n',
+        encoding="utf-8",
+    )
+
     main(["run"])
 
-    assert wiring.vocabularies == [[locales.load("tr").stt_vocabulary, "Spotify", "Google Chrome"]]
+    assert wiring.tools[0][-1] == "start_my_project"
+    assert wiring.tools[0][:-1] == [
+        "get_current_time",
+        "open_app",
+        "open_url",
+        "open_settings",
+        "media_control",
+        "play_music",
+        "play_video",
+        "open_media",
+        "remember",
+        "forget",
+        "install_app",
+    ]
+
+
+def test_the_speech_model_is_told_the_locales_sentence_and_the_apps_names(
+    configured: Path, wiring: Wiring
+) -> None:
+    """Section 3.4: the pack's `[stt] prompt` with the catalogue's names as
+    people say them (2026-09-13)."""
+    main(["run"])
+
+    assert wiring.vocabularies == [["Spotify", "Google Chrome"]]
+    assert wiring.prompts_for_speech == [locales.load("tr").stt_prompt]
 
 
 def test_the_gate_the_agent_is_handed_is_the_permission_gate(

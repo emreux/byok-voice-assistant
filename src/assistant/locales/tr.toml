@@ -9,9 +9,12 @@ name = "Türkçe"
 
 [stt]
 language = "tr"
-# Words the recogniser is told to expect before each sentence (design.md 3.4):
-# the commands people say most. The app names are added by the program.
-vocabulary_hint = "aç, ayarlar, müzik, sonraki, önceki, saat, Bluetooth, Spotify"
+# What the recogniser is told to expect before each sentence (design.md 3.4):
+# a sentence, not a list - the decoder is being shown what speech in this
+# language looks like - with the commands people say most, and the names of
+# the installed apps where {apps} is. The program fills them in, as many as
+# the recogniser's window holds.
+prompt = "Bilgisayarımdaki uygulamalar: {apps}. Uygulamayı aç, siteyi aç, ayarları göster, müzik çal, sonraki şarkı, saat kaç?"
 
 [speech]
 # What the confirmation window listens for (design.md 3.1 rule 2). Whole
@@ -86,6 +89,12 @@ time_is = "Saat {hour} {minute}."
 # Asked before a remembered fact is removed (2.10); {fact} is the fact as
 # the model named it. The hint on how to answer is added after it.
 forget_confirm = "'{fact}' kaydı unutulacak."
+# Asked before an app is downloaded from the Microsoft Store (2026-09-13);
+# {name} is the app as the Store lists it and {publisher} who made it - said
+# out loud because the Store is full of look-alikes. The word below stands
+# in for a publisher the Store did not name.
+store_install_confirm = "'{name}' ({publisher}) Microsoft Store'dan indirilecek."
+unknown_publisher = "yayıncısı bilinmiyor"
 duplicate_done = "Bunu {ago} önce zaten yaptın."
 duplicate_uncertain = "Bunu {ago} önce denedin, sonucu belirsiz kaldı."
 seconds_ago = "{count} saniye"
@@ -93,8 +102,8 @@ minutes_ago = "{count} dakika"
 
 # Shown on screen while it runs - the status line and what a turn left behind
 # (item 1.11). Short: they share one line with the hotkey.
-hold_to_talk = "Konuşmak için {hotkey} basılı tut, ya da {toggle} ile dinlemede kal. Ctrl+C durdurur."
-hands_free = "Dinliyorum - konuşman yeterli. {toggle} dinlemeyi kapatır, Ctrl+C her şeyi."
+paused = "Dinlemiyorum. {toggle} dinlemeyi açar, Ctrl+C durdurur."
+hands_free = "Dinliyorum - konuşman yeterli. {toggle} dinlemeyi kapatır (konuşuyorsa susturur), Ctrl+C her şeyi."
 loading_speech = "Konuşma modeli yükleniyor..."
 checking_model = "Modelin araç çağırıp çağıramadığı sınanıyor..."
 state_idle = "hazır"

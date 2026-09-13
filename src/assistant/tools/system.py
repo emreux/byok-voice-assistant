@@ -37,38 +37,49 @@ import os
 import re
 import shutil
 import subprocess
-import webbrowser
-from collections.abc import Callable, Iterable, Iterator
+from collections.abc import Awaitable, Callable, Iterable, Iterator
 from dataclasses import dataclass
 from datetime import datetime
 from difflib import SequenceMatcher
 from pathlib import Path
-from typing import Annotated
+from typing import Annotated, Protocol
 
 from loguru import logger
 
+from assistant import shell
 from assistant.store.normalize import normalize_search
 from assistant.tools.registry import Tool, tool
 
 __all__ = [
     "PROMPT_NAMES",
     "SETTINGS_PAGES",
+    "TEXT",
     "AppCatalog",
     "AppEntry",
+    "MediaNames",
     "get_current_time",
     "open_app_for",
     "open_settings",
     "open_url",
     "scan_start_apps",
     "scan_start_menu",
+    "spoken_form",
     "start_menu_folders",
 ]
 
-# How many of the catalogue's names are told to the recogniser before each
-# utterance. Whisper's prompt window is about 224 tokens, so hundreds of names
-# would not fit; the shortest are offered, because those are the ones people
-# say. The right number is measured in 2.8 (`bench_stt.py`), not guessed here.
-PROMPT_NAMES = 40
+# How many of the catalogue's names are *offered* to the recogniser. What it
+# takes is measured in tokens where the tokenizer is (`stt/local_whisper.py`,
+# `PROMPT_TOKENS`); this is only the upper bound of the list handed over, so
+# that a machine with hundreds of apps does not make it encode them all. Until
+# 2026-09-13 this was 40 and the prompt was the forty *shortest* names -
+# `Run`, `dfrgui`, `services` - and neither PyCharm nor FortiClient was in it.
+PROMPT_NAMES = 120
+
+# What a name carries on the shortcut and nobody says: a version (`PyCharm
+# 2026.2.1`, `Python 3.13`), a year (`Word 2016`), a parenthesised tail
+# (`Outlook (classic)`, `IDLE (Python 3.13 64-bit)`), in any order at the end.
+# `Paint 3D` and `7-Zip` are names, not versions, and stay.
+SPOKEN_TAIL = re.compile(r"(?:\s*\([^)]*\)|\s+v?\d+(?:\.\d+)+\S*|\s+\d{4})+\s*$", re.IGNORECASE)
 
 # Below this ratio `difflib` is guessing rather than matching. Measured on
 # this machine (2026-09-09) against its 173 apps: at 0.6, "spotify" - not
@@ -127,6 +138,65 @@ PAGE_KEYS = "One of: " + ", ".join(SETTINGS_PAGES)
 Runner = Callable[..., subprocess.CompletedProcess[str]]
 Scanner = Callable[[], list["AppEntry"]]
 
+# What `open_app` asks when the catalogue has no such application: the spoken
+# name in, the answer out, or `None` when the name is not a media service
+# either. `media/player.py::Player.open_named` is the one implementation.
+MediaNames = Callable[[str], Awaitable[str | None]]
+
+
+# What `open_app` asks last, when the media engine has no answer either: the
+# Microsoft Store (`tools/store.py`). Only the three questions `open_app`
+# puts to it are named here, so that this module never imports that one.
+class StoreLookup(Protocol):
+    @property
+    def available(self) -> bool: ...
+
+    async def search(self, words: str) -> StoreListing | None: ...
+
+    def settled(self) -> bool: ...
+
+
+class StoreListing(Protocol):
+    @property
+    def name(self) -> str: ...
+
+    @property
+    def store_id(self) -> str: ...
+
+    @property
+    def publisher(self) -> str: ...
+
+    @property
+    def pricing(self) -> str: ...
+
+    @property
+    def installable(self) -> bool: ...
+
+
+# The end of the chain of section 3.12 for the one word of `open_app`'s
+# answer the user may hear: the publisher's name, when the Store gave none.
+# `install_app`'s question reads it back, so the pack's word for it goes in
+# here (`__main__`), and this is what stands when the pack has none.
+TEXT: dict[str, str] = {
+    "unknown_publisher": "unknown publisher",
+}
+
+# What `open_app` tells the model about the Store. `{closest}` is the
+# nearest installed names, kept so that the model can still prefer an app
+# that was nearly it over a download.
+NOT_INSTALLED = (
+    "No app called {name!r} is installed. The Microsoft Store has {listing!r} by {publisher}"
+)
+OFFERED = (
+    " ({pricing}). To download it, call install_app(name={listing!r}, store_id={store_id!r}, "
+    "publisher={publisher!r}) - it asks the user first; do not ask them yourself{closest}."
+)
+COSTS_MONEY = (
+    ", but it costs money ({pricing}) and cannot be bought from here; the user can buy it in "
+    "the Store{closest}."
+)
+PRICE_NOT_LISTED = "price not listed"
+
 
 @dataclass(frozen=True, slots=True)
 class AppEntry:
@@ -136,6 +206,17 @@ class AppEntry:
     # A shortcut's path, or `shell:AppsFolder\<AppID>`; `os.startfile` opens
     # either.
     launch: str
+
+    @property
+    def spoken(self) -> str:
+        """The name as people say it - `PyCharm`, not `PyCharm 2026.2.1`."""
+        return spoken_form(self.name)
+
+
+def spoken_form(name: str) -> str:
+    """`name` without what nobody says out loud (`SPOKEN_TAIL`); `name` itself
+    when nothing would be left of it."""
+    return SPOKEN_TAIL.sub("", name).strip() or name
 
 
 # --------------------------------------------------------------------------
@@ -228,32 +309,58 @@ def _listed(printed: object) -> Iterator[AppEntry]:
 class AppCatalog:
     """The apps this machine can open, found by whatever the user called them."""
 
-    def __init__(self, entries: Iterable[AppEntry]) -> None:
+    def __init__(self, entries: Iterable[AppEntry], *, scanners: Iterable[Scanner] = ()) -> None:
+        self._scanners = tuple(scanners)
         self._entries: list[AppEntry] = []
         self._by_name: dict[str, AppEntry] = {}
         self._by_word: dict[str, AppEntry] = {}
+        self._fill(entries)
+
+    def _fill(self, entries: Iterable[AppEntry]) -> None:
+        self._entries.clear()
+        self._by_name.clear()
+        self._by_word.clear()
+        listed: set[str] = set()
         for entry in entries:
             key = normalize_search(entry.name).strip()
             # The same name twice - a shortcut and its store twin - is one
             # app, and the first one offered is the one kept.
-            if not key or key in self._by_name:
+            if not key or key in listed:
                 continue
+            listed.add(key)
             self._entries.append(entry)
+            # The listed name always finds its own app, even when another
+            # app is *said* the same way and was listed first ("Outlook
+            # (classic)" before "Outlook"); the spoken form is an alias that
+            # only stands where no listed name does.
             self._by_name[key] = entry
-            for word in _words(key):
+            spoken = normalize_search(entry.spoken).strip()
+            if spoken and spoken != key:
+                self._by_name.setdefault(spoken, entry)
+            for word in _words(spoken or key):
                 self._by_word.setdefault(word, entry)
 
     @classmethod
     async def load(cls, *, scanners: Iterable[Scanner] | None = None) -> AppCatalog:
         """Scans the machine - off the event loop, because it takes seconds."""
         chosen = tuple(scanners) if scanners is not None else (scan_start_menu, scan_start_apps)
-
-        def scan() -> list[AppEntry]:
-            return [entry for scanner in chosen for entry in scanner()]
-
-        catalog = cls(await asyncio.to_thread(scan))
+        catalog = cls(await asyncio.to_thread(_scan, chosen), scanners=chosen)
         logger.info("app catalogue: {} apps", len(catalog))
         return catalog
+
+    async def refresh(self) -> None:
+        """Scans the machine again, into this same catalogue.
+
+        The tools hold this object, not a list, so an app installed since
+        the start (`tools/store.py`) is found by the next call without any of
+        them changing hands. The recogniser's prompt is not rebuilt: it was
+        fitted when the model loaded, and the new name is understood after
+        the next start. A catalogue built by hand has nothing to scan.
+        """
+        if not self._scanners:
+            return
+        self._fill(await asyncio.to_thread(_scan, self._scanners))
+        logger.info("app catalogue: {} apps (refreshed)", len(self))
 
     def __len__(self) -> int:
         return len(self._entries)
@@ -261,14 +368,31 @@ class AppCatalog:
     def names(self) -> list[str]:
         return [entry.name for entry in self._entries]
 
-    def vocabulary(self, limit: int = PROMPT_NAMES) -> list[str]:
-        """The names most worth telling the recogniser about.
+    def spoken_names(self, limit: int = PROMPT_NAMES, *, first: Iterable[str] = ()) -> list[str]:
+        """The names most worth telling the recogniser about, as people say
+        them, each once.
 
-        The shortest first: a short name is one people say, and the prompt
-        has room for few (`PROMPT_NAMES`).
+        `first` is what this user has asked to open before, in their own
+        words (`AuditRepo.names_asked`): each is resolved the way `open_app`
+        resolves it, and the apps found lead the list - the window is short
+        (`stt/local_whisper.py`), and the apps someone opens are the ones
+        they will say again. Then products - a name with a capital letter in
+        it, in every language the catalogue has been seen in; `dfrgui`,
+        `services`, `computer` are what the machine calls its own utilities -
+        and among them the shorter first, because a short name is one people
+        say.
         """
-        ranked = sorted(self._entries, key=lambda entry: len(entry.name))
-        return [entry.name for entry in ranked[:limit]]
+        distinct: dict[str, None] = {}
+        for said in first:
+            found = self.find(said)
+            if found is not None:
+                distinct.setdefault(found.spoken, None)
+        rest: dict[str, None] = {}
+        for entry in self._entries:
+            if entry.spoken not in distinct:
+                rest.setdefault(entry.spoken, None)
+        ranked = sorted(rest, key=lambda name: (name == name.lower(), len(name)))
+        return [*distinct, *ranked][:limit]
 
     def find(self, spoken: str) -> AppEntry | None:
         """The app the user meant by `spoken`, or `None`.
@@ -284,7 +408,9 @@ class AppCatalog:
 
         found = self._by_name.get(wanted) or self._by_word.get(wanted)
         if found is None and len(wanted) >= PREFIX_CHARS:
-            found = next((entry for key, entry in self._keys() if key.startswith(wanted)), None)
+            found = next(
+                (entry for key, entry in self._keys(words=True) if key.startswith(wanted)), None
+            )
         if found is None:
             found = self._one_close_enough(wanted)
         return found
@@ -311,11 +437,19 @@ class AppCatalog:
     def _ranked(self, wanted: str, *, cutoff: float) -> list[tuple[float, AppEntry]]:
         """Every app with a key at least `cutoff` like `wanted`, the most
         alike first, each app once - scored by its best key, so that a name
-        and its words do not fill the list with one app."""
+        and its words do not fill the list with one app.
+
+        One word said is measured against single words too ("krom" against
+        "chrome"); several words are measured against whole names only.
+        Measured 2026-09-13: "Text Editor" opened the Registry Editor because
+        the word "editor" alone is seven tenths of the phrase, while "Pay
+        Charm" - what the recogniser made of PyCharm - is closer to the whole
+        spoken name than to any word of it.
+        """
         matcher = SequenceMatcher()
         matcher.set_seq2(wanted)
         best: dict[AppEntry, float] = {}
-        for key, entry in self._keys():
+        for key, entry in self._keys(words=" " not in wanted):
             matcher.set_seq1(key)
             # The two cheap upper bounds first, as `get_close_matches` does;
             # the real ratio is the expensive one, and this runs on the loop.
@@ -326,9 +460,14 @@ class AppCatalog:
                 best[entry] = score
         return sorted(((score, entry) for entry, score in best.items()), key=lambda pair: -pair[0])
 
-    def _keys(self) -> Iterator[tuple[str, AppEntry]]:
+    def _keys(self, *, words: bool) -> Iterator[tuple[str, AppEntry]]:
         yield from self._by_name.items()
-        yield from self._by_word.items()
+        if words:
+            yield from self._by_word.items()
+
+
+def _scan(scanners: Iterable[Scanner]) -> list[AppEntry]:
+    return [entry for scanner in scanners for entry in scanner()]
 
 
 def _words(key: str) -> list[str]:
@@ -346,17 +485,6 @@ def _now() -> datetime:
     return datetime.now().astimezone()
 
 
-def _launch(target: str) -> None:
-    """Hands `target` to the shell, as a double-click would. Kept apart so a
-    test can see what would have opened without opening it."""
-    os.startfile(target)  # noqa: S606  # the target is ours: a catalogue entry or a settings URI
-
-
-def _browse(address: str) -> bool:
-    """The default browser, on `address`. Kept apart for the same reason."""
-    return webbrowser.open(address)
-
-
 @tool(risk="safe")
 async def get_current_time() -> str:
     """Returns the current local date, time, weekday and time zone. Call it before
@@ -368,34 +496,86 @@ async def get_current_time() -> str:
     return f"{now.isoformat(timespec='minutes')} {now:%A}, {now.tzname()}"
 
 
-def open_app_for(catalog: AppCatalog) -> Tool:
+def open_app_for(
+    catalog: AppCatalog,
+    *,
+    media: MediaNames | None = None,
+    store: StoreLookup | None = None,
+    unknown_publisher: str = TEXT["unknown_publisher"],
+) -> Tool:
     """`open_app`, bound to the catalogue it looks names up in.
 
     A closure rather than a parameter: the schema the model sees is read from
-    the function's signature, and the catalogue is not something the model
-    chooses (python-guide 3.4).
+    the function's signature, and neither the catalogue nor the media engine
+    nor the Store is something the model chooses (python-guide 3.4).
+
+    `media` covers the names that are services rather than applications.
+    YouTube Music has no application on Windows at all, and a machine without
+    Spotify installed still has a Spotify the user can be shown. **It is asked
+    second, after the catalogue**, so that a real installed application always
+    wins its own name: someone with the Spotify application gets the
+    application, and only someone without it gets the website. This module
+    stays ignorant of which names those are - `media/player.py` knows.
+
+    `store` is asked **last**, and only when it can be (`available`): an app
+    that is neither installed nor a service may be in the Microsoft Store,
+    and the model is told how to have it downloaded - through `install_app`,
+    which asks the user (2026-09-13). The name the user said goes to the
+    Store for that lookup and nowhere else.
     """
 
     @tool(risk="safe")
     async def open_app(name: Annotated[str, "The application, as the user said it."]) -> str:
         """Opens an application installed on this computer by name. Pass the
-        name the user said, as they said it: case, accents and small spelling
-        differences are forgiven. When nothing matches, the answer names the
-        closest apps. Windows may list the app under its English name, so
-        before telling the user it is not installed, call again with that
-        name (Calculator, Settings, Notepad) or with one of the closest
-        names; ask the user only when that fails too."""
+        name exactly as it was transcribed, even when it looks wrong or like
+        other words ('pay charm', 'porti client'): the matcher is built for
+        what the recogniser makes of names. Never translate it, correct it, or
+        replace it with a guess of your own. When nothing matches, the answer
+        names the closest installed apps - call again with one of those when
+        it is plainly what was meant - and, when the Microsoft Store has the
+        app, how to download it: call install_app as the answer says, it asks
+        the user. Windows may list the app under its English name (Calculator,
+        Settings, Notepad); ask the user only when all of that fails. To play
+        something rather than to open the app it plays in, use play_music or
+        play_video."""
         found = catalog.find(name)
-        if found is None:
-            near = catalog.closest(name)
-            hint = f"; closest names: {', '.join(near)}" if near else ""
-            return f"No app called {name!r}{hint}."
+        if found is None and store is not None and store.settled():
+            # A download that outlived its turn has ended: the Start menu has
+            # an entry the catalogue was read too early to know.
+            await catalog.refresh()
+            found = catalog.find(name)
+        if found is not None:
+            # `os.startfile` returns as soon as the shell has taken the
+            # request, but taking it can be a store app's activation - long
+            # enough to be kept off the loop.
+            await shell.open_target(found.launch)
+            return f"Opened {found.name}."
 
-        # `os.startfile` returns as soon as the shell has taken the request,
-        # but taking it can be a store app's activation - long enough to be
-        # kept off the loop.
-        await asyncio.to_thread(_launch, found.launch)
-        return f"Opened {found.name}."
+        if media is not None:
+            service = await media(name)
+            if service is not None:
+                return service
+
+        near = catalog.closest(name)
+        if store is not None and store.available:
+            listing = await store.search(name)
+            if listing is not None:
+                closest = f"; closest installed names: {', '.join(near)}" if near else ""
+                publisher = listing.publisher or unknown_publisher
+                pricing = listing.pricing or PRICE_NOT_LISTED
+                said = NOT_INSTALLED.format(name=name, listing=listing.name, publisher=publisher)
+                if listing.installable:
+                    return said + OFFERED.format(
+                        pricing=pricing,
+                        listing=listing.name,
+                        store_id=listing.store_id,
+                        publisher=publisher,
+                        closest=closest,
+                    )
+                return said + COSTS_MONEY.format(pricing=pricing, closest=closest)
+
+        hint = f"; closest names: {', '.join(near)}" if near else ""
+        return f"No app called {name!r}{hint}."
 
     return open_app
 
@@ -403,12 +583,15 @@ def open_app_for(catalog: AppCatalog) -> Tool:
 @tool(risk="safe")
 async def open_url(url: Annotated[str, "A web address; 'https://' is added when missing."]) -> str:
     """Opens a web address in the user's default browser. Use it for a site the
-    user named or an address that came up in the conversation."""
+    user named or an address that came up in the conversation. Not for music or
+    video: an address you write for those either opens a search the user then
+    has to click, or names an identifier you cannot know. play_music and
+    play_video look the real one up first."""
     address = url.strip()
     if "://" not in address:
         address = f"https://{address}"
 
-    if not await asyncio.to_thread(_browse, address):
+    if not await shell.open_address(address):
         raise RuntimeError(f"no browser would open {address}")
     return f"Opened {address}."
 
@@ -422,11 +605,11 @@ async def open_settings(page: Annotated[str, PAGE_KEYS]) -> str:
     key = page.strip().casefold()
     uri = SETTINGS_PAGES.get(key)
     if uri is None:
-        await asyncio.to_thread(_launch, SETTINGS_PAGES["home"])
+        await shell.open_target(SETTINGS_PAGES["home"])
         return (
             f"No settings page called {page!r}; opened the Settings home page. "
             f"The pages are: {', '.join(SETTINGS_PAGES)}."
         )
 
-    await asyncio.to_thread(_launch, uri)
+    await shell.open_target(uri)
     return f"Opened the {key} page of Settings."

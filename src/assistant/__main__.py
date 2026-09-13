@@ -106,7 +106,9 @@ def build_parser() -> argparse.ArgumentParser:
 
     subparsers = parser.add_subparsers(dest="command", metavar="<command>")
     subparsers.add_parser("setup", help="Choose a provider, store the API key, pick a model.")
-    run = subparsers.add_parser("run", help="Start the assistant and watch for the hotkeys.")
+    run = subparsers.add_parser(
+        "run", help="Start the assistant. Ctrl+Alt+H pauses and resumes listening; Ctrl+C stops."
+    )
     run.add_argument(
         "--device",
         default=None,
@@ -240,12 +242,21 @@ async def _talk(settings: Settings, pack: Locale, *, device: int | str | None = 
     from assistant.audio.player import SystemSpeaker
     from assistant.audio.vad import Endpoint, SileroVAD
     from assistant.llm.registry import create_provider
+    from assistant.media.player import Player
     from assistant.store.db import open_database
     from assistant.store.memory import UserMemory
     from assistant.store.repos import AuditRepo, SettingsRepo, UsageRepo
     from assistant.stt.local_whisper import LocalWhisper
     from assistant.tools import memory as memory_tools
-    from assistant.tools.media import media_control
+    from assistant.tools import store as store_tools
+    from assistant.tools import system as system_tools
+    from assistant.tools.local import load_local_tools
+    from assistant.tools.media import (
+        media_control,
+        open_media_for,
+        play_music_for,
+        play_video_for,
+    )
     from assistant.tools.registry import ToolRegistry
     from assistant.tools.system import (
         PROMPT_NAMES,
@@ -273,6 +284,10 @@ async def _talk(settings: Settings, pack: Locale, *, device: int | str | None = 
     # The table of section 3.11, once, for everyone who reads a row of it:
     # the loop, the gate, the state machine's clock and the tracker.
     limits = Limits.from_settings(settings.limits)
+    # Where music comes from (section 3.6). Built before the try, because it
+    # holds a connection open between searches and the `finally` below is what
+    # gives it back; three tools and `open_app` share the one player.
+    player = Player(settings=settings.media)
     try:
         detector = SileroVAD()
 
@@ -287,20 +302,40 @@ async def _talk(settings: Settings, pack: Locale, *, device: int | str | None = 
             # files and a PowerShell process, on a thread (2.2). Before the
             # speech model, because the model is told the names it will hear.
             catalog = await AppCatalog.load()
+            # The names this user has asked to open before lead the list;
+            # the window holds few (`stt/local_whisper.py`).
+            asked = AuditRepo(database).names_asked("open_app", limit=PROMPT_NAMES)
             speech = LocalWhisper(
-                vocabulary=[pack.stt_vocabulary, *catalog.vocabulary(limit=PROMPT_NAMES)]
+                vocabulary=catalog.spoken_names(first=asked), prompt=pack.stt_prompt
             )
+            # The Microsoft Store, asked last by `open_app` and installed from
+            # by `install_app` - the one tool that changes what is on the
+            # machine, and asks first (2026-09-13).
+            store = store_tools.WingetStore()
             # The tools on offer, by name, in one place. Every one of them
             # runs through the gate below and nowhere else (section 3.9).
-            # `forget` is declared with the question it asks, in the pack's
-            # words: the first question of phase 2 a user actually hears.
+            # `forget` and `install_app` are declared with the questions they
+            # ask, in the pack's words.
             tools = ToolRegistry(
                 [
                     get_current_time,
-                    open_app_for(catalog),
+                    # The catalogue answers first, the player second and the
+                    # Store last, so an installed application always wins
+                    # its own name.
+                    open_app_for(
+                        catalog,
+                        media=player.open_named,
+                        store=store,
+                        unknown_publisher=pack.say(
+                            "unknown_publisher", system_tools.TEXT["unknown_publisher"]
+                        ),
+                    ),
                     open_url,
                     open_settings,
                     media_control,
+                    play_music_for(player),
+                    play_video_for(player),
+                    open_media_for(player),
                     memory_tools.remember_for(memory),
                     memory_tools.forget_for(
                         memory,
@@ -308,6 +343,16 @@ async def _talk(settings: Settings, pack: Locale, *, device: int | str | None = 
                             "forget_confirm", memory_tools.TEXT["forget_confirm"]
                         ),
                     ),
+                    store_tools.install_app_for(
+                        catalog,
+                        store,
+                        confirm_prompt=pack.say(
+                            "store_install_confirm", store_tools.TEXT["store_install_confirm"]
+                        ),
+                    ),
+                    # The owner's own, from %APPDATA%\assistant\tools: read
+                    # here, through the same gate, never in the repository.
+                    *load_local_tools(),
                 ]
             )
             # Loading Whisper takes seconds of four cores. Doing it now rather
@@ -327,7 +372,6 @@ async def _talk(settings: Settings, pack: Locale, *, device: int | str | None = 
                 capture=HandsFree(
                     microphone=SystemMicrophone(device=device),
                     endpoint=Endpoint(detector),
-                    on_mode=screen.hands_free,
                 ),
                 stt=speech,
                 agent=Agent(
@@ -347,6 +391,9 @@ async def _talk(settings: Settings, pack: Locale, *, device: int | str | None = 
                 thinking_timeout=limits.turn_seconds,
                 on_state=screen.state,
                 on_turn=_finished(screen),
+                # The toggle's news goes to the state machine first - off is
+                # an interruption - and to the screen after it.
+                on_mode=screen.hands_free,
                 # Every turn's tokens, priced, to `usage_log`: what `assistant
                 # cost` reads and what the spending limits are checked against.
                 tracker=UsageTracker(
@@ -360,6 +407,7 @@ async def _talk(settings: Settings, pack: Locale, *, device: int | str | None = 
             )
             await assistant.run()
     finally:
+        await player.aclose()
         database.close()
 
 

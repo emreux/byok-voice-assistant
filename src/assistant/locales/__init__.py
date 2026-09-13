@@ -65,12 +65,13 @@ class Locale:
     # is answered by the caller's own English constant through `say`.
     ui: Mapping[str, str]
 
-    # The words the recogniser is told to expect, from `[stt]
-    # vocabulary_hint`: the commands people say most, in this language. Like
-    # the speech language it does not fall back to English - English words
-    # would not help a Turkish speaker be understood - so a pack that leaves
-    # it out gives the recogniser nothing rather than the wrong thing.
-    stt_vocabulary: str = ""
+    # What the recogniser is told to expect before each utterance, from
+    # `[stt] prompt`: a sentence in this language with `{apps}` where the
+    # installed apps' names go (`stt/local_whisper.py`). Like the speech
+    # language it does not fall back to English - English words would not
+    # help a Turkish speaker be understood - so a pack that leaves it out
+    # gives the recogniser the names alone rather than the wrong sentence.
+    stt_prompt: str = ""
 
     # The words the confirmation window listens for, from `[speech]`
     # (design.md 3.1 rule 2). They fall back the way sentences do, not the
@@ -132,7 +133,7 @@ def load(code: str | None = None, *, directory: Path | None = None) -> Locale:
         stt_language=_text(_table(pack, "stt"), "language") or wanted,
         voices=_texts(_table(_table(pack, "tts"), "voice")),
         ui={**_texts(_table(english, "ui")), **_texts(_table(pack, "ui"))},
-        stt_vocabulary=_text(_table(pack, "stt"), "vocabulary_hint").strip(),
+        stt_prompt=_text(_table(pack, "stt"), "prompt").strip(),
         yes_words=_words(_table(pack, "speech"), "yes_words"),
         no_words=_words(_table(pack, "speech"), "no_words"),
         fillers=_words(_table(pack, "speech"), "filler"),

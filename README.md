@@ -17,7 +17,7 @@ A Windows voice assistant that runs on **your** API key, **your** model, and spe
 assistant  Bluetooth ayarları açılıyor.   443 in, 6 out
     you  Saat kaç?
 assistant  Saat 12 13.
-● ready    Hold Ctrl+Alt+Space to talk, or press Ctrl+Alt+H to keep listening. Ctrl+C stops.
+● ready    Listening - just talk. Ctrl+Alt+H stops listening (and cuts an answer short). Ctrl+C stops everything.
 ```
 
 ## Two things are the point
@@ -44,6 +44,18 @@ third is copying a template and translating the right-hand side.
   recogniser's spelling are forgiven, and Windows' English names are tried before it
   gives up), a web address, a page of Windows Settings (Bluetooth, Wi-Fi, display,
   sound...). The media keys: play, pause, next, previous, volume.
+- **Plays music, rather than searching for it.** "Bir müzik aç", "Yaşar'dan Kumralım
+  çal", "şu videoyu aç" - the song or the video is looked up first and the address that
+  opens is the one that starts playing, in the browser you are already signed in to - in
+  a window of its own, which the next song closes, so five songs are not five tabs. The
+  model never writes a `watch?v=` identifier, because it cannot know one and the ones it
+  invents open "This video isn't available anymore". YouTube Music is the default;
+  Spotify starts in its installed application where there is one. Spotify's catalogue
+  cannot be searched without a developer application, and since February 2026 that
+  needs a Premium subscription this version does not ask for - so a Spotify request
+  finds the recording's ISRC on Deezer (no key) and opens Spotify on that one exact
+  result, or on a plain search when Deezer does not know the song, and says, in as
+  many words, that nothing has started until you press play.
 - **Tells the time without asking anybody.** "Saat kaç", "dur", "iptal" and the other
   short commands the locale pack lists never reach the model: no wait, no tokens. The
   time still comes through the gate, from the same tool the model would call.
@@ -54,6 +66,11 @@ third is copying a template and translating the right-hand side.
   name it in `config.toml`, and even then it asks. There is exactly one path from the
   model's request to a running tool, and `tests/test_policy.py` proves a risky tool cannot
   run unconfirmed.
+- **Offers to install what you do not have.** "Open X" and there is no X: the assistant
+  looks in the Microsoft Store, and if X is there it asks - "'X' (its publisher) will be
+  downloaded from the Microsoft Store. Say yes or no." - and only a yes downloads it
+  (through `winget`, silently), then opens it. A paid app is not bought; you are told it
+  costs money.
 - **Remembers what you ask it to.** "Bana Emre de", "adın Ada" - kept in
   `%APPDATA%\assistant\memory.toml`, plain text you can edit, read into every request,
   still there after a restart. Forty facts at most, and it says so rather than dropping
@@ -121,35 +138,33 @@ Running setup again rewrites `config.toml` from scratch, including `[audio] inpu
 uv run assistant run
 ```
 
-Wait for the line to say `ready`. There are two ways to be heard, and both keys work
-wherever you are - the terminal does not need to be in front.
+Wait for the line to say `ready`. It is already listening: just talk. Each time you
+stop speaking for about half a second, that sentence becomes a turn, and three to four
+seconds later you hear the first sentence of the answer; what was said scrolls past
+above the status line.
 
-**Hold `Ctrl+Alt+Space`, speak, and let go.** Three to four seconds later you hear the
-first sentence of the answer, and what was said scrolls past above the status line.
-`Ctrl+C` stops.
-
-**Or press `Ctrl+Alt+H` once and just talk.** The microphone stays live, and each time you
-stop speaking for about half a second that sentence becomes a turn. Press it again to
-switch back. The status line always says which of the two you are in.
+**`Ctrl+Alt+H` switches listening off and on.** It works wherever you are - the terminal
+does not need to be in front - and the status line always says which state you are in.
+`Ctrl+C` stops the program.
 
 Things worth knowing:
 
-- **Speak while you hold.** Releasing the key ends the recording. Anything shorter than a
-  third of a second is treated as a key touched by accident.
-- **Press again to cut it off.** If the assistant is still talking and you press
-  `Ctrl+Alt+Space`, it stops immediately, drops the request it was waiting on, and
-  listens. `Ctrl+Alt+H` does not interrupt; it only switches the mode.
-- **When it asks, answer.** A risky tool reads its question and listens for six seconds
-  without a key. Say yes or no; when it caught neither it asks once more, and then takes
-  silence for no.
-- **Hands-free hears the whole room.** A television, a phone call, somebody else talking:
-  each is a turn it will try to answer. In a room with other people in it, use the key.
-  A wake word that answers only to its name is v0.5.0.
+- **Anything shorter than a third of a second** is treated as a noise, not a word.
+- **To cut it off, switch it off.** If the assistant is still talking and you press
+  `Ctrl+Alt+H`, it stops immediately, drops the request it was waiting on, and goes
+  quiet; press again to go on. It cannot yet be interrupted by voice - the microphone is
+  deaf while it speaks, so that it does not answer itself.
+- **When it asks, answer.** A risky tool reads its question and listens for six seconds.
+  Say yes or no; when it caught neither it asks once more, and then takes silence for no.
+  Switching off while it asks is a no.
+- **It hears the whole room.** A television, a phone call, somebody else talking: each is
+  a turn it will try to answer. In a room with other people in it, switch it off. A wake
+  word that answers only to its name is v0.5.0.
 - **It does not hear itself.** The microphone is deaf for as long as the answer lasts, plus
   a quarter of a second for the room to stop repeating it.
 - **Silence is not answered.** The recogniser is asked whether the recording held speech at
-  all, never how sure it is of the words: a held key over a quiet room says nothing back, a
-  sentence it could not read gets "I did not catch that", and words are answered however
+  all, never how sure it is of the words: a quiet room says nothing back, a sentence it
+  could not read gets "I did not catch that", and words are answered however
   unsure the decoder was of them.
 
 Which microphone all of this listens through is the system default unless you say otherwise.
@@ -199,12 +214,19 @@ because your voice never leaves the machine with it. `scripts/bench_stt.py` and
 `scripts/bench_e2e.py` measure both on your own recordings (see `fixtures/audio/`).
 
 Whisper is loaded once while the program starts, about three seconds, so the first press
-never waits for it.
+never waits for it. It decodes once, at temperature zero, may write only as many tokens
+as the audio could hold, and throws away a decode that went round in circles - so a hard
+sentence takes three seconds, not thirty, and comes back as "say it again" rather than as
+a word nobody said. Before each sentence it is told, in your language, the apps you have
+opened before and the shortest names of the rest, as many as its window holds.
 
 ## Where your data goes
 
 - **Your voice stays on the machine.** Whisper runs locally; only the transcript is sent to
   the provider you chose.
+- **The name of an app you do not have goes to Microsoft.** When "open X" finds no X on the
+  machine, X is looked up in the Microsoft Store through `winget`. Nothing else is, and
+  nothing is when `winget` is not installed.
 - **Your API key is never written to a file.** It lives in the Windows Credential Manager,
   reached through `keyring`.
 - **What you say is not written down; what the assistant did is.** The database at
@@ -234,6 +256,15 @@ that satisfies the `LLMProvider` protocol, give its test file a `build` function
 one line to `ADAPTERS` in `tests/test_llm_adapters.py`. The contract suite then asks your
 adapter every question it asks the others, unchanged - and a test fails if an adapter is
 registered without being put through it.
+
+## Adding a tool of your own
+
+Drop a `.py` file into `%APPDATA%\assistant\tools\` - beside `config.toml` - with
+functions declared through `@tool` from `assistant.tools.registry`, the way the built-in
+ones are, and they are on offer at the next start. They run in the same process through
+the same permission gate, declare their own risk, and stay on your machine: nothing in
+that folder is part of this repository. A file that will not import is skipped with a
+line in the log, not a crash.
 
 ## Development
 
