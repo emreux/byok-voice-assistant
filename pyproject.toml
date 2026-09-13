@@ -25,6 +25,8 @@ dependencies = [
     "sounddevice>=0.5.6",
     "soundfile>=0.14.0",
     "tenacity>=9.1.4",
+    "winrt-windows-media-control>=3.2.1",
+    "ytmusicapi>=1.12.2",
 ]
 
 [project.scripts]

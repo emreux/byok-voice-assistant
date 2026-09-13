@@ -36,6 +36,7 @@ from pydantic_settings import (
 )
 
 from assistant.agent.limits import Limits
+from assistant.media.youtube import SEARCH_SECONDS
 
 __all__ = [
     "CONFIG_DIR_ENV",
@@ -44,6 +45,7 @@ __all__ = [
     "LLMSettings",
     "LimitSettings",
     "LocaleSettings",
+    "MediaSettings",
     "Settings",
     "ToolSettings",
     "config_dir",
@@ -185,6 +187,34 @@ class ToolSettings(BaseModel):
     unblocked: list[str] = []
 
 
+class MediaSettings(BaseModel):
+    """The `[media]` table: where music comes from, and what happens first.
+
+    `default_service` is what "play something" means when the user did not
+    name a service. It is YouTube Music because that is the one that actually
+    *plays* from here: a song resolves to a `watch?v=` address and starts by
+    itself in the browser the user is signed in to. Spotify is reached the
+    other way round - it can be handed words to search, not a track to play
+    (`media/spotify.py`) - so naming it here means "open a Spotify search for
+    everything", which is a choice and not a default.
+
+    `default_query` fills in for "put some music on" when it is set; empty,
+    the front page of the service decides, which is the service's guess about
+    this listener rather than the assistant's.
+    """
+
+    model_config = ConfigDict(extra="ignore")
+
+    default_service: str = "youtube_music"
+    default_query: str = ""
+    # A song plays in the assistant's own browser window, which the next song
+    # closes; what plays elsewhere would keep going underneath it without
+    # this (`media/now_playing.py`). Off for anyone who would rather the
+    # assistant never touched what they were listening to.
+    pause_before_playing: bool = True
+    search_timeout_seconds: float = SEARCH_SECONDS
+
+
 # The numbers of section 3.11 are written once, in `agent/limits.py`; the
 # file's defaults are read off them so that the two cannot drift apart.
 _LIMITS = Limits()
@@ -227,6 +257,7 @@ class Settings(BaseSettings):
     audio: AudioSettings = AudioSettings()
     tools: ToolSettings = ToolSettings()
     limits: LimitSettings = LimitSettings()
+    media: MediaSettings = MediaSettings()
 
     @classmethod
     def settings_customise_sources(
