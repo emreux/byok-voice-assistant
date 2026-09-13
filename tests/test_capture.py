@@ -1,10 +1,10 @@
-"""Both ways of being listened to: what gets recorded, and what does not.
+"""Being listened to: what reaches the detector, and what does not.
 
 Two threads that are not the event loop reach into this module - the keyboard
 listener and PortAudio's callback - so the tests drive it the same way, and
 three specific traps are pinned:
 
-* audio that arrives while no key is held belongs to nobody,
+* audio that arrives while listening is off belongs to nobody,
 * the buffer PortAudio hands over is reused, so it has to be copied,
 * the stream is opened at the rate the speech layer declares, not a plausible
   looking one. That last mistake has already been made once in this project.
@@ -18,7 +18,6 @@ from __future__ import annotations
 
 import asyncio
 import sys
-import threading
 from types import SimpleNamespace
 from typing import Any
 
@@ -28,13 +27,11 @@ from loguru import logger
 
 from assistant.audio.capture import (
     CHUNK_FRAMES,
-    DEFAULT_HOTKEY,
     DEFAULT_TOGGLE_HOTKEY,
     ECHO_TAIL_SECONDS,
     HandsFree,
     KeyCombination,
     MicrophoneUnavailableError,
-    PushToTalk,
     SystemHotkey,
     SystemMicrophone,
     device_choice,
@@ -249,75 +246,159 @@ def test_letting_go_twice_only_ends_it_once() -> None:
 
 
 # --------------------------------------------------------------------------
-# What ends up in an utterance
+# Listening without a key
 # --------------------------------------------------------------------------
 
 
-async def test_what_was_said_while_the_key_was_down_is_what_comes_back() -> None:
-    hotkey, microphone = FakeHotkey(), FakeMicrophone()
+class FakeEndpoint:
+    """A detector with no patience: a loud block is a sentence, a quiet one
+    ends it. Where the real thresholds sit is `test_vad.py`'s business, and
+    these tests are about which blocks reach a detector at all."""
 
-    with PushToTalk(hotkey=hotkey, microphone=microphone) as talk:
-        hotkey.press()
-        microphone.hear(tone(0.1))
-        microphone.hear(tone(0.2))
-        hotkey.release()
+    LOUD = 0.5
+
+    def __init__(self) -> None:
+        self.speaking = False
+        self.heard: list[Audio] = []
+        self.resets = 0
+        self._take: list[Audio] = []
+
+    def feed(self, chunk: Audio) -> list[Audio]:
+        self.heard.append(chunk)
+        if float(chunk[0]) >= self.LOUD:
+            self.speaking = True
+            self._take.append(chunk)
+            return []
+        if not self._take:
+            return []
+
+        take, self._take = self._take, []
+        self.speaking = False
+        return [np.concatenate(take)]
+
+    def reset(self) -> None:
+        self.resets += 1
+        self.speaking = False
+        self._take = []
+
+
+def wired(**extra: Any) -> tuple[HandsFree, FakeHotkey, FakeMicrophone, FakeEndpoint]:
+    """A capture with no keyboard, no microphone and no model."""
+    toggle, microphone, endpoint = FakeHotkey(), FakeMicrophone(), FakeEndpoint()
+    talk = HandsFree(microphone=microphone, toggle=toggle, endpoint=endpoint, **extra)
+    return talk, toggle, microphone, endpoint
+
+
+async def test_it_listens_from_the_moment_it_starts() -> None:
+    """`assistant run` means run: there is no other key to press, and a program
+    that starts deaf looks like one that failed to start (owner's decision,
+    2026-09-11)."""
+    talk, _, microphone, endpoint = wired()
+
+    with talk:
+        microphone.hear(tone(0.9))
+        await asyncio.sleep(0)
+
+        assert talk.listening is True
+        assert len(endpoint.heard) == 1
+
+
+async def test_it_can_be_started_deaf_for_whoever_wants_that() -> None:
+    talk, _, microphone, endpoint = wired(listening=False)
+
+    with talk:
+        microphone.hear(tone(0.9))
+        await asyncio.sleep(0)
+
+        assert talk.listening is False
+        assert endpoint.heard == []
+
+
+async def test_a_sentence_comes_back_as_one_buffer() -> None:
+    talk, _, microphone, _ = wired()
+
+    with talk:
+        microphone.hear(tone(0.9))
+        microphone.hear(tone(0.8))
+        microphone.hear(tone(0.1))  # the sentence ended
 
         pcm = await talk.utterance()
 
-    assert np.array_equal(pcm, np.concatenate([tone(0.1), tone(0.2)]))
+    assert np.array_equal(pcm, np.concatenate([tone(0.9), tone(0.8)]))
     assert pcm.dtype == np.float32
 
 
-async def test_a_room_that_was_never_asked_to_listen_is_not_recorded() -> None:
-    """The microphone is open all the time; that is not the same as recording."""
-    hotkey, microphone = FakeHotkey(), FakeMicrophone()
+async def test_two_sentences_are_two_utterances() -> None:
+    talk, _, microphone, _ = wired()
 
-    with PushToTalk(hotkey=hotkey, microphone=microphone) as talk:
-        microphone.hear(tone(0.9))  # nobody pressed anything
-        hotkey.press()
-        microphone.hear(tone(0.1))
-        hotkey.release()
-
-        pcm = await talk.utterance()
-
-    assert np.array_equal(pcm, tone(0.1))
-
-
-async def test_audio_that_arrives_after_the_release_belongs_to_no_utterance() -> None:
-    """PortAudio's thread and the keyboard's thread do not agree on an order,
-    so a chunk can turn up just after the key came up."""
-    hotkey, microphone = FakeHotkey(), FakeMicrophone()
-
-    with PushToTalk(hotkey=hotkey, microphone=microphone) as talk:
-        hotkey.press()
-        microphone.hear(tone(0.1))
-        hotkey.release()
+    with talk:
         microphone.hear(tone(0.9))
+        microphone.hear(tone(0.1))
+        microphone.hear(tone(0.7))
+        microphone.hear(tone(0.1))
 
         first = await talk.utterance()
-
-        hotkey.press()
-        microphone.hear(tone(0.2))
-        hotkey.release()
         second = await talk.utterance()
 
-    assert np.array_equal(first, tone(0.1))
-    assert np.array_equal(second, tone(0.2))
+    assert np.array_equal(first, tone(0.9))
+    assert np.array_equal(second, tone(0.7))
+
+
+async def test_an_utterance_survives_until_somebody_asks_for_it() -> None:
+    """The state machine is busy with the last turn when the next sentence
+    ends. It is kept, not dropped."""
+    talk, _, microphone, _ = wired()
+
+    with talk:
+        microphone.hear(tone(0.9))
+        microphone.hear(tone(0.1))
+        await asyncio.sleep(0)
+
+        pcm = await asyncio.wait_for(talk.utterance(), timeout=0.5)
+
+    assert np.array_equal(pcm, tone(0.9))
+
+
+async def test_the_toggle_turns_it_off() -> None:
+    talk, toggle, microphone, endpoint = wired()
+
+    with talk:
+        toggle.press()
+        await asyncio.sleep(0)
+        microphone.hear(tone(0.9))
+        await asyncio.sleep(0)
+
+        assert talk.listening is False
+        assert endpoint.heard == []
+
+
+async def test_the_toggle_turns_it_on_again() -> None:
+    talk, toggle, microphone, endpoint = wired()
+
+    with talk:
+        toggle.press()
+        await asyncio.sleep(0)
+        toggle.press()
+        await asyncio.sleep(0)
+        microphone.hear(tone(0.9))
+        await asyncio.sleep(0)
+
+        assert talk.listening is True
+        assert len(endpoint.heard) == 1
 
 
 async def test_idle_audio_never_reaches_the_event_loop(monkeypatch: pytest.MonkeyPatch) -> None:
     """The microphone is open all day.
 
-    Handing every block to the loop while nobody is talking wakes it ten times
-    a second to throw the block away again. The two tests either side of this
-    one show the block does not end up in an utterance; this one shows it does
+    Handing every block to the loop while listening is off wakes it fifty
+    times a second to throw the block away again. The tests around this one
+    show the block does not end up in an utterance; this one shows it does
     not cross the thread boundary in the first place - a claim with no public
     face, which is why it reaches for the method behind it.
     """
-    hotkey, microphone = FakeHotkey(), FakeMicrophone()
-    talk = PushToTalk(hotkey=hotkey, microphone=microphone)
+    talk, _, microphone, _ = wired(listening=False)
     crossed: list[Audio] = []
-    monkeypatch.setattr(talk, "_keep", crossed.append)
+    monkeypatch.setattr(talk, "_examine", crossed.append)
 
     with talk:
         microphone.hear(tone(0.9))
@@ -326,108 +407,162 @@ async def test_idle_audio_never_reaches_the_event_loop(monkeypatch: pytest.Monke
     assert crossed == []
 
 
-async def test_a_block_that_crosses_the_release_joins_no_turn_at_all() -> None:
-    """The real race, reproduced.
+async def test_the_mode_is_said_out_where_it_can_be_shown() -> None:
+    """The status line is the only thing on screen that answers whether the
+    microphone is live, and a mode nobody can see the state of is one left on
+    in a room with other people in it. Starting counts: the line would
+    otherwise show the paused hint over a microphone that is listening."""
+    seen: list[bool] = []
+    talk, toggle, _, _ = wired(on_mode=seen.append)
 
-    PortAudio's thread reads the recording flag an instant before the keyboard
-    thread clears it, so its block is handed to the loop *after* the take was
-    closed. Driving that from the fake microphone is impossible - the flag is
-    read inside it - so the block is delivered the way PortAudio's thread would
-    have, one step too late.
-    """
-    hotkey, microphone = FakeHotkey(), FakeMicrophone()
+    with talk:
+        toggle.press()
+        toggle.press()
+        await asyncio.sleep(0)
 
-    with PushToTalk(hotkey=hotkey, microphone=microphone) as talk:
-        hotkey.press()
+    assert seen == [True, False, True]
+
+
+async def test_the_mode_is_reported_on_the_event_loop() -> None:
+    """It is posted from the keyboard's thread and runs on the event loop,
+    which is what makes it safe for `app.py` to stop the speaker from it."""
+    loops: list[object] = []
+    talk, toggle, _, _ = wired(on_mode=lambda _: loops.append(asyncio.get_running_loop()))
+
+    with talk:
+        toggle.press()
+        await asyncio.sleep(0)
+
+    assert loops == [asyncio.get_running_loop()] * 2
+
+
+async def test_two_quick_presses_report_two_changes_and_not_one_twice() -> None:
+    """Which way it went travels with the message: a listener that read the
+    flag on arrival would be told the mode is whatever it is *now*, twice."""
+    seen: list[bool] = []
+    talk, toggle, _, _ = wired(on_mode=seen.append)
+
+    with talk:
+        toggle.press()
+        toggle.press()
+        toggle.press()
+        await asyncio.sleep(0)
+
+    assert seen == [True, False, True, False]
+
+
+async def test_switching_the_mode_starts_a_new_stream() -> None:
+    """Whatever the detector was in the middle of belongs to before the switch."""
+    talk, toggle, _, endpoint = wired()
+
+    with talk:
+        before = endpoint.resets
+        toggle.press()
+        await asyncio.sleep(0)
+
+    assert endpoint.resets == before + 1
+
+
+async def test_the_moment_the_detector_hears_a_voice_is_announced() -> None:
+    """`app.py` learns from it that whatever it was doing has been overtaken,
+    and stops talking before the sentence is even over."""
+    started: list[str] = []
+    talk, _, microphone, _ = wired(on_listening=lambda: started.append("now"))
+
+    with talk:
         microphone.hear(tone(0.1))
-        hotkey.release()
-        await asyncio.sleep(0)  # the loop begins, keeps and ends the take
-        talk._keep(tone(0.9))  # the block that was already in PortAudio's hands
+        await asyncio.sleep(0)
+        assert started == []
 
-        first = await talk.utterance()
+        microphone.hear(tone(0.9))
+        await asyncio.sleep(0)
 
-        hotkey.press()
-        microphone.hear(tone(0.2))
-        hotkey.release()
-        second = await talk.utterance()
-
-    assert np.array_equal(first, tone(0.1))
-    assert np.array_equal(second, tone(0.2))
+    assert started == ["now"]
 
 
-async def test_a_press_with_nothing_said_is_an_empty_utterance() -> None:
-    """A stray keypress is still a turn; what to do about it is the state
-    machine's decision, not this module's."""
-    hotkey, microphone = FakeHotkey(), FakeMicrophone()
+async def test_the_announcement_arrives_where_asyncio_can_be_touched() -> None:
+    loops: list[object] = []
+    talk, _, microphone, _ = wired(on_listening=lambda: loops.append(asyncio.get_running_loop()))
 
-    with PushToTalk(hotkey=hotkey, microphone=microphone) as talk:
-        hotkey.press()
-        hotkey.release()
+    with talk:
+        microphone.hear(tone(0.9))
+        await asyncio.sleep(0)
 
-        pcm = await talk.utterance()
-
-    assert len(pcm) == 0
-    assert pcm.dtype == np.float32
+    assert loops == [asyncio.get_running_loop()]
 
 
-async def test_an_utterance_survives_until_somebody_asks_for_it() -> None:
-    """The key can be released while the assistant is still speaking; the
-    recording is not thrown away because nobody was waiting yet."""
-    hotkey, microphone = FakeHotkey(), FakeMicrophone()
+async def test_a_sentence_is_announced_once_and_not_once_a_block() -> None:
+    started: list[str] = []
+    talk, _, microphone, _ = wired(on_listening=lambda: started.append("now"))
 
-    with PushToTalk(hotkey=hotkey, microphone=microphone) as talk:
-        hotkey.press()
-        microphone.hear(tone(0.3))
-        hotkey.release()
-        await asyncio.sleep(0)  # the assistant was busy with something else
+    with talk:
+        for _ in range(3):
+            microphone.hear(tone(0.9))
+        await asyncio.sleep(0)
+
+    assert started == ["now"]
+
+
+async def test_listening_works_whether_or_not_anybody_listens_for_the_announcement() -> None:
+    talk, _, microphone, _ = wired()
+
+    with talk:
+        microphone.hear(tone(0.9))
+        microphone.hear(tone(0.1))
 
         pcm = await talk.utterance()
 
-    assert np.array_equal(pcm, tone(0.3))
+    assert np.array_equal(pcm, tone(0.9))
 
 
-async def test_a_release_nobody_pressed_produces_no_utterance() -> None:
-    """The combination can be completed in another application and released
-    over ours; there is no recording to hand over."""
-    hotkey, microphone = FakeHotkey(), FakeMicrophone()
-
-    with PushToTalk(hotkey=hotkey, microphone=microphone) as talk:
-        hotkey.release()
-
-        with pytest.raises(TimeoutError):
-            await asyncio.wait_for(talk.utterance(), timeout=0.05)
+# --------------------------------------------------------------------------
+# Not hearing the assistant's own voice
+# --------------------------------------------------------------------------
 
 
-async def test_two_presses_are_two_utterances() -> None:
-    hotkey, microphone = FakeHotkey(), FakeMicrophone()
+async def test_nothing_is_listened_to_while_the_assistant_speaks() -> None:
+    """Without this the detector hears the answer come out of the speakers,
+    takes it for a question, and answers it - once per API call."""
+    talk, _, microphone, endpoint = wired()
 
-    with PushToTalk(hotkey=hotkey, microphone=microphone) as talk:
-        for level in (0.1, 0.2):
-            hotkey.press()
-            microphone.hear(tone(level))
-            hotkey.release()
+    with talk:
+        talk.mute()
+        microphone.hear(tone(0.9))
+        await asyncio.sleep(0)
 
-        first, second = await talk.utterance(), await talk.utterance()
-
-    assert float(first[0]) == pytest.approx(0.1)
-    assert float(second[0]) == pytest.approx(0.2)
+    assert endpoint.heard == []
 
 
-async def test_audio_recorded_on_another_thread_still_arrives() -> None:
-    """PortAudio calls back on its own thread; the bridge has to be one that
-    asyncio tolerates from the outside."""
-    hotkey, microphone = FakeHotkey(), FakeMicrophone()
+async def test_the_room_still_repeating_the_answer_is_not_a_question() -> None:
+    """The sound card holds some of the answer and the room holds the rest;
+    both arrive after the speaker has been told to stop."""
+    talk, _, microphone, endpoint = wired()
+    tail = round(ECHO_TAIL_SECONDS * SAMPLE_RATE)
 
-    with PushToTalk(hotkey=hotkey, microphone=microphone) as talk:
-        hotkey.press()
-        recorder = threading.Thread(target=lambda: microphone.hear(tone(0.4)))
-        recorder.start()
-        recorder.join()
-        hotkey.release()
+    with talk:
+        talk.mute()
+        talk.unmute()
 
-        pcm = await talk.utterance()
+        microphone.hear(tone(0.9, frames=tail))
+        await asyncio.sleep(0)
+        assert endpoint.heard == [], "the assistant's own echo reached the detector"
 
-    assert np.array_equal(pcm, tone(0.4))
+        microphone.hear(tone(0.9))
+        await asyncio.sleep(0)
+
+    assert len(endpoint.heard) == 1
+
+
+async def test_listening_again_starts_a_new_stream() -> None:
+    """The frames either side of an answer are not neighbours."""
+    talk, _, _, endpoint = wired()
+
+    with talk:
+        before = endpoint.resets
+        talk.mute()
+        talk.unmute()
+
+    assert endpoint.resets == before + 1
 
 
 # --------------------------------------------------------------------------
@@ -435,22 +570,23 @@ async def test_audio_recorded_on_another_thread_still_arrives() -> None:
 # --------------------------------------------------------------------------
 
 
-async def test_starting_watches_the_keyboard_and_opens_the_microphone() -> None:
-    hotkey, microphone = FakeHotkey(), FakeMicrophone()
+async def test_starting_watches_the_key_and_opens_the_microphone() -> None:
+    talk, toggle, microphone, _ = wired()
 
-    with PushToTalk(hotkey=hotkey, microphone=microphone):
-        assert (hotkey.watching, microphone.opened) == (True, True)
+    with talk:
+        assert (toggle.watching, microphone.opened) == (True, True)
 
 
-async def test_leaving_closes_both_even_after_a_failure() -> None:
+async def test_leaving_lets_go_of_both_even_after_a_failure() -> None:
     """A microphone left open is a light that stays on and a device another
     application cannot have."""
-    hotkey, microphone = FakeHotkey(), FakeMicrophone()
+    talk, toggle, microphone, _ = wired()
 
-    with pytest.raises(RuntimeError), PushToTalk(hotkey=hotkey, microphone=microphone):
+    with pytest.raises(RuntimeError), talk:
         raise RuntimeError("the turn failed")
 
-    assert (hotkey.watching, microphone.opened) == (False, False)
+    assert (toggle.watching, microphone.opened) == (False, False)
+    assert talk.listening is False
 
 
 # --------------------------------------------------------------------------
@@ -697,7 +833,7 @@ def test_the_default_combination_is_three_keys_the_system_knows() -> None:
     keys = SystemHotkey().keys
 
     assert len(keys) == 3
-    assert DEFAULT_HOTKEY == "<ctrl>+<alt>+<space>"
+    assert DEFAULT_TOGGLE_HOTKEY == "<ctrl>+<alt>+h"
 
 
 def test_a_combination_that_makes_no_sense_is_refused_at_once() -> None:
@@ -706,445 +842,31 @@ def test_a_combination_that_makes_no_sense_is_refused_at_once() -> None:
 
 
 # --------------------------------------------------------------------------
-# Telling the state machine that the key went down
+# The confirmation window (2.3): listening for an answer
 # --------------------------------------------------------------------------
 
 
-async def test_the_moment_recording_starts_is_announced() -> None:
-    """`app.py` stops speaking on this. Waiting for the finished utterance
-    instead would mean the assistant talks over the user until they let go of
-    the key - and that the microphone records its own voice doing it."""
-    hotkey, microphone = FakeHotkey(), FakeMicrophone()
-    started: list[str] = []
-
-    with PushToTalk(hotkey=hotkey, microphone=microphone) as talk:
-        talk.on_listening = lambda: started.append("now")
-        hotkey.press()
-        await asyncio.sleep(0)
-
-    assert started == ["now"]
-
-
-async def test_the_announcement_arrives_where_asyncio_can_be_touched() -> None:
-    """It is posted from the keyboard's thread and runs on the event loop,
-    which is what makes it safe for the listener to stop the speaker."""
-    hotkey, microphone = FakeHotkey(), FakeMicrophone()
-    loops: list[object] = []
-
-    with PushToTalk(hotkey=hotkey, microphone=microphone) as talk:
-        talk.on_listening = lambda: loops.append(asyncio.get_running_loop())
-        hotkey.press()
-        await asyncio.sleep(0)
-
-    assert loops == [asyncio.get_running_loop()]
-
-
-async def test_recording_works_whether_or_not_anybody_listens_for_the_press() -> None:
-    hotkey, microphone = FakeHotkey(), FakeMicrophone()
-
-    with PushToTalk(hotkey=hotkey, microphone=microphone) as talk:
-        hotkey.press()
-        microphone.hear(tone(0.1))
-        hotkey.release()
-
-        pcm = await talk.utterance()
-
-    assert np.array_equal(pcm, tone(0.1))
-
-
-# --------------------------------------------------------------------------
-# Hands free: the key that is pressed once instead of held
-# --------------------------------------------------------------------------
-
-
-class FakeEndpoint:
-    """A detector with no patience: a loud block is a sentence, a quiet one
-    ends it. Where the real thresholds sit is `test_vad.py`'s business, and
-    these tests are about which blocks reach a detector at all."""
-
-    LOUD = 0.5
-
-    def __init__(self) -> None:
-        self.speaking = False
-        self.heard: list[Audio] = []
-        self.resets = 0
-        self._take: list[Audio] = []
-
-    def feed(self, chunk: Audio) -> list[Audio]:
-        self.heard.append(chunk)
-        if float(chunk[0]) >= self.LOUD:
-            self.speaking = True
-            self._take.append(chunk)
-            return []
-        if not self._take:
-            return []
-
-        take, self._take = self._take, []
-        self.speaking = False
-        return [np.concatenate(take)]
-
-    def reset(self) -> None:
-        self.resets += 1
-        self.speaking = False
-        self._take = []
-
-
-def wired(**extra: Any) -> tuple[HandsFree, FakeHotkey, FakeHotkey, FakeMicrophone, FakeEndpoint]:
-    """A hands-free capture with no keyboard, no microphone and no model."""
-    hotkey, toggle = FakeHotkey(), FakeHotkey()
-    microphone, endpoint = FakeMicrophone(), FakeEndpoint()
-    talk = HandsFree(
-        hotkey=hotkey, microphone=microphone, toggle=toggle, endpoint=endpoint, **extra
-    )
-    return talk, toggle, hotkey, microphone, endpoint
-
-
-async def test_nothing_is_listened_to_until_the_toggle_is_pressed() -> None:
-    """The mode is off when the program starts. A microphone that begins live
-    is one the user never agreed to."""
-    talk, _, _, microphone, endpoint = wired()
-
-    with talk:
-        microphone.hear(tone(0.9))
-        await asyncio.sleep(0)
-
-        assert talk.listening is False
-        assert endpoint.heard == []
-
-
-async def test_what_was_said_after_the_toggle_comes_back_without_any_key() -> None:
-    talk, toggle, _, microphone, _ = wired()
-
-    with talk:
-        toggle.press()
-        await asyncio.sleep(0)
-        microphone.hear(tone(0.9))
-        microphone.hear(tone(0.8))
-        microphone.hear(tone(0.1))  # the sentence ended
-
-        pcm = await talk.utterance()
-
-    assert np.array_equal(pcm, np.concatenate([tone(0.9), tone(0.8)]))
-    assert pcm.dtype == np.float32
-
-
-async def test_the_toggle_turns_it_off_again() -> None:
-    talk, toggle, _, microphone, endpoint = wired()
-
-    with talk:
-        toggle.press()
-        await asyncio.sleep(0)
-        toggle.press()
-        await asyncio.sleep(0)
-
-        microphone.hear(tone(0.9))
-        await asyncio.sleep(0)
-
-    assert talk.listening is False
-    assert endpoint.heard == []
-
-
-async def test_switching_the_mode_is_said_out_where_it_can_be_shown() -> None:
-    """The status line is the only thing on screen that answers whether the
-    microphone is live, and a mode nobody can see the state of is one left on
-    in a room with other people in it."""
-    seen: list[bool] = []
-    talk, toggle, _, _, _ = wired(on_mode=seen.append)
-
-    with talk:
-        toggle.press()
-        toggle.press()
-        await asyncio.sleep(0)
-
-    assert seen == [True, False]
-
-
-async def test_switching_the_mode_starts_a_new_stream() -> None:
-    """Whatever the detector was in the middle of belongs to before the switch."""
-    talk, toggle, _, _, endpoint = wired()
-
-    with talk:
-        toggle.press()
-        await asyncio.sleep(0)
-
-    assert endpoint.resets == 1
-
-
-async def test_the_moment_the_detector_hears_a_voice_is_announced() -> None:
-    """The hands-free equivalent of the key going down: `app.py` learns from
-    it that whatever it was doing has been overtaken."""
-    started: list[str] = []
-    talk, toggle, _, microphone, _ = wired(on_listening=lambda: started.append("now"))
-
-    with talk:
-        toggle.press()
-        await asyncio.sleep(0)
-        microphone.hear(tone(0.1))
-        await asyncio.sleep(0)
-        assert started == []
-
-        microphone.hear(tone(0.9))
-        await asyncio.sleep(0)
-
-    assert started == ["now"]
-
-
-async def test_a_sentence_is_announced_once_and_not_once_a_block() -> None:
-    started: list[str] = []
-    talk, toggle, _, microphone, _ = wired(on_listening=lambda: started.append("now"))
-
-    with talk:
-        toggle.press()
-        await asyncio.sleep(0)
-        for _ in range(3):
-            microphone.hear(tone(0.9))
-        await asyncio.sleep(0)
-
-    assert started == ["now"]
-
-
-# --------------------------------------------------------------------------
-# The key still works, and still wins
-# --------------------------------------------------------------------------
-
-
-async def test_holding_the_key_records_even_while_hands_free_is_on() -> None:
-    """The detector will be wrong about some room, and the key that is never
-    wrong has to be under the user's thumb when it is."""
-    talk, toggle, hotkey, microphone, endpoint = wired()
-
-    with talk:
-        toggle.press()
-        await asyncio.sleep(0)
-        hotkey.press()
-        microphone.hear(tone(0.9))
-        hotkey.release()
-
-        pcm = await talk.utterance()
-
-    assert np.array_equal(pcm, tone(0.9))
-    assert endpoint.heard == [], "the block was recorded twice over"
-
-
-async def test_holding_the_key_throws_away_what_the_detector_had_collected() -> None:
-    """Half a sentence the room started is not part of what the user is about
-    to say deliberately."""
-    talk, toggle, hotkey, microphone, endpoint = wired()
-
-    with talk:
-        toggle.press()
-        await asyncio.sleep(0)
-        microphone.hear(tone(0.9))
-        await asyncio.sleep(0)
-        before = endpoint.resets
-
-        hotkey.press()
-        await asyncio.sleep(0)
-
-    assert endpoint.resets == before + 1
-
-
-async def test_the_key_still_works_when_hands_free_was_never_switched_on() -> None:
-    talk, _, hotkey, microphone, _ = wired()
-
-    with talk:
-        hotkey.press()
-        microphone.hear(tone(0.2))
-        hotkey.release()
-
-        pcm = await talk.utterance()
-
-    assert np.array_equal(pcm, tone(0.2))
-
-
-# --------------------------------------------------------------------------
-# Not hearing the assistant's own voice
-# --------------------------------------------------------------------------
-
-
-async def test_nothing_is_listened_to_while_the_assistant_speaks() -> None:
-    """Without this the detector hears the answer come out of the speakers,
-    takes it for a question, and answers it - once per API call."""
-    talk, toggle, _, microphone, endpoint = wired()
-
-    with talk:
-        toggle.press()
-        await asyncio.sleep(0)
-        talk.mute()
-
-        microphone.hear(tone(0.9))
-        await asyncio.sleep(0)
-
-    assert endpoint.heard == []
-
-
-async def test_the_room_still_repeating_the_answer_is_not_a_question() -> None:
-    """The sound card holds some of the answer and the room holds the rest;
-    both arrive after the speaker has been told to stop."""
-    talk, toggle, _, microphone, endpoint = wired()
-    tail = round(ECHO_TAIL_SECONDS * SAMPLE_RATE)
-
-    with talk:
-        toggle.press()
-        await asyncio.sleep(0)
-        talk.mute()
-        talk.unmute()
-
-        microphone.hear(tone(0.9, frames=tail))
-        await asyncio.sleep(0)
-        assert endpoint.heard == [], "the assistant's own echo reached the detector"
-
-        microphone.hear(tone(0.9))
-        await asyncio.sleep(0)
-
-    assert len(endpoint.heard) == 1
-
-
-async def test_listening_again_starts_a_new_stream() -> None:
-    """The frames either side of an answer are not neighbours."""
-    talk, toggle, _, _, endpoint = wired()
-
-    with talk:
-        toggle.press()
-        await asyncio.sleep(0)
-        before = endpoint.resets
-        talk.mute()
-        talk.unmute()
-
-    assert endpoint.resets == before + 1
-
-
-async def test_push_to_talk_is_never_deafened() -> None:
-    """A key pressed while the assistant is talking is the user interrupting
-    it, and that is the one thing that has to keep working."""
-    hotkey, microphone = FakeHotkey(), FakeMicrophone()
-
-    with PushToTalk(hotkey=hotkey, microphone=microphone) as talk:
-        talk.mute()
-        hotkey.press()
-        microphone.hear(tone(0.1))
-        hotkey.release()
-
-        pcm = await talk.utterance()
-
-    assert np.array_equal(pcm, tone(0.1))
-
-
-# --------------------------------------------------------------------------
-# The devices, again - there are two keyboards to let go of now
-# --------------------------------------------------------------------------
-
-
-async def test_starting_watches_both_keys() -> None:
-    talk, toggle, hotkey, microphone, _ = wired()
-
-    with talk:
-        assert (hotkey.watching, toggle.watching, microphone.opened) == (True, True, True)
-
-
-async def test_leaving_lets_go_of_both_keys_and_the_microphone() -> None:
-    talk, toggle, hotkey, microphone, _ = wired()
-
-    with pytest.raises(RuntimeError), talk:
-        raise RuntimeError("the turn failed")
-
-    assert (hotkey.watching, toggle.watching, microphone.opened) == (False, False, False)
-    assert talk.listening is False
-
-
-def test_the_two_combinations_are_not_the_same_keys() -> None:
-    """One is held and one is pressed; the same combination for both would make
-    every hands-free switch a recording as well."""
-    assert DEFAULT_TOGGLE_HOTKEY != DEFAULT_HOTKEY
-    assert SystemHotkey(DEFAULT_TOGGLE_HOTKEY).keys != SystemHotkey(DEFAULT_HOTKEY).keys
-
-
-# --------------------------------------------------------------------------
-# The confirmation window (2.3): listening for an answer, key or no key
-# --------------------------------------------------------------------------
-
-
-async def opened(talk: PushToTalk, seconds: float = 1.0) -> asyncio.Task[Audio | None]:
+async def opened(talk: HandsFree, seconds: float = 1.0) -> asyncio.Task[Audio | None]:
     """`listen_for`, running, with its window already open."""
     window = asyncio.create_task(talk.listen_for(seconds))
     await asyncio.sleep(0)
     return window
 
 
-async def test_a_press_inside_the_window_is_the_answer() -> None:
-    hotkey, microphone = FakeHotkey(), FakeMicrophone()
-
-    with PushToTalk(hotkey=hotkey, microphone=microphone) as talk:
-        window = await opened(talk)
-        hotkey.press()
-        microphone.hear(tone(0.3))
-        hotkey.release()
-
-        answer = await window
-
-    assert answer is not None
-    assert np.array_equal(answer, tone(0.3))
-
-
 async def test_a_window_nobody_answers_in_closes_with_nothing() -> None:
-    hotkey, microphone = FakeHotkey(), FakeMicrophone()
+    talk, _, _, _ = wired()
 
-    with PushToTalk(hotkey=hotkey, microphone=microphone) as talk:
+    with talk:
         assert await talk.listen_for(0.02) is None
 
 
-async def test_a_press_inside_the_window_is_not_announced() -> None:
-    """The state machine would take it for a new question and withdraw the
-    one it was asking (`app.py`); inside the window the press is the answer."""
-    hotkey, microphone = FakeHotkey(), FakeMicrophone()
+async def test_with_listening_off_the_window_still_hears_a_sentence() -> None:
+    """The assistant asked, so the answer is heard even with the mode off -
+    and the mode is as it was afterwards."""
     started: list[str] = []
-
-    with PushToTalk(hotkey=hotkey, microphone=microphone) as talk:
-        talk.on_listening = lambda: started.append("now")
-        window = await opened(talk)
-        hotkey.press()
-        microphone.hear(tone(0.3))
-        hotkey.release()
-        await window
-
-    assert started == []
-
-
-async def test_the_answer_does_not_come_back_as_a_question_as_well() -> None:
-    hotkey, microphone = FakeHotkey(), FakeMicrophone()
-
-    with PushToTalk(hotkey=hotkey, microphone=microphone) as talk:
-        window = await opened(talk)
-        hotkey.press()
-        hotkey.release()
-        await window
-
-        with pytest.raises(TimeoutError):
-            await asyncio.wait_for(talk.utterance(), timeout=0.05)
-
-
-async def test_once_the_window_is_closed_a_press_is_a_question_again() -> None:
-    hotkey, microphone = FakeHotkey(), FakeMicrophone()
-    started: list[str] = []
-
-    with PushToTalk(hotkey=hotkey, microphone=microphone) as talk:
-        talk.on_listening = lambda: started.append("now")
-        await talk.listen_for(0.02)
-        hotkey.press()
-        microphone.hear(tone(0.4))
-        hotkey.release()
-
-        pcm = await talk.utterance()
-
-    assert started == ["now"]
-    assert np.array_equal(pcm, tone(0.4))
-
-
-async def test_with_hands_free_off_the_window_still_hears_a_sentence() -> None:
-    """The assistant asked, so the answer is heard without any key - in the
-    one mode where nothing else is - and the mode is as it was afterwards."""
-    started: list[str] = []
-    talk, _, _, microphone, endpoint = wired(on_listening=lambda: started.append("now"))
+    talk, _, microphone, endpoint = wired(
+        listening=False, on_listening=lambda: started.append("now")
+    )
 
     with talk:
         window = await opened(talk)
@@ -1164,13 +886,11 @@ async def test_with_hands_free_off_the_window_still_hears_a_sentence() -> None:
     assert len(endpoint.heard) == 3
 
 
-async def test_with_hands_free_on_the_answer_does_not_become_a_question() -> None:
+async def test_the_answer_does_not_become_a_question_as_well() -> None:
     started: list[str] = []
-    talk, toggle, _, microphone, _ = wired(on_listening=lambda: started.append("now"))
+    talk, _, microphone, _ = wired(on_listening=lambda: started.append("now"))
 
     with talk:
-        toggle.press()
-        await asyncio.sleep(0)
         window = await opened(talk)
         microphone.hear(tone(0.9))
         microphone.hear(tone(0.1))
@@ -1184,13 +904,11 @@ async def test_with_hands_free_on_the_answer_does_not_become_a_question() -> Non
     assert started == []
 
 
-async def test_after_the_window_hands_free_listens_for_questions_again() -> None:
+async def test_after_the_window_it_listens_for_questions_again() -> None:
     started: list[str] = []
-    talk, toggle, _, microphone, _ = wired(on_listening=lambda: started.append("now"))
+    talk, _, microphone, _ = wired(on_listening=lambda: started.append("now"))
 
     with talk:
-        toggle.press()
-        await asyncio.sleep(0)
         assert await talk.listen_for(0.02) is None
 
         microphone.hear(tone(0.9))
@@ -1201,30 +919,10 @@ async def test_after_the_window_hands_free_listens_for_questions_again() -> None
     assert np.array_equal(pcm, tone(0.9))
 
 
-async def test_the_key_answers_inside_the_window_too() -> None:
-    """The key always works (design.md section 3.5), and inside the window
-    what it records is the answer - and is not shown to the detector."""
-    talk, toggle, hotkey, microphone, endpoint = wired()
-
-    with talk:
-        toggle.press()
-        await asyncio.sleep(0)
-        window = await opened(talk)
-        hotkey.press()
-        microphone.hear(tone(0.9))
-        hotkey.release()
-
-        answer = await window
-
-    assert answer is not None
-    assert np.array_equal(answer, tone(0.9))
-    assert endpoint.heard == []
-
-
 async def test_the_room_repeating_the_question_is_not_an_answer() -> None:
     """`unmute` leaves the echo tail behind, and the window counts it down
     before it listens - the question coming back off the walls is not a yes."""
-    talk, _, _, microphone, endpoint = wired()
+    talk, _, microphone, endpoint = wired()
     tail = round(ECHO_TAIL_SECONDS * SAMPLE_RATE)
 
     with talk:
@@ -1246,10 +944,32 @@ async def test_the_room_repeating_the_question_is_not_an_answer() -> None:
 async def test_the_window_starts_a_fresh_sentence_and_leaves_none_behind() -> None:
     """Whatever the detector had half collected before the question is not
     the answer, and whatever it had when time ran out is not the next question."""
-    talk, _, _, _, endpoint = wired()
+    talk, _, _, endpoint = wired()
 
     with talk:
         before = endpoint.resets
         await talk.listen_for(0.02)
 
     assert endpoint.resets == before + 2
+
+
+async def test_switching_off_closes_an_open_window_with_nothing() -> None:
+    """The user turned the assistant off while it was asking. The question is
+    a no at once - not six seconds later, and not whatever the room says next."""
+    talk, toggle, microphone, _ = wired()
+
+    with talk:
+        window = await opened(talk, seconds=5.0)
+        toggle.press()
+        await asyncio.sleep(0)
+
+        answer = await asyncio.wait_for(window, timeout=0.5)
+
+        microphone.hear(tone(0.9))
+        microphone.hear(tone(0.1))
+        await asyncio.sleep(0)
+        with pytest.raises(TimeoutError):
+            await asyncio.wait_for(talk.utterance(), timeout=0.05)
+
+    assert answer is not None
+    assert len(answer) == 0

@@ -51,14 +51,15 @@ from assistant.store.repos import AuditRepo
 from assistant.stt.base import Audio
 from assistant.stt.local_whisper import LocalWhisper
 from assistant.tools.registry import ToolRegistry
-from assistant.tools.system import get_current_time
+from assistant.tools.system import AppCatalog, get_current_time
 from assistant.tts.sapi import SapiTTS
 
 
 class NoMicrophone:
-    """The turns are driven by hand; nobody presses anything."""
+    """The turns are driven by hand; nobody speaks."""
 
     on_listening: Callable[[], None] | None = None
+    on_mode: Callable[[bool], None] | None = None
 
     def start(self) -> None:
         pass
@@ -129,7 +130,9 @@ async def build(model: str | None) -> Bench:
     limits = Limits.from_settings(settings.limits)
     print(f"model {provider_id}:{model_id}, locale {pack.code}")
 
-    speech = LocalWhisper(vocabulary=[pack.stt_vocabulary])
+    speech = LocalWhisper(
+        vocabulary=(await AppCatalog.load()).spoken_names(), prompt=pack.stt_prompt
+    )
     started = time.perf_counter()
     await speech.load()
     print(f"whisper loaded in {time.perf_counter() - started:.1f} s")

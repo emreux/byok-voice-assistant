@@ -27,7 +27,7 @@ import pytest
 from rich.console import Console
 
 from assistant.app import State, Turn
-from assistant.audio.capture import DEFAULT_HOTKEY
+from assistant.audio.capture import DEFAULT_TOGGLE_HOTKEY
 from assistant.llm.base import Usage
 from assistant.locales import Locale
 from assistant.ui.status import TEXT, StatusLine, label_key, spell
@@ -40,7 +40,7 @@ TURKISH = Locale(
     ui={
         "state_thinking": "düşünüyor",
         "state_idle": "hazır",
-        "hold_to_talk": "Konuşmak için {hotkey} tuşlarını basılı tut.",
+        "paused": "Dinlemiyorum. {toggle} açar.",
         "you_said": "sen",
     },
 )
@@ -99,13 +99,21 @@ def test_the_line_is_on_screen_before_anything_has_happened(screen: Screen) -> N
         assert TEXT["state_idle"] in str(screen)
 
 
-def test_the_line_keeps_the_hotkey_in_view(screen: Screen) -> None:
-    """The one thing a new user needs to know is which key to hold, and there
-    is nowhere else in phase 1 to put it."""
+def test_the_line_keeps_the_key_in_view(screen: Screen) -> None:
+    """The one thing a new user needs to know is which key switches the
+    microphone, and there is nowhere else to put it."""
     with line(screen) as status:
         status.state(State.IDLE)
 
-    assert "Ctrl+Alt+Space" in str(screen)
+    assert "Ctrl+Alt+H" in str(screen)
+
+
+def test_before_the_microphone_reports_itself_the_line_says_paused(screen: Screen) -> None:
+    """Honest until told otherwise: the capture reports its mode at start."""
+    with line(screen) as status:
+        status.state(State.IDLE)
+
+    assert "Not listening" in str(screen)
 
 
 def test_the_words_are_the_pack_s_and_not_the_code_s(screen: Screen) -> None:
@@ -156,17 +164,8 @@ def test_a_notice_stays_on_screen_when_the_state_moves_on(screen: Screen) -> Non
 
 def test_the_hotkey_is_spelled_the_way_a_keyboard_is() -> None:
     """`pynput` writes it for a parser; the user reads it off their keyboard."""
-    assert spell(DEFAULT_HOTKEY) == "Ctrl+Alt+Space"
+    assert spell(DEFAULT_TOGGLE_HOTKEY) == "Ctrl+Alt+H"
     assert spell("<ctrl>+<shift>+k") == "Ctrl+Shift+K"
-
-
-def test_the_line_says_which_key_keeps_it_listening(screen: Screen) -> None:
-    """Both keys are on the line, because a mode nobody knows about is a mode
-    nobody turns on."""
-    with line(screen) as status:
-        status.state(State.IDLE)
-
-    assert "Ctrl+Alt+H" in str(screen)
 
 
 def test_the_line_says_when_the_microphone_is_live_without_a_key(screen: Screen) -> None:
@@ -176,7 +175,7 @@ def test_the_line_says_when_the_microphone_is_live_without_a_key(screen: Screen)
         status.state(State.IDLE)
         status.hands_free(True)
 
-    assert TEXT["hands_free"].format(hotkey="", toggle="Ctrl+Alt+H") in str(screen)
+    assert TEXT["hands_free"].format(toggle="Ctrl+Alt+H") in str(screen)
 
 
 def test_switching_it_off_puts_the_key_back_on_the_line(screen: Screen) -> None:

@@ -1,9 +1,10 @@
 """The state machine - where the pieces of phase 1 become a product (item 1.10).
 
-`IDLE`, then `LISTENING` while the key is held, then `TRANSCRIBING`, `THINKING`
-and `SPEAKING`, and back to `IDLE`. `CONFIRMING` is the window of phase 2.3,
-opened from inside `THINKING` when a tool wants a yes; `ANNOUNCING` arrives
-with the announce queue in phase 4.2. The diagram in section 3.1 is the
+`IDLE`, then `LISTENING` while a sentence is being collected, then
+`TRANSCRIBING`, `THINKING` and `SPEAKING`, and back to `IDLE`. `CONFIRMING` is
+the window of phase 2.3, opened from inside `THINKING` when a tool wants a
+yes; `ANNOUNCING` arrives with the announce queue in phase 4.2. The diagram
+in section 3.1 is the
 target, not this file (rule 6).
 
 Everything is injected - the microphone, the recogniser, the model, the voice,
@@ -24,27 +25,35 @@ below rests on that and on nothing else. The words themselves are never
 looked at: a list of known hallucinations would be a language constant in
 code, which section 3.12 does not allow.
 
-**The key going down cuts the answer off.** Not the key coming up: the user is
-speaking from the moment they press, so an assistant still talking is both rude
-and something the microphone is recording. The same press abandons a turn that
-is still being transcribed or thought about - there is no point paying for an
-answer to a question that has been withdrawn.
+**A voice that starts cuts the answer off.** The detector announces a sentence
+the moment it begins, and an assistant still talking then is both rude and
+something the microphone is recording. The same announcement abandons a turn
+that is still being transcribed or thought about - there is no point paying
+for an answer to a question that has been withdrawn - and ends the provider's
+stream under the loop, request and all: nothing is remembered, the user is
+asking something else.
 
-**The microphone is deaf for exactly as long as the answer lasts.** Push to
-talk never needed that - nobody holds the key while the assistant is talking -
-but hands-free (`audio/capture.py`) would otherwise hear the answer come out of
-the speakers, take it for a question and answer it, once per API call, until
-somebody noticed. Which microphone is being deafened is not this file's
-business: it calls `mute` and `unmute`, and the capture that has nothing to
-mute does nothing.
+**Switching off is an interruption too.** `Ctrl+Alt+H` is the only key
+(2026-09-11), and off means silent as well as deaf: the speaker stops, the
+request is dropped, and the turn ends without a word - not even about not
+having finished. The capture reports the switch through `on_mode`; this file
+acts on it and only then passes it to the screen.
+
+**The microphone is deaf for exactly as long as the answer lasts.** The
+capture would otherwise hear the answer come out of the speakers, take it for
+a question and answer it, once per API call, until somebody noticed - which
+is also why an answer cannot be interrupted by voice until the echo
+cancellation of phase 5.3. This file calls `mute` and `unmute`; which
+microphone is being deafened is not its business.
 
 **A tool that wants a yes gets one out loud, or does not run.** The gate of
 section 3.9 hands `confirm` the sentence with the real argument values in it;
 this file reads it, tells the user how to answer, and opens the microphone
 for six seconds without waiting for a key (section 3.1 rule 2). A "no"
-anywhere in the answer wins over a "yes"; silence is a no; an answer with
-neither word in it is asked about once more, and a second such answer is a no
-as well. Every path that is not a clear yes ends in nothing being done - the
+anywhere in the answer wins over a "yes"; silence is a no, and so is a voice
+or the switch while the question is still being read; an answer with neither
+word in it is asked about once more, and a second such answer is a no as
+well. Every path that is not a clear yes ends in nothing being done - the
 window exists so that an action the user did not agree to cannot happen, not
 so that one they did agree to happens quickly. The exchange belongs to the
 gate, not to the model: nothing said in it reaches the conversation. The
@@ -65,7 +74,7 @@ whole (`agent/intents.py`) before anything is sent, and answered here. The
 time is asked of `get_current_time` through the same gate the model's calls
 go through - the fast path skips the model, not the gate (invariant 1) -
 and said in the pack's words. Stop and cancel are answered by silence: in
-phase 2 the microphone is deaf while the assistant talks and a key press
+phase 2 the microphone is deaf while the assistant talks and the switch
 already cuts it off, so all there is to do about them is not spend a
 request. A turn like this costs nothing and says so: no tokens, no row on
 the bill.
@@ -75,7 +84,7 @@ second** (2.8, architecture guide section 11). The loop hands the words out
 as they arrive (`Agent.stream_reply`), `tts.base.sentences` cuts them at the
 first boundary, and the speaker has that sentence while the rest is on its
 way - phase 1 waited for the whole answer, and the first sound came 2.5-6 s
-after the key (measured 3.3 s). The minute of section 3.1 rule 6 is the
+after the sentence ended (measured 3.3 s). The minute of section 3.1 rule 6 is the
 time to the first word; after it the model finishes at its own pace, since
 a long answer read out loud is not a turn that hung. The speaker pulls: the
 model is read only as fast as the speaker asks for more, so a tool the
@@ -89,10 +98,6 @@ saniye, bakıyorum" is what makes two seconds of silence feel like none
 (section 4). The words come from the pack's `[speech] filler`; `FILLERS`
 below is the end of the chain. Never while a question is being asked: the
 user is answering it.
-
-**The key going down ends the stream, request and all.** Not only the
-sound: the loop is left where it stood, the provider's stream is closed
-under it, and nothing is remembered - the user is asking something else.
 
 **Three failures are said out loud, and no others.** A refused key means the
 user has to go and renew it (section 3.2), a provider that cannot be reached
@@ -185,7 +190,7 @@ THINKING_TIMEOUT = Limits().turn_seconds
 # after the question has been read; what comes after it is a no.
 CONFIRM_WINDOW_SECONDS = 6.0
 
-# Shorter than this and the key was tapped rather than held. Below a syllable,
+# Shorter than this and it was a noise rather than a word. Below a syllable,
 # so nothing anybody meant to say is thrown away.
 MIN_UTTERANCE_SECONDS = 0.35
 
@@ -341,12 +346,16 @@ class _Saying:
 
 
 class Capture(Protocol):
-    """The microphone side of push to talk, as the state machine needs it."""
+    """The microphone, as the state machine needs it."""
 
-    # Called on the event loop the moment recording starts. The state machine
-    # stops the speaker from here; waiting for the finished utterance instead
-    # would leave the assistant talking over the user until they let go.
+    # Called on the event loop the moment a sentence begins. The state machine
+    # stops the speaker from here; waiting for the finished sentence instead
+    # would leave the assistant talking over the user until they stopped.
     on_listening: Callable[[], None] | None
+
+    # Called on the event loop when listening is switched on or off - and
+    # once at `start`, with the mode it began in. Off is an interruption.
+    on_mode: Callable[[bool], None] | None
 
     def start(self) -> None: ...
 
@@ -355,10 +364,9 @@ class Capture(Protocol):
     def mute(self) -> None:
         """Stops listening, because the assistant is about to speak.
 
-        A microphone that is only live while a key is held has nothing to do
-        here. One that is live on its own would otherwise hear the answer come
-        out of the speakers, take it for a question, and answer it - once per
-        API call, for as long as nobody stopped it.
+        The microphone would otherwise hear the answer come out of the
+        speakers, take it for a question, and answer it - once per API call,
+        for as long as nobody stopped it.
         """
         ...
 
@@ -367,11 +375,11 @@ class Capture(Protocol):
         ...
 
     async def utterance(self) -> Audio:
-        """Waits for the next completed recording."""
+        """Waits for the next finished sentence."""
         ...
 
     async def listen_for(self, seconds: float) -> Audio | None:
-        """One sentence within `seconds`, key or no key; `None` if none came.
+        """One sentence within `seconds`, listening on or off; `None` if none came.
 
         The window of section 3.1 rule 2. What is said in it is an answer to
         the assistant, not a question for it, so it is not announced through
@@ -396,6 +404,7 @@ class Assistant:
         filler_delay: float = FILLER_DELAY_SECONDS,
         on_state: Callable[[State], None] | None = None,
         on_turn: Callable[[Turn], None] | None = None,
+        on_mode: Callable[[bool], None] | None = None,
         tracker: UsageTracker | None = None,
         dispatch: Dispatch | None = None,
     ) -> None:
@@ -409,6 +418,9 @@ class Assistant:
         self._filler_delay = filler_delay
         self._on_state = on_state
         self._on_turn = on_turn
+        # The screen's listener for the mode. Told after this file has acted
+        # on a switch-off, never before (`_mode_changed`).
+        self._on_mode = on_mode
         self._tracker = tracker
         # The gate of section 3.9 - the same one the loop runs the model's
         # calls through - for the one call the fast path makes on its own.
@@ -423,9 +435,10 @@ class Assistant:
         self._fillers_said = 0
         self._state = State.IDLE
         self._voice = ""
-        # Set the moment the key goes down, so that whatever is waiting for
-        # the model's next word wakes up and stops waiting (`_as_they_come`).
-        self._pressed = asyncio.Event()
+        # Set the moment a voice starts or listening is switched off, so that
+        # whatever is waiting for the model's next word wakes up and stops
+        # waiting (`_as_they_come`). Cleared when a turn begins.
+        self._interrupted = asyncio.Event()
         # How many answers are being played at once: the answer, and inside
         # it the question a tool asks (2.8). The microphone is deafened by
         # the outermost and listens again when that one is done.
@@ -443,7 +456,8 @@ class Assistant:
         finding out at startup instead of at two in the morning.
         """
         self._voice = await self._pick_voice()
-        self._capture.on_listening = self._key_went_down
+        self._capture.on_listening = self._speech_began
+        self._capture.on_mode = self._mode_changed
         self._capture.start()
 
         # Said out loud to whoever is watching, rather than merely being true.
@@ -451,7 +465,7 @@ class Assistant:
         # announced it, so the status line went on showing the last thing it
         # was told - which is "loading the speech model" - until the first turn
         # was over. A program that looks like it never finished starting is one
-        # nobody presses a key at.
+        # nobody speaks to.
         self._enter(State.IDLE)
 
     async def run(self) -> None:
@@ -468,7 +482,7 @@ class Assistant:
     async def turn(self, pcm: Audio) -> Turn:
         """One recording, from what was heard to what was said back."""
         started = time.perf_counter()
-        self._pressed.clear()
+        self._interrupted.clear()
         self._enter(State.TRANSCRIBING)
         heard = await self._heard(pcm)
 
@@ -504,7 +518,7 @@ class Assistant:
         await self._speak_all(self._answering(heard.text, turn_id, saying), saying)
 
         # What the turn came to is known once its stream has ended, and not
-        # at all when it was cut short: by a press, or by a failure on the
+        # at all when it was cut short: by an interruption, or by a failure on the
         # way. A turn cut short spent no tokens anybody can account for.
         answer = self._agent.last_answer if saying.failure is None else None
         cost = self._record(turn_id, answer, saying.failure)
@@ -526,7 +540,7 @@ class Assistant:
         The gate's `Confirm`. `question` already holds the real argument
         values; what is added is how to answer, since the user cannot know
         that only two words are being listened for. Everything that is not a
-        clear yes is a no: silence, a no beside a yes, a press of the key
+        clear yes is a no: silence, a no beside a yes, a voice or the switch
         while the question is still being read, and two answers with neither
         word in them.
         """
@@ -549,7 +563,7 @@ class Assistant:
     async def _missed(self, heard: Heard) -> Turn:
         """Nothing usable came back. Whether that is worth saying depends.
 
-        A recording too short to be a word is a key touched by accident, and an
+        A recording too short to be a word is a door or a cough, and an
         assistant that announced every one of those would be unusable. A
         recording that held speech the recogniser could not read is the
         opposite: silence there is indistinguishable from a broken program,
@@ -603,9 +617,9 @@ class Assistant:
     async def _heard(self, pcm: Audio) -> Heard:
         """What the user said, and what to make of it when they said nothing."""
         if len(pcm) < MIN_UTTERANCE_SECONDS * SAMPLE_RATE:
-            # A tap rather than a hold. Transcribing it costs seconds of four
-            # cores and answering it costs an API call, both for nothing - and
-            # there is nothing here to have misheard, so nothing to say about.
+            # A noise rather than a word. Transcribing it costs seconds of
+            # four cores and answering it costs an API call, both for nothing -
+            # and there is nothing here to have misheard, so nothing to say.
             return Heard()
 
         return hear(await self._stt.transcribe(pcm, hint=self._locale.stt_language))
@@ -621,7 +635,7 @@ class Assistant:
         comes last because that is where the cut is. A failure's sentence
         comes after whatever was already said: a connection that dropped in
         the second request of a tool turn has left half an answer behind,
-        and the user has heard it. Nothing is said after a press.
+        and the user has heard it. Nothing is said after an interruption.
 
         A turn that failed spent no tokens anybody can account for: what
         the provider counted before it refused is not reported to us, and
@@ -638,7 +652,7 @@ class Assistant:
         pieces = _as_they_come(
             stream,
             tool_round=tool_round,
-            pressed=self._pressed,
+            interrupted=self._interrupted,
             filler=self._filler,
             delay=self._filler_delay,
             asking=lambda: self._state is State.CONFIRMING,
@@ -647,8 +661,8 @@ class Assistant:
             async with aclosing(pieces):
                 # The minute of section 3.1 rule 6 is the time to the first
                 # word. After it the model finishes at its own pace: a long
-                # answer read out loud is not a turn that hung, and a key
-                # press ends one that did.
+                # answer read out loud is not a turn that hung, and an
+                # interruption ends one that did.
                 first = await asyncio.wait_for(anext(pieces, None), self._thinking_timeout)
                 if first is not None:
                     yield saying.add(first)
@@ -712,7 +726,7 @@ class Assistant:
         `None` is "neither word was heard": something was said, or the
         recogniser could not read it, and it is worth one more try. `False`
         is every way of not saying yes that is not worth one: silence, a no,
-        the key going down while the question was still being read.
+        the user speaking over the question or switching the assistant off.
         """
         await self._play(_one(prompt))
         if self._withdrawn():
@@ -801,24 +815,49 @@ class Assistant:
             self._on_state(state)
 
     def _withdrawn(self) -> bool:
-        """Whether the user has started saying something else in the meantime."""
-        return self._state is State.LISTENING
+        """Whether the user has moved on in the meantime: started saying
+        something else, or switched the assistant off."""
+        return self._interrupted.is_set()
 
     def _rest(self) -> None:
-        # A turn ending must not undo a press that arrived while it was
-        # finishing: that press is a recording already in progress.
-        if not self._withdrawn():
+        # A turn ending must not undo a sentence that began while it was
+        # finishing: that sentence is a recording already in progress, and
+        # `LISTENING` is the truth about it.
+        if self._state is not State.LISTENING:
             self._enter(State.IDLE)
 
-    def _key_went_down(self) -> None:
+    def _speech_began(self) -> None:
         # A question being read is cut off like an answer: the user is talking
-        # over it. A press inside the window itself never arrives here - the
+        # over it. A voice inside the window itself never arrives here - the
         # capture keeps it as the answer (`Capture.listen_for`).
         was_talking = self._state in (State.SPEAKING, State.CONFIRMING)
         self._enter(State.LISTENING)
-        self._pressed.set()
+        self._interrupted.set()
         if was_talking:
             self._speaker.stop()
+
+    def _mode_changed(self, listening: bool) -> None:
+        """The toggle went one way or the other. Acted on first, shown second:
+        the screen must not say "paused" over an assistant still talking."""
+        if not listening:
+            self._switched_off()
+        if self._on_mode is not None:
+            self._on_mode(listening)
+
+    def _switched_off(self) -> None:
+        """Listening went off, and with it whatever the turn was doing: the
+        speaker if it was talking or asking, the request if one was under
+        way. Nothing is said about it - the user asked for silence."""
+        if self._state is State.IDLE:
+            return
+        self._interrupted.set()
+        if self._state in (State.SPEAKING, State.CONFIRMING):
+            self._speaker.stop()
+        if self._state is State.LISTENING:
+            # A sentence the detector announced and the capture has now thrown
+            # away. No turn will follow it, and `_rest` leaves this state alone
+            # on purpose - so it is left here.
+            self._enter(State.IDLE)
 
     async def _pick_voice(self) -> str:
         preferred = self._locale.voice(self._tts.id)
@@ -964,21 +1003,21 @@ async def _as_they_come(
     stream: AsyncGenerator[str],
     *,
     tool_round: asyncio.Event,
-    pressed: asyncio.Event,
+    interrupted: asyncio.Event,
     filler: Callable[[], str],
     delay: float,
     asking: Callable[[], bool],
 ) -> AsyncGenerator[str]:
     """The model's words as they come, with the filler among them, ending
-    the moment the key goes down (2.8).
+    the moment the user moves on (2.8).
 
     Three things can happen while the next piece is waited for. It arrives,
     and is handed on. A tool round begins - then the piece has `delay` more
     to arrive, and when it has not the filler is said in its place, once per
     turn and never while a question is being asked (`asking`), because the
-    user is answering it. Or the key goes down - then the stream is left
-    where it stands, the request with it (`Agent.stream_reply`), and nothing
-    more is said.
+    user is answering it. Or the user moves on - a voice starts, or the
+    assistant is switched off - then the stream is left where it stands, the
+    request with it (`Agent.stream_reply`), and nothing more is said.
 
     The stream is read in a task of its own, so that the wait can be for
     whichever of the three comes first; the task is always waited out before
@@ -986,7 +1025,7 @@ async def _as_they_come(
     another task is still inside it.
     """
     began = asyncio.ensure_future(tool_round.wait())
-    withdrawn = asyncio.ensure_future(pressed.wait())
+    withdrawn = asyncio.ensure_future(interrupted.wait())
     filler_due = True
     said_any = False
     try:

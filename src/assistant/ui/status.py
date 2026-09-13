@@ -30,7 +30,7 @@ from rich.table import Table
 from rich.text import Text
 
 from assistant.app import State, Turn
-from assistant.audio.capture import DEFAULT_HOTKEY, DEFAULT_TOGGLE_HOTKEY
+from assistant.audio.capture import DEFAULT_TOGGLE_HOTKEY
 from assistant.llm.base import Usage
 from assistant.locales import Locale
 
@@ -51,8 +51,11 @@ def label_key(state: State) -> str:
 
 
 TEXT: dict[str, str] = {
-    "hold_to_talk": "Hold {hotkey} to talk, or press {toggle} to keep listening. Ctrl+C stops.",
-    "hands_free": "Listening - just talk. {toggle} stops listening, Ctrl+C stops everything.",
+    "paused": "Not listening. Press {toggle} to listen again. Ctrl+C stops.",
+    "hands_free": (
+        "Listening - just talk. {toggle} stops listening (and cuts an answer short). "
+        "Ctrl+C stops everything."
+    ),
     "loading_speech": "Loading the speech model...",
     "checking_model": "Checking whether the model calls tools...",
     "state_idle": "ready",
@@ -81,7 +84,7 @@ _STYLES: dict[State, str] = {
 
 
 def spell(hotkey: str) -> str:
-    """`<ctrl>+<alt>+<space>` as `Ctrl+Alt+Space`.
+    """`<ctrl>+<alt>+h` as `Ctrl+Alt+H`.
 
     `pynput` spells a combination for its own parser; the user reads it off
     their keyboard, where none of the angle brackets appear.
@@ -96,19 +99,19 @@ class StatusLine:
         self,
         locale: Locale,
         *,
-        hotkey: str = DEFAULT_HOTKEY,
         toggle: str = DEFAULT_TOGGLE_HOTKEY,
         console: Console | None = None,
     ) -> None:
         self._said = {key: locale.say(key, default) for key, default in TEXT.items()}
         self._console = console if console is not None else Console()
 
-        keys = {"hotkey": spell(hotkey), "toggle": spell(toggle)}
+        keys = {"toggle": spell(toggle)}
         # Both are built up front; only which one is shown changes when the
         # mode does. `hands_free` runs on the event loop between two other
-        # things, and should cost a lookup rather than a format.
+        # things, and should cost a lookup rather than a format. Paused until
+        # the capture says otherwise - which it does the moment it starts.
         self._hints = {
-            False: self._said["hold_to_talk"].format(**keys),
+            False: self._said["paused"].format(**keys),
             True: self._said["hands_free"].format(**keys),
         }
         self._hint = self._hints[False]
@@ -157,7 +160,7 @@ class StatusLine:
         self._show(self._said[label_key(state)], _STYLES.get(state, ""))
 
     def hands_free(self, listening: bool) -> None:
-        """Says whether the microphone is live without anybody holding a key.
+        """Says whether the microphone is live.
 
         The only thing on screen that answers it. A mode the user cannot see
         the state of is a mode they leave on by accident in a room with other

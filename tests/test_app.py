@@ -117,10 +117,11 @@ class StopError(Exception):
 
 
 class FakeCapture:
-    """Push to talk without a keyboard: utterances arrive in the order given."""
+    """A microphone without a room: utterances arrive in the order given."""
 
     def __init__(self, *utterances: Audio, answers: Sequence[Audio | None] = ()) -> None:
         self.on_listening: Callable[[], None] | None = None
+        self.on_mode: Callable[[bool], None] | None = None
         self.started = False
         # Whether the state machine has told it to stop listening, and how many
         # times it has been told either thing - a microphone left deaf and one
@@ -159,10 +160,19 @@ class FakeCapture:
         self.deaf_windows.append(self.deaf)
         return self._answers.pop(0) if self._answers else None
 
-    def press(self) -> None:
-        """What the hotkey does the moment it goes down."""
+    def speak(self) -> None:
+        """What the detector does the moment it hears a sentence begin."""
         if self.on_listening is not None:
             self.on_listening()
+
+    def switch_off(self) -> None:
+        """What the toggle does when it turns listening off."""
+        if self.on_mode is not None:
+            self.on_mode(False)
+
+    def switch_on(self) -> None:
+        if self.on_mode is not None:
+            self.on_mode(True)
 
 
 class FakeSTT:
@@ -179,7 +189,7 @@ class FakeSTT:
     async def transcribe(self, pcm: Audio, *, hint: str | None = None) -> Transcript:
         self.hints.append(hint)
         if self._before is not None:
-            # Somebody pressing the key while the machine is still listening to
+            # Somebody speaking again while the machine is still transcribing
             # the last thing they said.
             self._before()
         # The last one is kept: a recogniser does not run out of hearing, and a
@@ -258,6 +268,7 @@ def assistant_with(
     filler_delay: float = FILLER_DELAY_SECONDS,
     on_state: Callable[[State], None] | None = None,
     on_turn: Callable[[Turn], None] | None = None,
+    on_mode: Callable[[bool], None] | None = None,
     agent: Agent | None = None,
     tracker: UsageTracker | None = None,
     dispatch: Dispatch | None = None,
@@ -278,6 +289,7 @@ def assistant_with(
         filler_delay=filler_delay,
         on_state=on_state,
         on_turn=on_turn,
+        on_mode=on_mode,
         tracker=tracker,
         dispatch=dispatch,
     )
@@ -311,13 +323,13 @@ async def test_a_turn_walks_through_the_states_the_design_names() -> None:
     ]
 
 
-async def test_the_key_going_down_is_what_starts_listening() -> None:
+async def test_a_voice_starting_is_what_starts_listening() -> None:
     capture = FakeCapture()
     seen: list[State] = []
     assistant = assistant_with(capture=capture, on_state=seen.append)
 
     await assistant.begin()
-    capture.press()
+    capture.speak()
 
     assert seen == [State.IDLE, State.LISTENING]
     assert assistant.state is State.LISTENING
@@ -377,9 +389,9 @@ async def test_the_recogniser_is_told_which_language_to_expect() -> None:
     assert stt.hints == ["tr"]
 
 
-async def test_a_stray_press_is_not_a_turn() -> None:
-    """Tapping the hotkey by accident costs a Whisper run, an API call and an
-    answer to nothing."""
+async def test_a_stray_noise_is_not_a_turn() -> None:
+    """A door, a cough: a recording too short to be a word costs a Whisper run,
+    an API call and an answer to nothing."""
     stt, speaker = FakeSTT(), FakeSpeaker()
     provider = ScriptedProvider([Delta(text="Efendim?")])
 
@@ -457,11 +469,11 @@ def test_hear_has_exactly_three_outcomes() -> None:
     assert hear(Transcript(text="")) == Heard(missed=True)
 
 
-async def test_the_assistant_says_it_is_ready_before_anybody_presses_anything() -> None:
+async def test_the_assistant_says_it_is_ready_before_anybody_says_anything() -> None:
     """The state has been `IDLE` since the constructor, and for a while nobody
     was ever told. The status line went on showing "loading the speech model"
     until the first turn was over, which reads as a program that never finished
-    starting - so nobody pressed the key that would have cleared it."""
+    starting - so nobody spoke to it."""
     seen: list[State] = []
 
     await assistant_with(on_state=seen.append).begin()
@@ -484,7 +496,7 @@ async def test_a_garbled_sentence_still_goes_to_the_model() -> None:
     assert (turn.heard, turn.missed) == ("bu cümlemik takılın", False)
 
 
-async def test_a_key_touched_by_accident_is_not_apologised_for() -> None:
+async def test_a_noise_too_short_to_be_a_word_is_not_apologised_for() -> None:
     """Nothing was said, so there is nothing to have misheard. An assistant
     that announced every brushed key would be unusable."""
     speaker = FakeSpeaker()
@@ -500,7 +512,7 @@ async def test_a_question_the_user_withdrew_is_not_apologised_for_either() -> No
     one was not understood is worse than saying nothing."""
     capture = FakeCapture()
     speaker = FakeSpeaker()
-    stt = FakeSTT(Transcript(text="", no_speech_probability=0.0), before=capture.press)
+    stt = FakeSTT(Transcript(text="", no_speech_probability=0.0), before=capture.speak)
 
     turn = await one_turn(assistant_with(capture=capture, stt=stt, speaker=speaker))
 
@@ -708,22 +720,22 @@ async def test_an_answer_of_nothing_is_not_spoken() -> None:
 # --------------------------------------------------------------------------
 
 
-async def test_pressing_the_key_while_the_assistant_talks_stops_it() -> None:
+async def test_a_voice_while_the_assistant_talks_stops_it() -> None:
     capture = FakeCapture()
     speaker = FakeSpeaker()
-    speaker.on_play = capture.press  # the user cuts in mid answer
+    speaker.on_play = capture.speak  # the user cuts in mid answer
 
     await one_turn(assistant_with(capture=capture, speaker=speaker))
 
     assert speaker.stopped
 
 
-async def test_the_machine_is_left_listening_by_the_press_that_cut_it_off() -> None:
-    """The key is still down and the microphone is recording. A turn ending
-    tidily into `IDLE` would say the opposite of what is happening."""
+async def test_the_machine_is_left_listening_by_the_voice_that_cut_it_off() -> None:
+    """The user is mid-sentence and the detector is collecting it. A turn
+    ending tidily into `IDLE` would say the opposite of what is happening."""
     capture = FakeCapture()
     speaker = FakeSpeaker()
-    speaker.on_play = capture.press
+    speaker.on_play = capture.speak
     assistant = assistant_with(capture=capture, speaker=speaker)
 
     await one_turn(assistant)
@@ -731,7 +743,7 @@ async def test_the_machine_is_left_listening_by_the_press_that_cut_it_off() -> N
     assert assistant.state is State.LISTENING
 
 
-async def test_a_press_when_nothing_is_being_said_stops_nothing() -> None:
+async def test_a_voice_when_nothing_is_being_said_stops_nothing() -> None:
     """The speaker is stopped, not silenced: a stop left behind would cut off
     the next answer before it began."""
     capture = FakeCapture()
@@ -739,7 +751,7 @@ async def test_a_press_when_nothing_is_being_said_stops_nothing() -> None:
     assistant = assistant_with(capture=capture, speaker=speaker)
 
     await assistant.begin()
-    capture.press()
+    capture.speak()
 
     assert not speaker.stopped
 
@@ -749,7 +761,7 @@ async def test_a_turn_the_user_interrupted_never_reaches_the_model() -> None:
     paying an API call for."""
     capture = FakeCapture()
     provider = ScriptedProvider([Delta(text="Üç.")])
-    stt = FakeSTT(Transcript(text="saat kaç", confidence=0.9), before=capture.press)
+    stt = FakeSTT(Transcript(text="saat kaç", confidence=0.9), before=capture.speak)
 
     await one_turn(assistant_with(capture=capture, stt=stt, provider=provider))
 
@@ -757,15 +769,108 @@ async def test_a_turn_the_user_interrupted_never_reaches_the_model() -> None:
 
 
 async def test_an_answer_nobody_is_waiting_for_any_more_is_not_spoken() -> None:
-    """The key went down while the model was still writing. By the time the
+    """A voice started while the model was still writing. By the time the
     answer arrives the user is halfway through a different question."""
     capture = FakeCapture()
     speaker = FakeSpeaker()
-    provider = ScriptedProvider([capture.press, Delta(text="Saat üç.")])
+    provider = ScriptedProvider([capture.speak, Delta(text="Saat üç.")])
 
     await one_turn(assistant_with(capture=capture, provider=provider, speaker=speaker))
 
     assert speaker.played == []
+
+
+# --------------------------------------------------------------------------
+# Being switched off (2026-09-11: the toggle is the only key, and off means off)
+# --------------------------------------------------------------------------
+
+
+async def test_switching_off_while_the_assistant_talks_stops_it_and_ends_the_turn() -> None:
+    """Off means silent as well as deaf. The answer stops where it was, and
+    the machine is idle afterwards - nobody is speaking a new question."""
+    capture = FakeCapture()
+    speaker = FakeSpeaker()
+    speaker.on_play = capture.switch_off
+    assistant = assistant_with(capture=capture, speaker=speaker)
+
+    turn = await one_turn(assistant)
+
+    assert speaker.stopped
+    assert assistant.state is State.IDLE
+    assert turn.failure is None
+
+
+async def test_switching_off_while_thinking_ends_the_request_and_says_nothing() -> None:
+    capture = FakeCapture()
+    speaker = FakeSpeaker()
+    provider = ScriptedProvider([capture.switch_off, Delta(text="Saat üç.")])
+    assistant = assistant_with(capture=capture, provider=provider, speaker=speaker)
+
+    turn = await one_turn(assistant)
+
+    assert speaker.played == []
+    assert provider.open_streams == 0
+    assert turn.said == ""
+    assert assistant.state is State.IDLE
+
+
+async def test_switching_off_while_transcribing_never_reaches_the_model() -> None:
+    capture = FakeCapture()
+    provider = ScriptedProvider([Delta(text="Üç.")])
+    stt = FakeSTT(Transcript(text="saat kaç", confidence=0.9), before=capture.switch_off)
+
+    await one_turn(assistant_with(capture=capture, stt=stt, provider=provider))
+
+    assert provider.calls == []
+
+
+async def test_switching_off_while_idle_changes_nothing() -> None:
+    capture = FakeCapture()
+    speaker = FakeSpeaker()
+    seen: list[State] = []
+    assistant = assistant_with(capture=capture, speaker=speaker, on_state=seen.append)
+
+    await assistant.begin()
+    capture.switch_off()
+
+    assert not speaker.stopped
+    assert seen == [State.IDLE]
+
+
+async def test_switching_off_after_a_voice_overtook_the_turn_rests_the_machine() -> None:
+    """The detector had announced a sentence and the machine was `LISTENING`
+    for it; the switch throws that sentence away, and nothing else would
+    ever put the machine back to `IDLE`."""
+    capture = FakeCapture()
+    assistant = assistant_with(capture=capture)
+
+    await assistant.begin()
+    capture.speak()
+    before = assistant.state
+    capture.switch_off()
+
+    assert before is State.LISTENING
+    assert assistant.state is State.IDLE
+
+
+async def test_the_screen_hears_of_the_mode_after_the_machine_acted_on_it() -> None:
+    """`on_mode` is the state machine's to pass on: the speaker is stopped
+    before the line changes, so the screen never shows "paused" over an
+    assistant still talking."""
+    capture = FakeCapture()
+    speaker = FakeSpeaker()
+    told: list[tuple[bool, bool]] = []
+    assistant = assistant_with(
+        capture=capture,
+        speaker=speaker,
+        on_mode=lambda listening: told.append((listening, speaker.stopped)),
+    )
+    speaker.on_play = capture.switch_off
+
+    await one_turn(assistant)
+    capture.switch_on()
+
+    assert told == [(False, True), (True, True)]
 
 
 # --------------------------------------------------------------------------
@@ -1174,13 +1279,13 @@ async def test_the_microphone_is_deaf_while_the_question_is_read_and_not_after()
     assert capture.deaf_windows == [False]
 
 
-async def test_a_press_while_the_question_is_read_is_a_no() -> None:
+async def test_a_voice_while_the_question_is_read_is_a_no() -> None:
     """The user is talking over the question: a new question, and the window
     is never opened. Nothing runs, and what the model says about being
     refused is not said over them either."""
     capture = FakeCapture()
     speaker = FakeSpeaker()
-    speaker.on_play = capture.press
+    speaker.on_play = capture.speak
     assistant = asking(capture=capture, stt=says("evet"), speaker=speaker)
 
     await one_turn(assistant)
@@ -1680,16 +1785,16 @@ async def test_the_time_sentence_comes_from_the_pack_and_falls_back_with_the_res
     assert speaker.heard == "It is 14 3."
 
 
-async def test_a_press_during_the_fast_path_is_not_spoken_over() -> None:
+async def test_a_voice_during_the_fast_path_is_not_spoken_over() -> None:
     """The same rule as for an answer from the model: the user is talking."""
     capture = FakeCapture()
     speaker = FakeSpeaker()
 
-    async def pressed_meanwhile(call: ToolCall, *, turn_id: str, confirm: Confirm) -> str:
-        capture.press()
+    async def spoken_over_meanwhile(call: ToolCall, *, turn_id: str, confirm: Confirm) -> str:
+        capture.speak()
         return TOLD
 
-    assistant = commanding(capture=capture, speaker=speaker, dispatch=pressed_meanwhile)
+    assistant = commanding(capture=capture, speaker=speaker, dispatch=spoken_over_meanwhile)
     await one_turn(assistant)
 
     assert speaker.played == []
@@ -1946,13 +2051,13 @@ async def test_a_failure_in_the_second_request_is_said_after_what_was_already_he
     assert provider.calls[-1].turns == [Message.user("saat kaç")]
 
 
-async def test_the_key_going_down_ends_the_request_and_not_only_the_sound() -> None:
-    """The model would have gone on for a minute. The press ends the wait
+async def test_a_voice_starting_ends_the_request_and_not_only_the_sound() -> None:
+    """The model would have gone on for a minute. The voice ends the wait
     at once, the provider's stream is closed under it, and the turn is
     over - because the next one, the one the user is speaking now, cannot
     start until it is."""
     capture = FakeCapture()
-    provider = ScriptedProvider([Delta(text="Bir. "), capture.press, 60.0, Delta(text="İki.")])
+    provider = ScriptedProvider([Delta(text="Bir. "), capture.speak, 60.0, Delta(text="İki.")])
     assistant = assistant_with(capture=capture, provider=provider)
 
     turn = await asyncio.wait_for(one_turn(assistant), 2.0)
@@ -1984,12 +2089,12 @@ async def test_how_long_the_first_sound_took_leaves_the_turn() -> None:
     assert silent.first_sound_ms is None
 
 
-async def test_a_press_before_the_first_word_leaves_the_model_s_answer_unspoken() -> None:
+async def test_a_voice_before_the_first_word_leaves_the_model_s_answer_unspoken() -> None:
     """The stream is closed under the model, and no sentence follows: not the
     answer, and not a failure's either."""
     capture = FakeCapture()
     speaker = FakeSpeaker()
-    provider = ScriptedProvider([capture.press, ProviderError("503")])
+    provider = ScriptedProvider([capture.speak, ProviderError("503")])
 
     turn = await one_turn(assistant_with(capture=capture, provider=provider, speaker=speaker))
 
