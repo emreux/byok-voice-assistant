@@ -59,6 +59,7 @@ models/
 *.flac
 *.ogg
 *.m4a
+fixtures/
 
 # Design, planning and progress notes stay on this machine. The published
 # repository is the code and the README; the thinking behind it is not part of

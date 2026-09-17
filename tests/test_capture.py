@@ -31,9 +31,11 @@ from assistant.audio.capture import (
     ECHO_TAIL_SECONDS,
     HandsFree,
     KeyCombination,
+    MicrophoneInfo,
     MicrophoneUnavailableError,
     SystemHotkey,
     SystemMicrophone,
+    available_microphones,
     device_choice,
 )
 from assistant.stt.base import SAMPLE_RATE, Audio
@@ -94,6 +96,7 @@ def fake_sounddevice(
     host_api: str = "MME",
     native_rate: int = SAMPLE_RATE,
     accepts: set[int] | None = None,
+    devices: list[tuple[str, str, int]] | None = None,
 ) -> tuple[SimpleNamespace, list[SimpleNamespace]]:
     """Stands in for the module, and records how the stream was opened.
 
@@ -103,8 +106,13 @@ def fake_sounddevice(
     kernel streaming did on 2026-09-05. A WASAPI device told to convert opens
     at any rate. A device called `nope` is refused the way `sounddevice`
     refuses a name that matches nothing: a `ValueError` that quotes the name.
+
+    `devices` is what `query_devices()` lists when asked for everything, as
+    (name, host API, input channels) - the shape of PortAudio's table, where
+    one microphone appears once per host API and outputs sit in between.
     """
     streams: list[SimpleNamespace] = []
+    hosts = sorted({host_api, *(host for _, host, _ in devices or [])})
 
     class PortAudioError(Exception):
         pass
@@ -113,19 +121,30 @@ def fake_sounddevice(
         def __init__(self, *, auto_convert: bool = False) -> None:
             self.auto_convert = auto_convert
 
-    def query_devices(device: Any = None, kind: str | None = None) -> dict[str, Any]:
+    def query_devices(device: Any = None, kind: str | None = None) -> Any:
         if device == "nope":
             raise ValueError("No input device matching 'nope'")
+        if device is None and kind is None:
+            return [
+                {
+                    "index": index,
+                    "name": name,
+                    "hostapi": hosts.index(host),
+                    "max_input_channels": inputs,
+                    "default_samplerate": float(native_rate),
+                }
+                for index, (name, host, inputs) in enumerate(devices or [])
+            ]
         return {
             "index": 0,
             "name": "Microphone Array",
-            "hostapi": 0,
+            "hostapi": hosts.index(host_api),
             "max_input_channels": 2,
             "default_samplerate": float(native_rate),
         }
 
     def query_hostapis(index: int | None = None) -> dict[str, Any]:
-        return {"name": host_api}
+        return {"name": host_api if index is None else hosts[index]}
 
     def input_stream(**options: Any) -> SimpleNamespace:
         if options.get("device") == "nope":
@@ -625,6 +644,22 @@ def test_closing_the_microphone_releases_the_device(monkeypatch: pytest.MonkeyPa
     assert (streams[0].stopped, streams[0].closed) == (True, True)
 
 
+def test_the_device_that_was_opened_is_on_record(monkeypatch: pytest.MonkeyPatch) -> None:
+    """With the setting empty, which microphone Windows handed over is not
+    written anywhere else - and "which device did it open" is the first
+    question when the assistant mishears (2026-09-06)."""
+    module, _ = fake_sounddevice(host_api="Windows WDM-KS")
+    monkeypatch.setitem(sys.modules, "sounddevice", module)
+    lines: list[str] = []
+    sink = logger.add(lines.append, format="{message}")
+    try:
+        SystemMicrophone().open(lambda chunk: None)
+    finally:
+        logger.remove(sink)
+
+    assert any("Microphone Array, Windows WDM-KS" in line for line in lines)
+
+
 def test_a_microphone_that_cannot_be_opened_fails_by_name(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -973,3 +1008,106 @@ async def test_switching_off_closes_an_open_window_with_nothing() -> None:
 
     assert answer is not None
     assert len(answer) == 0
+
+
+# --------------------------------------------------------------------------
+# The list `assistant mic` offers
+# --------------------------------------------------------------------------
+
+# PortAudio's table on the development laptop, abridged: the one array behind
+# four host APIs, the two entries that only mean "whatever the default is",
+# an output, and a headset whose kernel-streaming name spans two lines.
+KS_HEADSET = "Headset (@System32\\drivers\\bthhfenum.sys,#2;%1 Hands-Free%0\n;(Buds3))"
+LAPTOP_DEVICES = [
+    ("Microsoft Sound Mapper - Input", "MME", 2),
+    ("Microphone Array (Intel\u00ae Smart ", "MME", 4),
+    ("Speakers (Realtek HD Audio)", "MME", 0),
+    ("Primary Sound Capture Driver", "Windows DirectSound", 2),
+    ("Microphone Array (Intel\u00ae Smart Sound Technology)", "Windows WASAPI", 2),
+    ("Microphone Array 1 ()", "Windows WDM-KS", 2),
+    (KS_HEADSET, "Windows WDM-KS", 1),
+]
+
+
+def test_every_input_device_is_listed_once_per_host_api(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The same microphone reaches the assistant through several Windows paths,
+    and they are not alike (README, "which microphone path, measured"), so the
+    list keeps them apart rather than folding them into one entry."""
+    module, _ = fake_sounddevice(devices=LAPTOP_DEVICES)
+    monkeypatch.setitem(sys.modules, "sounddevice", module)
+
+    found = available_microphones()
+
+    assert [(m.name, m.host_api) for m in found.devices] == [
+        ("Microphone Array (Intel\u00ae Smart ", "MME"),
+        ("Microphone Array (Intel\u00ae Smart Sound Technology)", "Windows WASAPI"),
+        ("Microphone Array 1 ()", "Windows WDM-KS"),
+        (KS_HEADSET, "Windows WDM-KS"),
+    ]
+
+
+def test_the_entries_that_only_mean_the_default_are_left_out(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The mapper and DirectSound's "primary" driver are the default under
+    another name; the list offers the default once, as itself."""
+    module, _ = fake_sounddevice(devices=LAPTOP_DEVICES)
+    monkeypatch.setitem(sys.modules, "sounddevice", module)
+
+    names = [m.name for m in available_microphones().devices]
+
+    assert "Microsoft Sound Mapper - Input" not in names
+    assert "Primary Sound Capture Driver" not in names
+
+
+def test_the_list_names_what_windows_has_chosen_right_now(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module, _ = fake_sounddevice(devices=LAPTOP_DEVICES)
+    monkeypatch.setitem(sys.modules, "sounddevice", module)
+
+    assert available_microphones().default == "Microphone Array"
+
+
+def test_a_machine_without_a_microphone_lists_nothing_and_has_no_default(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """PortAudio has no default input then, and asking for it raises rather
+    than returning an empty entry."""
+    module, _ = fake_sounddevice(devices=[("Speakers (Realtek HD Audio)", "MME", 0)])
+    listing = module.query_devices
+
+    def query_devices(device: Any = None, kind: str | None = None) -> Any:
+        if device is None and kind is None:
+            return listing()
+        raise module.PortAudioError("Error querying device -1")
+
+    module.query_devices = query_devices
+    monkeypatch.setitem(sys.modules, "sounddevice", module)
+
+    found = available_microphones()
+
+    assert found.devices == ()
+    assert found.default is None
+
+
+def test_the_setting_is_the_line_sounddevice_matches_exactly() -> None:
+    """`sounddevice` matches words in order and, when several entries share
+    them, prefers the one whose "<name>, <host API>" is the whole query. The
+    stored value is that whole line, so that the MME entry - a prefix of the
+    WASAPI one - is not mistaken for it."""
+    entry = MicrophoneInfo(name="Microphone Array (Intel\u00ae Smart ", host_api="MME")
+
+    assert entry.setting == "Microphone Array (Intel\u00ae Smart , MME"
+
+
+def test_the_label_is_the_name_on_one_line() -> None:
+    """Kernel streaming names carry a driver path and a line break; the
+    terminal shows one line per choice."""
+    entry = MicrophoneInfo(name=KS_HEADSET, host_api="Windows WDM-KS")
+
+    assert entry.label == (
+        "Headset (@System32\\drivers\\bthhfenum.sys,#2;%1 Hands-Free%0 ;(Buds3)) - Windows WDM-KS"
+    )

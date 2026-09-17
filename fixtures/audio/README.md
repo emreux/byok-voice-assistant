@@ -15,12 +15,24 @@ Referans metin, kelime hata oranı (WER) hesabının doğruluk tarafıdır: `scr
 ```bash
 uv run python scripts/bench_stt.py                    # tiny, base, small, medium: süre ve WER
 uv run python scripts/bench_stt.py --sizes small      # yalnız uygulamanın kullandığı boyut
+uv run python scripts/bench_stt.py --provider gemini  # Google'ın tanıyıcısı, gerçek anahtarla (ses Google'a gider)
 uv run python scripts/bench_e2e.py                    # kayıt → Whisper → model → ses: ilk sese kadar süre
 ```
 
 `bench_stt.py` model boyutlarını süre (p50, p95) ve hata oranıyla (WER, CER) yan yana koyar; §8'deki karar kapısını (`small` p95 > 1.2 sn veya WER > %15) kendisi söyler. `bench_e2e.py` aynı kayıtları uygulamanın gerçek parçalarından geçirir — gerçek Whisper, gerçek sağlayıcı (anahtar Kimlik Bilgisi Yöneticisi'nden), gerçek kapı ve saat aracı, gerçek Windows sesi — ve her tur için üç süre yazar: yazıya dökme bitti, ilk ses, tur bitti. Ses çalınmaz; hiçbir uygulama açılmaz; her koşu token harcar.
 
 ## Kayıt nasıl alınır
+
+```bash
+uv run python scripts/bench_mic.py --takes              # fixtures/audio içine, config'deki mikrofonla
+uv run python scripts/bench_mic.py --takes --seconds 4  # kısa cümleler için
+```
+
+Her kayıt için önce cümleyi **söyleyeceğin gibi** yazarsın, Enter'a basıp söylersin; betik
+`.txt`'yi yazdığından üretir, kaydı dedektörün son konuşma duyduğu yerde keser ve
+`NN-ilk-kelimeler.wav` adıyla yazar. Boş satır bitirir. Mikrofon `assistant run`'ın açtığı
+mikrofondur (`config.toml [audio] input_device`) — Windows'un efekt yolundan alınan bir
+kayıt asistanın hiç duymadığı bir sinyali ölçer.
 
 15–20 kısa kayıt yeter. Alırken:
 

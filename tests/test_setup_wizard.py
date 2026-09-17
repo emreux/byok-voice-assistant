@@ -1,4 +1,4 @@
-"""The three questions of `assistant setup`, without a terminal.
+"""The questions of `assistant setup`, without a terminal.
 
 The wizard is the only place where a key the user typed exists in memory, so
 the tests that matter are about what happens to it: it is checked before it is
@@ -14,6 +14,10 @@ Since 2.6 the wizard also sends the chosen model one request to see whether
 it calls a tool, and refuses one that does not. The fake provider below
 answers that request from a class attribute, so a test can say which of
 its models call tools and which only talk.
+
+Since 2026-09-15 the last question is which microphone to listen through,
+and `assistant mic` asks that one question on its own. The device list is
+handed in, so no test touches PortAudio.
 """
 
 from __future__ import annotations
@@ -31,8 +35,10 @@ from prompt_toolkit.input import create_pipe_input
 from prompt_toolkit.output import DummyOutput
 
 from assistant import locales
+from assistant.audio.capture import MicrophoneInfo, Microphones
 from assistant.config import (
     KEYRING_SERVICE,
+    AudioSettings,
     LLMSettings,
     LocaleSettings,
     Settings,
@@ -44,7 +50,14 @@ from assistant.config import (
 from assistant.llm.base import Delta, Message, ModelInfo, ProviderError, ToolCall, ToolSpec
 from assistant.llm.probe import NO_TOOL_CALL, QUESTION, ProbeResult, remembered
 from assistant.llm.registry import ADAPTERS, ProviderEntry
-from assistant.setup_wizard import TEXT, Option, TerminalPrompter, run_setup, wording
+from assistant.setup_wizard import (
+    TEXT,
+    Option,
+    TerminalPrompter,
+    run_microphone_setup,
+    run_setup,
+    wording,
+)
 from assistant.store import db
 from assistant.store.db import open_database
 from assistant.store.repos import SettingsRepo
@@ -127,6 +140,7 @@ class ScriptedPrompter:
         }
         self.asked: list[str] = []
         self.offered: dict[str, list[str]] = {}
+        self.labelled: dict[str, list[str]] = {}
         self.said: list[tuple[str, dict[str, object]]] = []
 
     def say(self, key: str, **fields: object) -> None:
@@ -135,6 +149,7 @@ class ScriptedPrompter:
 
     async def choose(self, key: str, options: Sequence[Option]) -> str | None:
         self.offered[key] = [option.value for option in options]
+        self.labelled[key] = [option.label for option in options]
         return self._answer(key)
 
     async def secret(self, key: str) -> str | None:
@@ -195,12 +210,27 @@ def verdicts() -> Iterator[sqlite3.Connection]:
     connection.close()
 
 
+ARRAY = MicrophoneInfo(name="Microphone Array (Intel Smart ", host_api="MME")
+RAW_ARRAY = MicrophoneInfo(name="Microphone Array 1 ()", host_api="Windows WDM-KS")
+HEADSET = MicrophoneInfo(name="Headset (Buds3 Hands-Free AG Audio)", host_api="Windows WASAPI")
+LAPTOP = Microphones(default="Microphone Array (Intel Smart ", devices=(ARRAY, RAW_ARRAY, HEADSET))
+NO_MICROPHONE = Microphones(default=None, devices=())
+
+
+@pytest.fixture(autouse=True)
+def laptop_microphones(monkeypatch: pytest.MonkeyPatch) -> None:
+    """What the wizard finds when nobody hands it a list: the laptop above,
+    never PortAudio."""
+    monkeypatch.setattr("assistant.setup_wizard.available_microphones", lambda: LAPTOP)
+
+
 def complete_run(**overrides: str | list[str | None] | None) -> ScriptedPrompter:
     """A prompter scripted to walk the wizard from end to end."""
     answers: dict[str, str | list[str | None] | None] = {
         "locale": "tr",
         "api_key": GOOD_KEY,
         "model": "fast",
+        "microphone": "",
     }
     answers.update(overrides)
     return ScriptedPrompter(**answers)
@@ -322,7 +352,7 @@ async def test_a_provider_that_needs_no_key_is_not_asked_for_one(
 ) -> None:
     """A local Ollama has nothing to authenticate with. The server is asked
     whether it answers, and nothing goes to the Credential Manager."""
-    prompter = ScriptedPrompter(locale="tr", model="fast")
+    prompter = ScriptedPrompter(locale="tr", model="fast", microphone="")
 
     exit_code = await run_setup(prompter, catalog=local_catalog())
 
@@ -490,7 +520,7 @@ async def test_a_stored_key_that_stopped_working_is_replaced(
     exit_code = await run_setup(prompter, catalog=fake_catalog())
 
     assert exit_code == 0
-    assert prompter.asked == ["locale", "api_key_keep", "api_key", "model"]
+    assert prompter.asked == ["locale", "api_key_keep", "api_key", "model", "microphone"]
     assert vault.vault == {(KEYRING_SERVICE, "gemini"): GOOD_KEY}
 
 
@@ -696,6 +726,149 @@ def test_the_failed_verdict_has_the_reason_of_section_3_2() -> None:
     """What the probe writes down is what `assistant run` will read a week
     later; the word is the one the design names."""
     assert ProbeResult(ok=False, reason=NO_TOOL_CALL).reason == "no_tool_call_emitted"
+
+
+# --------------------------------------------------------------------------
+# The microphone
+# --------------------------------------------------------------------------
+
+
+async def test_the_microphone_chosen_lands_in_the_settings(
+    config_home: Path, vault: MemoryKeyring
+) -> None:
+    prompter = complete_run(microphone=RAW_ARRAY.setting)
+
+    await run_setup(prompter, catalog=fake_catalog())
+
+    assert load_settings().audio.input_device == "Microphone Array 1 (), Windows WDM-KS"
+
+
+async def test_the_microphone_is_the_last_question(config_home: Path, vault: MemoryKeyring) -> None:
+    """After the model, so that the probe has already said its piece; before
+    the file is written, so that walking away here still leaves nothing."""
+    prompter = complete_run()
+
+    await run_setup(prompter, catalog=fake_catalog())
+
+    assert prompter.asked[-1] == "microphone"
+
+
+async def test_whatever_windows_has_chosen_is_offered_first_and_stored_as_nothing(
+    config_home: Path, vault: MemoryKeyring
+) -> None:
+    """The one answer that needs no upkeep: an empty setting has always meant
+    the system default, and the label says which device that is right now."""
+    prompter = complete_run()
+
+    await run_setup(prompter, catalog=fake_catalog())
+
+    assert prompter.offered["microphone"][0] == ""
+    assert "Microphone Array (Intel Smart" in prompter.labelled["microphone"][0]
+    assert load_settings().audio.input_device == ""
+
+
+async def test_every_device_is_offered_by_its_line_and_labelled_by_its_name(
+    config_home: Path, vault: MemoryKeyring
+) -> None:
+    prompter = complete_run()
+
+    await run_setup(prompter, catalog=fake_catalog())
+
+    assert prompter.offered["microphone"][1:] == [
+        "Microphone Array (Intel Smart , MME",
+        "Microphone Array 1 (), Windows WDM-KS",
+        "Headset (Buds3 Hands-Free AG Audio), Windows WASAPI",
+    ]
+    assert prompter.labelled["microphone"][2] == "Microphone Array 1 () - Windows WDM-KS"
+
+
+async def test_a_machine_without_a_microphone_is_told_so_and_setup_goes_on(
+    config_home: Path, vault: MemoryKeyring
+) -> None:
+    """A desktop with nothing plugged in yet can still be set up; the default
+    is what it listens through once something is."""
+    prompter = complete_run()
+
+    exit_code = await run_setup(prompter, catalog=fake_catalog(), microphones=NO_MICROPHONE)
+
+    assert exit_code == 0
+    assert "microphone" not in prompter.asked
+    assert ("no_microphones", {}) in prompter.said
+    assert load_settings().audio.input_device == ""
+
+
+async def test_walking_away_at_the_microphone_writes_nothing(
+    config_home: Path, vault: MemoryKeyring
+) -> None:
+    exit_code = await run_setup(complete_run(microphone=None), catalog=fake_catalog())
+
+    assert exit_code != 0
+    assert vault.vault == {}
+    assert not config_path().exists()
+
+
+async def test_mic_changes_the_microphone_and_keeps_the_rest(
+    config_home: Path, vault: MemoryKeyring
+) -> None:
+    """`assistant mic` is the one question again, for the day the headset
+    comes out: it rewrites `[audio]` and nothing else in the file."""
+    save_settings(
+        Settings(
+            llm=LLMSettings(primary="gemini:fast"),
+            locale=LocaleSettings(code="tr"),
+            audio=AudioSettings(input_device=RAW_ARRAY.setting),
+        )
+    )
+    prompter = ScriptedPrompter(microphone=HEADSET.setting)
+
+    exit_code = await run_microphone_setup(prompter, microphones=LAPTOP)
+
+    settings = load_settings()
+    assert exit_code == 0
+    assert settings.audio.input_device == "Headset (Buds3 Hands-Free AG Audio), Windows WASAPI"
+    assert settings.llm.primary == "gemini:fast"
+    assert settings.locale.code == "tr"
+    assert prompter.asked == ["microphone"]
+    assert prompter.said[-1][0] == "microphone_saved"
+    assert (
+        prompter.said[-1][1]["microphone"] == "Headset (Buds3 Hands-Free AG Audio) - Windows WASAPI"
+    )
+
+
+async def test_mic_finds_the_devices_itself_when_handed_none(
+    config_home: Path, vault: MemoryKeyring
+) -> None:
+    prompter = ScriptedPrompter(microphone="")
+
+    await run_microphone_setup(prompter)
+
+    assert prompter.offered["microphone"] == ["", ARRAY.setting, RAW_ARRAY.setting, HEADSET.setting]
+
+
+async def test_mic_cancelled_leaves_the_file_as_it_was(
+    config_home: Path, vault: MemoryKeyring
+) -> None:
+    save_settings(Settings(audio=AudioSettings(input_device=RAW_ARRAY.setting)))
+    prompter = ScriptedPrompter(microphone=None)
+
+    exit_code = await run_microphone_setup(prompter, microphones=LAPTOP)
+
+    assert exit_code != 0
+    assert load_settings().audio.input_device == RAW_ARRAY.setting
+    assert prompter.said[-1] == ("cancelled", {})
+
+
+async def test_mic_with_nothing_to_choose_from_gives_up(
+    config_home: Path, vault: MemoryKeyring
+) -> None:
+    prompter = ScriptedPrompter()
+
+    exit_code = await run_microphone_setup(prompter, microphones=NO_MICROPHONE)
+
+    assert exit_code != 0
+    assert prompter.asked == []
+    assert prompter.said == [("no_microphones", {})]
+    assert not config_path().exists()
 
 
 # --------------------------------------------------------------------------

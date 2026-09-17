@@ -25,8 +25,12 @@ from assistant.config import (
     LimitSettings,
     LLMSettings,
     LocaleSettings,
+    MessagingSettings,
     Settings,
+    STTSettings,
+    TelegramSettings,
     ToolSettings,
+    WebSettings,
     config_dir,
     config_path,
     data_dir,
@@ -109,6 +113,19 @@ def test_the_input_device_round_trips_through_the_file(config_home: Path) -> Non
     assert load_settings().audio.input_device == "Microphone Array WASAPI"
 
 
+def test_a_kernel_streaming_device_line_round_trips_through_the_file(config_home: Path) -> None:
+    """What `assistant mic` stores is the device line as PortAudio prints it,
+    and a Bluetooth headset's kernel-streaming line carries a driver path with
+    backslashes and a line break. It must come back byte for byte, since
+    `sounddevice` is matched against it exactly."""
+    line = (
+        "Headset (@System32\\drivers\\bthhfenum.sys,#2;%1 Hands-Free%0\r\n;(Buds3)), Windows WDM-KS"
+    )
+    save_settings(Settings(audio=AudioSettings(input_device=line)))
+
+    assert load_settings().audio.input_device == line
+
+
 def test_no_input_device_means_the_system_default(config_home: Path) -> None:
     assert load_settings().audio.input_device == ""
 
@@ -179,6 +196,46 @@ def test_no_address_by_default(config_home: Path) -> None:
     save_settings(Settings(llm=LLMSettings(primary="gemini:x")))
 
     assert load_settings().llm.base_url == ""
+
+
+def test_the_search_engine_round_trips_through_the_file(config_home: Path) -> None:
+    """`[web] search_url` (15 Sep 2026): which engine `search_web` opens is
+    the user's, not the code's."""
+    save_settings(Settings(web=WebSettings(search_url="https://duckduckgo.com/?q={query}")))
+
+    assert load_settings().web.search_url == "https://duckduckgo.com/?q={query}"
+
+
+def test_a_file_written_before_there_was_a_web_table_searches_google(config_home: Path) -> None:
+    save_settings(Settings(llm=LLMSettings(primary="gemini:x")))
+
+    assert load_settings().web.search_url == "https://www.google.com/search?q={query}"
+
+
+def test_the_messaging_default_and_the_telegram_id_round_trip(config_home: Path) -> None:
+    """`[messaging] default_app` and `[telegram] api_id` (2026-09-15). The
+    hash and the session are secrets and never reach this file."""
+    save_settings(
+        Settings(
+            messaging=MessagingSettings(default_app="WhatsApp"),
+            telegram=TelegramSettings(api_id=123456),
+        )
+    )
+
+    loaded = load_settings()
+
+    assert loaded.messaging.default_app == "WhatsApp"
+    assert loaded.telegram.api_id == 123456
+    assert "hash" not in config_path().read_text(encoding="utf-8")
+
+
+def test_without_the_tables_no_app_is_the_default_and_telegram_is_not_set_up(
+    config_home: Path,
+) -> None:
+    save_settings(Settings(llm=LLMSettings(primary="gemini:x")))
+
+    assert load_settings().messaging.default_app == ""
+    assert load_settings().telegram.api_id == 0
 
 
 def test_a_primary_without_a_provider_is_refused() -> None:
@@ -290,3 +347,26 @@ def test_the_settings_model_has_nowhere_to_put_a_key() -> None:
     """Not an oversight to be fixed later: the field is absent on purpose."""
     assert "api_key" not in LLMSettings.model_fields
     assert not any("key" in name for name in Settings.model_fields)
+
+
+def test_the_stt_settings_round_trip_through_the_file(config_home: Path) -> None:
+    save_settings(Settings(stt=STTSettings(provider="gemini", model="x")))
+
+    assert load_settings().stt == STTSettings(provider="gemini", model="x")
+
+
+def test_the_recogniser_defaults_to_local(config_home: Path) -> None:
+    """ADR-001: local Whisper is the default and never leaves; a file written
+    before there was an `[stt]` table means exactly that."""
+    config_path().parent.mkdir(parents=True, exist_ok=True)
+    config_path().write_text('[llm]\nprimary = "gemini:x"\n', encoding="utf-8")
+
+    stt = load_settings().stt
+
+    assert stt == STTSettings()
+    assert (stt.provider, stt.model) == ("local", "gemini-3.5-transcribe-live")
+
+
+def test_an_unknown_recogniser_is_refused() -> None:
+    with pytest.raises(ValueError, match="local, gemini"):
+        STTSettings(provider="azure")

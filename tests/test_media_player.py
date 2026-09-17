@@ -141,12 +141,28 @@ class Paused:
         return self.playing
 
 
+class Windows:
+    """The desktop's answer to "which windows does this program have", in
+    turn: the last answer repeats once the earlier ones are used up."""
+
+    def __init__(self, *answers: set[int]) -> None:
+        self.answers = list(answers)
+        self.asked: list[str] = []
+        self.threads: list[threading.Thread] = []
+
+    def __call__(self, image: str) -> set[int]:
+        self.asked.append(image)
+        self.threads.append(threading.current_thread())
+        return self.answers.pop(0) if len(self.answers) > 1 else self.answers[0]
+
+
 def build(
     *,
     music: Music | None = None,
     videos: Videos | None = None,
     recordings: Recordings | None = None,
     installed: bool = False,
+    windows: Windows | None = None,
     pause: Paused | None = None,
     window: MediaWindow | None = None,
     **settings: object,
@@ -157,7 +173,15 @@ def build(
         # Nothing found by default, so that the tests of the search fallback
         # stay what they were; a test of the exact recording hands one in.
         recordings=recordings or Recordings(None),
-        spotify=Spotify(installed=lambda: installed),
+        # The application already has a window by default, so that nothing
+        # is woken - and nothing waited for - unless a test says otherwise.
+        spotify=Spotify(
+            installed=lambda: installed,
+            windows=windows or Windows({1}),
+            wake_seconds=0.05,
+            poll_seconds=0.001,
+            settle_seconds=0.0,
+        ),
         settings=MediaSettings(**settings),  # type: ignore[arg-type]
         pause=pause or Paused(playing=False),
         # No browser: the address goes to `shell.browse`, which `opened` sees.
@@ -483,6 +507,84 @@ async def test_closing_the_player_lets_go_of_the_recording_lookup_too() -> None:
     await player.aclose()
 
     assert recordings.closed
+
+
+# --------------------------------------------------------------------------
+# Spotify: the application is woken before it is handed a search
+# --------------------------------------------------------------------------
+
+
+async def test_a_search_goes_straight_to_a_running_application(opened: Opened) -> None:
+    windows = Windows({7})
+    player = build(installed=True, recordings=Recordings(KUMRALIM_RECORDING), windows=windows)
+
+    await player.play_music("kumralım", "spotify")
+
+    assert opened.targets == ["spotify:search:isrc%3ATR2240596102"]
+    assert windows.asked == ["Spotify.exe"]
+
+
+async def test_the_application_is_woken_before_the_search_when_it_is_not_running(
+    opened: Opened,
+) -> None:
+    """A URI handed to a Store application that is not running is the one
+    thing that gets lost on the way: the application starts, the search does
+    not. So the application is started first, and the search follows its
+    window."""
+    windows = Windows(set(), set(), {7})
+    player = build(installed=True, recordings=Recordings(KUMRALIM_RECORDING), windows=windows)
+
+    await player.play_music("kumralım", "spotify")
+
+    assert opened.targets == ["spotify:", "spotify:search:isrc%3ATR2240596102"]
+    assert len(windows.asked) == 3
+
+
+async def test_the_search_is_still_sent_when_no_window_appears_in_time(opened: Opened) -> None:
+    """A window that never comes is not a reason to swallow the request."""
+    recordings = Recordings(KUMRALIM_RECORDING)
+    player = build(installed=True, recordings=recordings, windows=Windows(set()))
+
+    said = await player.play_music("kumralım", "spotify")
+
+    assert opened.targets == ["spotify:", "spotify:search:isrc%3ATR2240596102"]
+    assert NOT_PLAYING in said
+
+
+async def test_the_word_search_wakes_the_application_too(opened: Opened) -> None:
+    player = build(installed=True, windows=Windows(set(), {7}))
+
+    await player.play_music("kumralım", "spotify")
+
+    assert opened.targets[0] == "spotify:"
+    assert opened.targets[1].startswith("spotify:search:Ya%C5%9Far")
+
+
+async def test_opening_spotify_itself_never_waits_for_a_window(opened: Opened) -> None:
+    windows = Windows(set())
+
+    await build(installed=True, windows=windows).open_service("spotify")
+
+    assert opened.targets == ["spotify:"]
+    assert windows.asked == []
+
+
+async def test_the_desktop_is_asked_about_windows_off_the_event_loop(opened: Opened) -> None:
+    windows = Windows({7})
+
+    await build(installed=True, windows=windows).play_music("kumralım", "spotify")
+
+    assert windows.threads and windows.threads[0] is not MAIN
+
+
+async def test_the_website_is_never_woken(opened: Opened) -> None:
+    windows = Windows(set())
+    player = build(installed=False, recordings=Recordings(KUMRALIM_RECORDING), windows=windows)
+
+    await player.play_music("kumralım", "spotify")
+
+    assert opened.targets == ["https://open.spotify.com/search/isrc%3ATR2240596102"]
+    assert windows.asked == []
 
 
 async def test_spotify_without_the_application_opens_its_website(opened: Opened) -> None:

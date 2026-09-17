@@ -56,9 +56,25 @@ third is copying a template and translating the right-hand side.
   finds the recording's ISRC on Deezer (no key) and opens Spotify on that one exact
   result, or on a plain search when Deezer does not know the song, and says, in as
   many words, that nothing has started until you press play.
+- **Knows how the machine and the day are doing.** "Pil ne durumda", "internete bağlı
+  mıyım", "disk dolu mu" are read straight off Windows (battery, processor, memory, the
+  system drive, the Wi-Fi's name), no `psutil`, no shelling out. "İstanbul'da hava nasıl",
+  "yarın Ankara'da yağmur var mı" come from Open-Meteo without a key, and the answer names
+  the place it found so you can tell it was the wrong Kadıköy. No city is built in: asked
+  without one, it asks you, and "İstanbul'da yaşıyorum" is remembered like anything else.
+  "Python öğrenmeyi ara" opens a web search in your browser, on the engine
+  `[web] search_url` names (Google unless you change it).
 - **Tells the time without asking anybody.** "Saat kaç", "dur", "iptal" and the other
   short commands the locale pack lists never reach the model: no wait, no tokens. The
   time still comes through the gate, from the same tool the model would call.
+- **Sends a message as you, and asks first.** "Ahmet'e WhatsApp'tan yaz: yarın
+  geliyorum" finds Ahmet in your `contacts.toml`, and you hear the person, the app and the
+  text before anything goes - "'yarın geliyorum' mesajı Ahmet kişisine WhatsApp üzerinden
+  gönderilecek. Evet ya da hayır de." WhatsApp is the official app on this PC, driven by
+  its own chat link and one Enter that is pressed only while WhatsApp is the window in
+  front; Telegram is your own account through Telegram's API, after one
+  `assistant telegram login`. A name that only *resembles* a contact is never sent to:
+  the assistant names who it found and asks. See *Messaging* below.
 - **Asks before it acts, and only then.** Every tool declares its risk. `safe` runs,
   `confirm` is read out to you with the real argument values - "'...' will be
   forgotten. Say yes or no." - and runs only on a clear yes within six seconds; silence,
@@ -129,8 +145,9 @@ is checked against the provider before anything is written down, and it goes to 
 question with one tool, and is accepted only if it calls the tool. Settings land in
 `%APPDATA%\assistant\config.toml`, plain TOML you can edit by hand.
 
-Running setup again rewrites `config.toml` from scratch, including `[audio] input_device`
-- put it back afterwards if you had set one.
+The last question is which microphone to listen through - a list, with "whatever Windows
+has chosen" on top. `uv run assistant mic` asks that one question again, for the day you
+switch to a headset: it rewrites `[audio]` and leaves the rest of the file alone.
 
 ## Talk to it
 
@@ -167,12 +184,13 @@ Things worth knowing:
   could not read gets "I did not catch that", and words are answered however
   unsure the decoder was of them.
 
-Which microphone all of this listens through is the system default unless you say otherwise.
-`uv run python scripts/bench_mic.py --list-devices` prints every device it can see; name yours
-by words from its line - `--device "Microphone Array 1"` - on `assistant run` for one
-evening with a headset, or as `input_device` under `[audio]` in `config.toml` for good. Words
-rather than the index: the indices shift every time a Bluetooth device connects. A device that
-will not run at 16 kHz is opened at its own rate and resampled on the way in.
+Which microphone all of this listens through is whatever Windows has chosen unless you say
+otherwise: `uv run assistant mic` lists every device PortAudio can see, once per host API,
+and stores the one you pick. The same list is `scripts/bench_mic.py --list-devices`, and
+`assistant run --device "Microphone Array 1"` names one by words from its line for a single
+evening. Words rather than the index: the indices shift every time a Bluetooth device
+connects. A device that will not run at 16 kHz is opened at its own rate and resampled on
+the way in; the log says which device was opened, whichever way it was chosen.
 
 **Which microphone path, measured.** On the development laptop (an Intel Smart Sound array)
 the default path with Windows' audio enhancements switched on garbled Whisper: no-speech
@@ -223,10 +241,23 @@ opened before and the shortest names of the rest, as many as its window holds.
 ## Where your data goes
 
 - **Your voice stays on the machine.** Whisper runs locally; only the transcript is sent to
-  the provider you chose.
+  the provider you chose. The one exception is a line you write yourself: `[stt] provider =
+  "gemini"` in `config.toml` sends the microphone audio to Google's recogniser instead (on
+  trial; Whisper stays loaded behind it for when Google says no). Leave it out and nothing
+  but text ever leaves.
 - **The name of an app you do not have goes to Microsoft.** When "open X" finds no X on the
   machine, X is looked up in the Microsoft Store through `winget`. Nothing else is, and
   nothing is when `winget` is not installed.
+- **A message goes where you would send it yourself, and nowhere else.** For WhatsApp,
+  the text and the number go to the WhatsApp app on this PC - nothing here speaks
+  WhatsApp's protocol, and nothing ever will. For Telegram, the text goes to Telegram's
+  servers through your own account; the session string that stands for that account is
+  in the Credential Manager. `contacts.toml` never leaves the machine and is not part of
+  this repository.
+- **A place you ask the weather for goes to Open-Meteo; a search goes to your engine.**
+  The city name is sent to Open-Meteo's geocoder and forecast (no key, no account, nothing
+  else about you). The words of a web search go to the engine in `[web] search_url`, in
+  your own browser, exactly as a typed search would.
 - **Your API key is never written to a file.** It lives in the Windows Credential Manager,
   reached through `keyring`.
 - **What you say is not written down; what the assistant did is.** The database at
@@ -256,6 +287,37 @@ that satisfies the `LLMProvider` protocol, give its test file a `build` function
 one line to `ADAPTERS` in `tests/test_llm_adapters.py`. The contract suite then asks your
 adapter every question it asks the others, unchanged - and a test fails if an adapter is
 registered without being put through it.
+
+## Messaging
+
+Write the people you message into `%APPDATA%\assistant\contacts.toml`, beside
+`config.toml`:
+
+```toml
+[[contact]]
+name = "Ahmet Yılmaz"
+aliases = ["Ahmet", "abi"]
+phone = "+90 532 000 00 00"      # for WhatsApp: international form, never a leading 0
+telegram = "ahmetyilmaz"         # the username without the @; leave out to find them by name
+```
+
+A file the assistant cannot trust - a number without its country code, a key it does not
+read, two people who answer to one name - stops it at startup with a sentence naming the
+line, because the worst thing this feature can do is write to the wrong person.
+
+**WhatsApp** needs the WhatsApp app from the Microsoft Store, linked to your phone. The
+assistant opens the chat through WhatsApp's own link and presses Enter only when WhatsApp
+is the window in front, checked again right before the key; if it is not, the message is
+left typed in the chat and you are told so.
+
+**Telegram** needs your own `api_id` and `api_hash` from https://my.telegram.org ("API
+development tools", two minutes) and one `assistant telegram login`: the phone, the code
+Telegram sends to your app, and the two-step password if you have one. The `api_id` goes
+into `config.toml`; the hash and the session go into the Credential Manager. Logging out is
+Telegram's own "Active sessions" screen.
+
+`[messaging] default_app = "WhatsApp"` in `config.toml` spares you saying the app every
+time; left out, the assistant asks which.
 
 ## Adding a tool of your own
 

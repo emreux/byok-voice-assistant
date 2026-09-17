@@ -158,6 +158,46 @@ async def test_the_user_hears_the_real_arguments_before_saying_yes() -> None:
     assert confirm.asked == ["attacker.exe will be opened."]
 
 
+async def test_a_message_does_not_go_on_no_and_goes_on_yes_and_the_user_hears_all_of_it() -> None:
+    """`send_message` (2026-09-15) bound to fakes, through the real gate:
+    the question carries the contact, the app and the text the model
+    chose, word for word - the injection defence for the one tool whose
+    wrong argument reaches another person."""
+    from assistant.tools.messaging import send_message_for
+
+    class Ada:
+        name = "Ada Lovelace"
+
+    class Channel:
+        def __init__(self) -> None:
+            self.sent: list[tuple[str, str]] = []
+
+        async def resolve(self, spoken: str) -> Ada | None:
+            return Ada() if spoken == "Ada" else None
+
+        async def closest(self, spoken: str) -> list[str]:
+            return []
+
+        async def send(self, recipient: Ada, text: str) -> str:
+            self.sent.append((recipient.name, text))
+            return "Sent."
+
+    channel = Channel()
+    registry = ToolRegistry([send_message_for({"whatsapp": channel})])
+    order = call("send_message", app="WhatsApp", contact="Ada", text="yarın geliyorum")
+
+    refused = FakeConfirm(answer=False)
+    answer = await gate(order, confirm=refused, registry=registry)
+    assert answer == DECLINED
+    assert channel.sent == []
+    assert refused.asked == ["The message 'yarın geliyorum' will be sent to Ada on WhatsApp."]
+
+    agreed = FakeConfirm(answer=True)
+    answer = await gate(order, confirm=agreed, registry=registry)
+    assert answer == "Sent."
+    assert channel.sent == [("Ada Lovelace", "yarın geliyorum")]
+
+
 async def test_a_confirm_tool_built_without_a_prompt_cannot_be_asked_so_cannot_run() -> None:
     """`tool()` refuses to build one; this one is made by hand to prove the
     gate fails closed on its own, not only because of the decorator."""

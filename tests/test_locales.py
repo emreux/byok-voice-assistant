@@ -27,7 +27,9 @@ from assistant.agent import policy
 from assistant.agent.intents import INTENTS
 from assistant.llm.probe import QUESTION
 from assistant.locales import FALLBACK_CODE, available, iso_code, load, system_code
+from assistant.messaging import telegram
 from assistant.tools import memory as memory_tools
+from assistant.tools import messaging as messaging_tools
 from assistant.tools import store as store_tools
 from assistant.tools import system as system_tools
 from assistant.ui import status
@@ -49,6 +51,8 @@ TABLES = {
     "tools.memory": memory_tools.TEXT,
     "tools.system": system_tools.TEXT,
     "tools.store": store_tools.TEXT,
+    "tools.messaging": messaging_tools.TEXT,
+    "messaging.telegram": telegram.TEXT,
 }
 SENTENCES = {key: text for table in TABLES.values() for key, text in table.items()}
 

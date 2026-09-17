@@ -21,11 +21,11 @@ import asyncio
 import sqlite3
 import sys
 import time
-from collections.abc import Iterable, Iterator
+from collections.abc import Iterable, Iterator, Mapping
 from dataclasses import dataclass, field
 from io import StringIO
 from pathlib import Path
-from typing import Any
+from typing import Any, ClassVar
 
 import pytest
 from loguru import logger
@@ -38,21 +38,27 @@ from assistant.agent.policy import NO_SUCH_TOOL
 from assistant.app import State, Turn
 from assistant.audio import capture
 from assistant.config import (
+    KEYRING_SERVICE,
     AudioSettings,
     LimitSettings,
     LLMSettings,
     LocaleSettings,
+    MessagingSettings,
     Settings,
+    STTSettings,
+    config_path,
+    load_settings,
     save_settings,
     store_api_key,
 )
 from assistant.llm import probe
 from assistant.llm.base import ProviderError, ToolCall, Usage
 from assistant.llm.probe import ProbeResult, remember, remembered
+from assistant.messaging.contacts import CONTACTS_FILE_NAME
 from assistant.store import db
 from assistant.store.memory import MEMORY_FILE_NAME
 from assistant.store.repos import SettingsRepo, UsageRepo
-from assistant.stt import local_whisper
+from assistant.stt import gemini_stt, local_whisper
 from assistant.tools import system
 from assistant.tools.system import AppCatalog, AppEntry
 from assistant.ui import status
@@ -105,6 +111,9 @@ class Wiring:
     # What the speech model was told to expect (2.2).
     vocabularies: list[list[str]] = field(default_factory=list)
     prompts_for_speech: list[str] = field(default_factory=list)
+    # Google's recogniser, when the settings ask for it: what it was built
+    # with (2026-09-14).
+    recognisers: list[dict[str, Any]] = field(default_factory=list)
     stop: BaseException | None = None
     # The probe of 2.6 at startup: what it was asked, as (provider id,
     # model, question), and what it answers.
@@ -134,6 +143,23 @@ def wiring(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Wiring:
 
         async def load(self) -> None:
             seen.happened.append("speech model")
+
+    class FakeGemini:
+        def __init__(self, api_key: str, **rest: Any) -> None:
+            self.fallback = rest.get("fallback")
+            seen.recognisers.append(
+                {
+                    "api_key": api_key,
+                    "model": rest.get("model"),
+                    "vocabulary": list(rest.get("vocabulary", ())),
+                    "fallback": self.fallback,
+                }
+            )
+
+        async def load(self) -> None:
+            if self.fallback is not None:
+                await self.fallback.load()
+            seen.happened.append("gemini")
 
     async def catalogue_here(**_: Any) -> AppCatalog:
         seen.happened.append("app catalogue")
@@ -179,6 +205,7 @@ def wiring(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Wiring:
 
     monkeypatch.setattr(probe, "probe_tool_support", probed)
     monkeypatch.setattr(local_whisper, "LocalWhisper", FakeWhisper)
+    monkeypatch.setattr(gemini_stt, "GeminiSTT", FakeGemini)
     monkeypatch.setattr(system.AppCatalog, "load", catalogue_here)
     monkeypatch.setattr(capture, "SystemMicrophone", FakeMicrophone)
     monkeypatch.setattr(core, "Agent", FakeAgent)
@@ -217,9 +244,18 @@ def test_no_command_prints_usage(capsys: pytest.CaptureFixture[str]) -> None:
     assert "usage:" in capsys.readouterr().out
 
 
-@pytest.mark.parametrize("command", ["setup", "run", "cost"])
+@pytest.mark.parametrize("command", ["setup", "run", "cost", "mic"])
 def test_the_command_names_are_declared(command: str) -> None:
     assert build_parser().parse_args([command]).command == command
+
+
+def test_telegram_login_is_a_command_of_its_own() -> None:
+    """`assistant telegram login` (2026-09-15); a bare `telegram` is a usage error."""
+    parsed = build_parser().parse_args(["telegram", "login"])
+
+    assert (parsed.command, parsed.telegram_command) == ("telegram", "login")
+    with pytest.raises(SystemExit):
+        build_parser().parse_args(["telegram"])
 
 
 # --------------------------------------------------------------------------
@@ -251,6 +287,37 @@ def test_the_exit_code_of_the_wizard_is_the_exit_code_of_the_process(
     monkeypatch.setattr(setup_wizard, "run_setup", wizard)
 
     assert main(["setup"]) == 1
+
+
+# --------------------------------------------------------------------------
+# mic
+# --------------------------------------------------------------------------
+
+
+def test_mic_asks_the_microphone_question_on_its_own(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The day a headset comes out: one command, the list, and the file is
+    updated - no text editor."""
+    calls: list[object] = []
+
+    async def wizard(prompter: object, **kwargs: object) -> int:
+        calls.append(prompter)
+        return 0
+
+    monkeypatch.setattr(setup_wizard, "run_microphone_setup", wizard)
+
+    assert main(["mic"]) == 0
+    assert isinstance(calls[0], setup_wizard.TerminalPrompter)
+
+
+def test_the_exit_code_of_mic_is_the_exit_code_of_the_process(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def wizard(prompter: object, **kwargs: object) -> int:
+        return 1
+
+    monkeypatch.setattr(setup_wizard, "run_microphone_setup", wizard)
+
+    assert main(["mic"]) == 1
 
 
 # --------------------------------------------------------------------------
@@ -423,8 +490,11 @@ def test_every_tool_of_phase_two_is_on_offer(configured: Path, wiring: Wiring) -
     assert wiring.tools == [
         [
             "get_current_time",
+            "system_status",
+            "get_weather",
             "open_app",
             "open_url",
+            "search_web",
             "open_settings",
             "media_control",
             "play_music",
@@ -433,6 +503,7 @@ def test_every_tool_of_phase_two_is_on_offer(configured: Path, wiring: Wiring) -
             "remember",
             "forget",
             "install_app",
+            "send_message",
         ]
     ]
 
@@ -458,8 +529,11 @@ def test_a_tool_file_beside_the_settings_is_on_offer(configured: Path, wiring: W
     assert wiring.tools[0][-1] == "start_my_project"
     assert wiring.tools[0][:-1] == [
         "get_current_time",
+        "system_status",
+        "get_weather",
         "open_app",
         "open_url",
+        "search_web",
         "open_settings",
         "media_control",
         "play_music",
@@ -468,6 +542,7 @@ def test_a_tool_file_beside_the_settings_is_on_offer(configured: Path, wiring: W
         "remember",
         "forget",
         "install_app",
+        "send_message",
     ]
 
 
@@ -480,6 +555,127 @@ def test_the_speech_model_is_told_the_locales_sentence_and_the_apps_names(
 
     assert wiring.vocabularies == [["Spotify", "Google Chrome"]]
     assert wiring.prompts_for_speech == [locales.load("tr").stt_prompt]
+
+
+def test_the_people_in_the_address_book_lead_the_recognisers_names(
+    configured: Path, wiring: Wiring
+) -> None:
+    """Spec A6 (2026-09-15): people's names are the shortest, most ambiguous
+    words the recogniser hears, and there are few of them."""
+    (configured / CONTACTS_FILE_NAME).write_text(
+        '[[contact]]\nname = "Ahmet Yılmaz"\naliases = ["abi"]\nphone = "+90 532 000 00 00"\n',
+        encoding="utf-8",
+    )
+
+    main(["run"])
+
+    assert wiring.vocabularies == [["Ahmet Yılmaz", "abi", "Spotify", "Google Chrome"]]
+
+
+def test_send_message_asks_its_question_in_the_language_of_the_pack(
+    configured: Path, wiring: Wiring
+) -> None:
+    from assistant.tools import messaging as messaging_tools
+
+    main(["run"])
+
+    [registry] = wiring.registries
+    send_message = registry.get("send_message")
+    assert send_message is not None
+    assert send_message.risk == "confirm"
+    assert send_message.confirm_prompt == locales.load("tr").say(
+        "send_message_confirm", messaging_tools.TEXT["send_message_confirm"]
+    )
+    assert send_message.confirm_prompt != messaging_tools.TEXT["send_message_confirm"]
+
+
+def test_a_contacts_file_that_names_one_person_twice_is_a_sentence_before_anything_slow(
+    configured: Path, wiring: Wiring, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The worst failure of messaging is a message to the wrong person; the
+    file that would cause one is refused at startup, not at the first send."""
+    (configured / CONTACTS_FILE_NAME).write_text(
+        '[[contact]]\nname = "Ahmet"\n\n[[contact]]\nname = "ahmet"\n', encoding="utf-8"
+    )
+
+    assert main(["run"]) == 1
+
+    assert "speech model" not in wiring.happened
+    out = capsys.readouterr().out
+    assert said("cannot_start", "tr").split("{")[0] in out
+    assert CONTACTS_FILE_NAME in out
+
+
+def test_a_default_messaging_app_that_is_not_one_is_a_sentence(
+    configured: Path, wiring: Wiring, capsys: pytest.CaptureFixture[str]
+) -> None:
+    save_settings(
+        Settings(
+            llm=LLMSettings(primary=f"gemini:{MODEL}"),
+            locale=LocaleSettings(code="tr"),
+            messaging=MessagingSettings(default_app="Signal"),
+        )
+    )
+
+    assert main(["run"]) == 1
+    assert "Signal" in capsys.readouterr().out
+
+
+def test_by_default_the_recogniser_is_whisper_alone(configured: Path, wiring: Wiring) -> None:
+    """ADR-001: local, no key, the audio stays; `[stt]` left out means that."""
+    main(["run"])
+
+    assert wiring.recognisers == []
+    assert "gemini" not in wiring.happened
+    assert type(wiring.built[-1]["stt"]).__name__ == "FakeWhisper"
+
+
+def test_with_the_setting_the_recogniser_is_gemini_with_whisper_behind_it(
+    configured: Path, wiring: Wiring
+) -> None:
+    """On trial (2026-09-14): Google first, the local engine loaded behind it
+    for the free tier's three requests a minute; the same names, the same
+    key entry the LLM uses."""
+    save_settings(
+        Settings(
+            llm=LLMSettings(primary=f"gemini:{MODEL}"),
+            locale=LocaleSettings(code="tr"),
+            stt=STTSettings(provider="gemini", model="gemini-3.5-transcribe-live"),
+        )
+    )
+
+    main(["run"])
+
+    (built,) = wiring.recognisers
+    assert built["api_key"] == "AIza-not-a-real-key"
+    assert built["model"] == "gemini-3.5-transcribe-live"
+    assert built["vocabulary"] == ["Spotify", "Google Chrome"]
+    assert type(built["fallback"]).__name__ == "FakeWhisper"
+    assert wiring.happened[-4:] == ["app catalogue", "speech model", "gemini", "assistant"]
+    assert type(wiring.built[-1]["stt"]).__name__ == "FakeGemini"
+
+
+def test_gemini_as_recogniser_without_a_gemini_key_is_one_sentence(
+    configured: Path, vault: MemoryKeyring, wiring: Wiring, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The LLM is elsewhere and has its key; the recogniser's is missing.
+    Named, with the way out, and nothing is loaded first."""
+    save_settings(
+        Settings(
+            llm=LLMSettings(primary="groq:llama"),
+            locale=LocaleSettings(code="tr"),
+            stt=STTSettings(provider="gemini"),
+        )
+    )
+    vault.vault.clear()
+    store_api_key("groq", "gsk-not-a-real-key")
+
+    assert main(["run"]) == 1
+
+    printed = capsys.readouterr().out
+    assert "gemini" in printed and "assistant setup" in printed
+    assert "speech model" not in wiring.happened
+    assert wiring.recognisers == []
 
 
 def test_the_gate_the_agent_is_handed_is_the_permission_gate(
@@ -921,3 +1117,146 @@ def test_a_stream_that_cannot_be_told_is_left_alone() -> None:
     """Something else is holding stdout - a test harness, a pipe of somebody
     else's making. Not being able to ask is not a reason to refuse to start."""
     use_utf8(object())
+
+
+# --------------------------------------------------------------------------
+# telegram login (2026-09-15)
+# --------------------------------------------------------------------------
+
+
+class ScriptedTerminal:
+    """Stands in for `TerminalPrompter`: scripted answers, recorded sayings."""
+
+    answers: ClassVar[dict[str, str | None]] = {}
+    said: ClassVar[list[tuple[str, dict[str, object]]]] = []
+    built_text: ClassVar[dict[str, str]] = {}
+
+    def __init__(self, *, text: Mapping[str, str] | None = None) -> None:
+        self.text = dict(text or {})
+        ScriptedTerminal.built_text = self.text
+
+    def say(self, key: str, **fields: object) -> None:
+        ScriptedTerminal.said.append((key, fields))
+        assert key in self.text, key
+
+    async def choose(self, key: str, options: object) -> str | None:
+        raise AssertionError("the login never offers a menu")
+
+    async def secret(self, key: str) -> str | None:
+        return ScriptedTerminal.answers.get(key)
+
+    async def ask(self, key: str) -> str | None:
+        return ScriptedTerminal.answers.get(key)
+
+
+@pytest.fixture
+def terminal(monkeypatch: pytest.MonkeyPatch) -> type[ScriptedTerminal]:
+    ScriptedTerminal.answers = {}
+    ScriptedTerminal.said = []
+    ScriptedTerminal.built_text = {}
+    monkeypatch.setattr(setup_wizard, "TerminalPrompter", ScriptedTerminal)
+    return ScriptedTerminal
+
+
+class FakeTelegramLogin:
+    """What `messaging/telegram.py`'s real client would do, without Telegram."""
+
+    def __init__(self, api_id: int, api_hash: str) -> None:
+        self.api_id, self.api_hash = api_id, api_hash
+
+    async def connect(self) -> None:
+        pass
+
+    async def send_code(self, phone: str) -> str:
+        return "code-hash"
+
+    async def sign_in(self, phone: str, code: str, *, code_hash: str) -> str:
+        if code != "12345":
+            from assistant.messaging.telegram import LoginError
+
+            raise LoginError("The phone code entered was invalid")
+        return "Emre"
+
+    async def sign_in_with_password(self, password: str) -> str:
+        return "Emre"
+
+    def session_string(self) -> str:
+        return "1BVts-the-session"
+
+    async def disconnect(self) -> None:
+        pass
+
+
+@pytest.fixture
+def telegram_client(monkeypatch: pytest.MonkeyPatch) -> None:
+    from assistant.messaging import telegram
+
+    monkeypatch.setattr(telegram, "_login_client", FakeTelegramLogin)
+
+
+def test_telegram_login_stores_the_id_in_the_file_and_the_secrets_in_the_vault(
+    configured: Path, vault: MemoryKeyring, terminal: type[ScriptedTerminal], telegram_client: None
+) -> None:
+    """Section 10: the `api_id` is not a secret, the hash and the session
+    are. And the file is rewritten from what was loaded: the microphone the
+    user chose survives (the known `setup` finding, not repeated here)."""
+    save_settings(
+        Settings(
+            llm=LLMSettings(primary=f"gemini:{MODEL}"),
+            locale=LocaleSettings(code="tr"),
+            audio=AudioSettings(input_device="Microphone Array 1"),
+        )
+    )
+    terminal.answers = {
+        "telegram_api_id": "123456",
+        "telegram_api_hash": "abcdef",
+        "telegram_phone": "+90 532 000 00 00",
+        "telegram_code": "12345",
+    }
+
+    assert main(["telegram", "login"]) == 0
+
+    loaded = load_settings()
+    assert loaded.telegram.api_id == 123456
+    assert loaded.audio.input_device == "Microphone Array 1"
+    assert vault.vault[(KEYRING_SERVICE, "telegram")] == "abcdef"
+    assert vault.vault[(KEYRING_SERVICE, "telegram-session")] == "1BVts-the-session"
+    assert "abcdef" not in config_path().read_text(encoding="utf-8")
+    assert terminal.said == [("telegram_logged_in", {"name": "Emre"})]
+
+
+def test_telegram_login_asks_in_the_language_of_the_pack(
+    configured: Path, terminal: type[ScriptedTerminal], telegram_client: None
+) -> None:
+    from assistant.messaging import telegram
+
+    terminal.answers = {"telegram_api_id": None}
+
+    assert main(["telegram", "login"]) == 1
+
+    # Walking away is said, and the prompter was built with the pack's
+    # sentences for every question the login asks.
+    assert terminal.said == [("cancelled", {})]
+    turkish = locales.load("tr")
+    for key, english in telegram.TEXT.items():
+        assert terminal.built_text[key] == turkish.say(key, english)
+        assert terminal.built_text[key] != english
+
+
+def test_a_wrong_code_is_telegrams_reason_and_nothing_is_stored(
+    configured: Path, vault: MemoryKeyring, terminal: type[ScriptedTerminal], telegram_client: None
+) -> None:
+    terminal.answers = {
+        "telegram_api_id": "1",
+        "telegram_api_hash": "h",
+        "telegram_phone": "+90...",
+        "telegram_code": "0",
+    }
+
+    assert main(["telegram", "login"]) == 1
+
+    assert (KEYRING_SERVICE, "telegram-session") not in vault.vault
+    assert load_settings().telegram.api_id == 0
+    [(key, fields)] = terminal.said
+    assert key == "telegram_login_failed"
+    assert "phone code entered was invalid" in str(fields["reason"])

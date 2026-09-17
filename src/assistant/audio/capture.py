@@ -41,6 +41,7 @@ from __future__ import annotations
 import asyncio
 import threading
 from collections.abc import Callable
+from dataclasses import dataclass
 from types import TracebackType
 from typing import Any, Protocol, Self, runtime_checkable
 
@@ -423,6 +424,71 @@ def device_choice(text: str | None) -> int | str | None:
     return int(chosen) if chosen.isdigit() else chosen
 
 
+@dataclass(frozen=True, slots=True)
+class MicrophoneInfo:
+    """One line of PortAudio's table, as `assistant mic` offers it and as
+    `sounddevice` will find it again."""
+
+    name: str
+    host_api: str
+
+    @property
+    def setting(self) -> str:
+        """What goes into `[audio] input_device`: the whole "<name>, <host
+        API>" line. `sounddevice` matches words in order and, when several
+        entries share them, takes the one this line is exactly - so the MME
+        entry, which Windows cuts to 31 characters and which is therefore a
+        prefix of the WASAPI one, is never mistaken for it."""
+        return f"{self.name}, {self.host_api}"
+
+    @property
+    def label(self) -> str:
+        """The same on one line: kernel streaming names carry a driver path
+        and a line break, and the terminal shows one line per choice."""
+        return f"{' '.join(self.name.split())} - {self.host_api}"
+
+
+@dataclass(frozen=True, slots=True)
+class Microphones:
+    """What there is to choose from: every input device, and the name of the
+    one Windows has chosen right now - `None` when there is none at all."""
+
+    default: str | None
+    devices: tuple[MicrophoneInfo, ...]
+
+
+# PortAudio lists the default input under two more names, one per legacy
+# host API. Each is whatever the default is, and the list says that once.
+_DEFAULT_ALIASES = frozenset({"Microsoft Sound Mapper - Input", "Primary Sound Capture Driver"})
+
+
+def available_microphones() -> Microphones:
+    """Every input device, once per host API - kept apart on purpose, since the
+    same microphone reaches Whisper differently through each (README: "which
+    microphone path, measured")."""
+    # Imported here rather than at module scope: it loads PortAudio's native
+    # library, which most of the program has no use for. It ships no type
+    # information either - said once, on this first import of the module,
+    # which is where mypy reports it.
+    import sounddevice  # type: ignore[import-untyped]
+
+    devices = tuple(
+        MicrophoneInfo(
+            name=str(facts["name"]),
+            host_api=str(sounddevice.query_hostapis(facts["hostapi"])["name"]),
+        )
+        for facts in sounddevice.query_devices()
+        if facts["max_input_channels"] > 0 and facts["name"] not in _DEFAULT_ALIASES
+    )
+    try:
+        default = str(sounddevice.query_devices(kind="input")["name"])
+    except (ValueError, sounddevice.PortAudioError):
+        # No input device at all: PortAudio has no default, and asking for
+        # it is an error rather than an empty answer.
+        default = None
+    return Microphones(default=default, devices=devices)
+
+
 class MicrophoneUnavailableError(RuntimeError):
     """The input device could not be opened: nothing matched the name, or
     PortAudio refused it. Fixable by the user, so named for `run`."""
@@ -461,10 +527,8 @@ class SystemMicrophone:
         self.overflows = 0
 
     def open(self, on_chunk: OnChunk) -> None:
-        # Imported here rather than at module scope: it loads PortAudio's
-        # native library, which `assistant setup` has no use for. It ships no
-        # type information either.
-        import sounddevice  # type: ignore[import-untyped]
+        # Local for the same reason as in `available_microphones`.
+        import sounddevice
 
         self._on_chunk = on_chunk
         try:
@@ -493,6 +557,10 @@ class SystemMicrophone:
         facts = sounddevice.query_devices(self._device, "input")
         host = str(sounddevice.query_hostapis(facts["hostapi"])["name"])
         native = round(float(facts["default_samplerate"]))
+        # Which device this is, in the line `assistant mic` would store for
+        # it. With the setting empty it is whatever Windows handed over, and
+        # this is the only place that says which.
+        logger.info("microphone: {line}", line=MicrophoneInfo(str(facts["name"]), host).setting)
         # Only WASAPI understands this, and PortAudio refuses a stream whose
         # host-specific settings belong to another host API.
         extra = sounddevice.WasapiSettings(auto_convert=True) if "WASAPI" in host else None

@@ -1,4 +1,4 @@
-"""Measures the local recogniser on the recorded fixtures (design.md section 11, 2.8).
+"""Measures the recogniser on the recorded fixtures (design.md section 11, 2.8).
 
 Which Whisper size, how long it takes, how many words it gets wrong: the
 table that ADR-001 rests on, and the one number section 8 decides by -
@@ -10,6 +10,7 @@ brought forward in phase 3.
     uv run python scripts/bench_stt.py --fixtures some/dir  # recordings elsewhere
     uv run python scripts/bench_stt.py --language en
     uv run python scripts/bench_stt.py --sizes small --no-prompt   # what the prompt is worth
+    uv run python scripts/bench_stt.py --provider gemini           # Google's recogniser, real key
 
 Every `.wav` in `fixtures/audio/` that has a `.txt` beside it saying what was
 said is transcribed the way the assistant transcribes - `LocalWhisper`, int8,
@@ -20,6 +21,13 @@ case, accents and punctuation off, the way search folds (`store/normalize.py`),
 so that "Fatura." and "fatura" are one word and the rate measures hearing
 rather than spelling. The first fixture is read once untimed per size: the
 first call pays for things that are not transcription.
+
+`--provider gemini` puts Google's recogniser (`stt/gemini_stt.py`, on
+trial since 2026-09-14) through the same fixtures with the key from the
+Credential Manager, the same names as its vocabulary and no engine behind
+it - a refused request shows as `(failed)` here rather than as Whisper's
+answer. Every clip is one Live API session, and the audio goes to Google;
+the free tier does not count sessions on that model.
 
 The recordings are personal and stay on this machine (`.gitignore`); only
 the texts are in the repository. The numbers depend on the recordings: a
@@ -37,6 +45,7 @@ import sys
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Protocol
 
 import numpy as np
 import soundfile  # type: ignore[import-untyped]
@@ -45,9 +54,10 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from assistant import locales
 from assistant.audio.resample import Resampler
-from assistant.config import is_configured, load_settings
+from assistant.config import is_configured, load_api_key, load_settings
 from assistant.store.normalize import normalize_search
-from assistant.stt.base import SAMPLE_RATE, Audio
+from assistant.stt.base import SAMPLE_RATE, Audio, STTProvider
+from assistant.stt.gemini_stt import DEFAULT_MODEL, GeminiSTT
 from assistant.stt.local_whisper import LocalWhisper
 from assistant.tools.system import AppCatalog
 
@@ -59,6 +69,7 @@ SIZES = ("tiny", "base", "small", "medium")
 DECIDING_SIZE = "small"
 P95_LIMIT_SECONDS = 1.2
 WER_LIMIT = 0.15
+
 
 # What is not a word for the purpose of scoring: punctuation, and anything
 # else that is not a letter, a digit or a space once the text is folded.
@@ -77,9 +88,9 @@ class Fixture:
 
 @dataclass
 class Result:
-    """What one size made of every fixture."""
+    """What one engine made of every fixture."""
 
-    size: str
+    label: str
     load_seconds: float
     durations: list[float] = field(default_factory=list)
     hypotheses: list[str] = field(default_factory=list)
@@ -153,18 +164,22 @@ def stt_language() -> tuple[str, str]:
     return pack.stt_language, pack.stt_prompt
 
 
+class Loadable(STTProvider, Protocol):
+    async def load(self) -> None: ...
+
+
 async def measure(
-    size: str, fixtures: list[Fixture], *, language: str, prompt: str, names: list[str]
+    label: str, speech: Loadable, fixtures: list[Fixture], *, language: str, pace: float = 0.0
 ) -> Result:
-    speech = LocalWhisper(model_size=size, vocabulary=names, prompt=prompt)
     started = time.perf_counter()
     await speech.load()
-    result = Result(size=size, load_seconds=time.perf_counter() - started)
-    print(f"\n[{size}] loaded in {result.load_seconds:.1f} s")
+    result = Result(label=label, load_seconds=time.perf_counter() - started)
+    print(f"\n[{label}] loaded in {result.load_seconds:.1f} s")
 
     # The first call pays for things that are not transcription; it is
     # made once and not counted.
     await speech.transcribe(fixtures[0].pcm, hint=language)
+    await asyncio.sleep(pace)
 
     for fixture in fixtures:
         started = time.perf_counter()
@@ -173,9 +188,11 @@ async def measure(
         result.durations.append(took)
         result.hypotheses.append(fold(heard.text))
         result.references.append(fold(fixture.reference))
-        print(
-            f"[{size}] {fixture.wav.name}: {took:.2f} s for {fixture.seconds:.1f} s -> {heard.text}"
-        )
+        # An empty answer with no opinion is the cloud engine saying it
+        # could not be asked; silence would have come with an opinion.
+        shown = heard.text or ("(failed)" if heard.no_speech_probability is None else "")
+        print(f"[{label}] {fixture.wav.name}: {took:.2f} s for {fixture.seconds:.1f} s -> {shown}")
+        await asyncio.sleep(pace)
 
     return result
 
@@ -186,16 +203,17 @@ def report(results: list[Result], fixtures: list[Fixture]) -> None:
         f"\n{len(fixtures)} fixtures, {statistics.mean(seconds):.1f} s of speech each on average "
         f"({min(seconds):.1f}-{max(seconds):.1f} s)"
     )
-    print(f"{'size':<8} {'load':>6} {'p50':>7} {'p95':>7} {'WER':>7} {'CER':>7}")
+    width = max(8, *(len(result.label) for result in results))
+    print(f"{'engine':<{width}} {'load':>6} {'p50':>7} {'p95':>7} {'WER':>7} {'CER':>7}")
     for result in results:
         print(
-            f"{result.size:<8} {result.load_seconds:>5.1f}s "
+            f"{result.label:<{width}} {result.load_seconds:>5.1f}s "
             f"{percentile(result.durations, 0.5):>6.2f}s "
             f"{percentile(result.durations, 0.95):>6.2f}s "
             f"{result.wer:>6.1%} {result.cer:>6.1%}"
         )
 
-    deciding = next((result for result in results if result.size == DECIDING_SIZE), None)
+    deciding = next((result for result in results if result.label == DECIDING_SIZE), None)
     if deciding is None:
         return
     p95 = percentile(deciding.durations, 0.95)
@@ -221,6 +239,12 @@ def main(argv: list[str] | None = None) -> int:
         action="store_true",
         help="give the recogniser no prompt at all, to measure what the prompt is worth",
     )
+    parser.add_argument(
+        "--provider",
+        choices=("local", "gemini"),
+        default="local",
+        help="which recogniser: Whisper here (default), or Google's with the stored key",
+    )
     args = parser.parse_args(argv)
 
     language, prompt = stt_language()
@@ -238,11 +262,27 @@ def main(argv: list[str] | None = None) -> int:
         print("record some with scripts/bench_mic.py - see fixtures/audio/README.md")
         return 2
 
-    print(f"language {language!r}, prompt {prompt!r} with {len(names)} names offered")
-    results = [
-        asyncio.run(measure(size, fixtures, language=language, prompt=prompt, names=names))
-        for size in args.sizes
-    ]
+    if args.provider == "gemini":
+        key = load_api_key("gemini")
+        if not key:
+            print("no API key stored for 'gemini' - run 'assistant setup' first")
+            return 2
+        print(f"language {language!r}, {len(names)} names as vocabulary, {DEFAULT_MODEL}")
+        engine = GeminiSTT(key, vocabulary=names)
+        results = [asyncio.run(measure(DEFAULT_MODEL, engine, fixtures, language=language))]
+    else:
+        print(f"language {language!r}, prompt {prompt!r} with {len(names)} names offered")
+        results = [
+            asyncio.run(
+                measure(
+                    size,
+                    LocalWhisper(model_size=size, vocabulary=names, prompt=prompt),
+                    fixtures,
+                    language=language,
+                )
+            )
+            for size in args.sizes
+        ]
     report(results, fixtures)
     return 0
 

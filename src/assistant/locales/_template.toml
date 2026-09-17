@@ -108,6 +108,13 @@ probing_tools = "Checking whether the model calls tools..."
 tools_ok = "The model calls tools - first token in {ms} ms."
 tools_failed = "This model does not call tools, and most of what the assistant does depends on that. Choose another model."
 probe_refused = "The model could not be tested: {problem}. Choose another model, or try again."
+# The last question of setup, and the whole of `assistant mic`. {name} is the
+# device Windows has chosen at that moment, as PortAudio names it; {microphone}
+# is the label of the choice that was just stored.
+microphone = "Which microphone should the assistant listen through?"
+windows_microphone = "Whatever Windows has chosen (right now: {name})"
+no_microphones = "No microphone was found."
+microphone_saved = "Microphone: {microphone}. Settings: {path}"
 saved = "Ready. Settings: {path} - the key itself is in the Windows Credential Manager."
 cancelled = "Setup cancelled. Nothing was changed."
 
@@ -139,6 +146,20 @@ forget_confirm = "'{fact}' will be forgotten."
 # is the word used for a publisher the Store did not name.
 store_install_confirm = "'{name}' ({publisher}) will be downloaded from the Microsoft Store."
 unknown_publisher = "unknown publisher"
+# Asked before a message is sent; {text} is the message word for word,
+# {contact} the person as the user said them, {app} the app's name (WhatsApp
+# or Telegram). "Say yes or no." is added after it.
+send_message_confirm = "The message '{text}' will be sent to {contact} on {app}."
+# `assistant telegram login`: the questions in the order they are asked, and
+# the two sentences at the end. {name} is the account's own name; {reason}
+# is Telegram's own explanation, in English.
+telegram_api_id = "Your Telegram api_id (a number). Create one at https://my.telegram.org under 'API development tools'"
+telegram_api_hash = "Your Telegram api_hash (nothing is shown as you type)"
+telegram_phone = "The phone number of your Telegram account, with the country code (+90...)"
+telegram_code = "The code Telegram just sent to your Telegram app (not by SMS)"
+telegram_password = "Your Telegram two-step verification password (nothing is shown)"
+telegram_logged_in = "Logged in to Telegram as {name}. The session is in the Credential Manager."
+telegram_login_failed = "Telegram login failed: {reason}"
 # Added to a risky tool's question when the same thing was done, or may have
 # been, a moment ago. {ago} is filled with one of the two spans below.
 duplicate_done = "You already did this {ago} ago."

@@ -12,6 +12,7 @@ into the microphone loudly enough to be taken for a question.
     uv run python scripts/bench_mic.py --echo     # what the speakers put back
     uv run python scripts/bench_mic.py --list-devices   # which microphones there are
     uv run python scripts/bench_mic.py --fixtures       # the endpoint over the recordings (2.9)
+    uv run python scripts/bench_mic.py --takes          # record the fixtures, a sentence at a time
 
 `--all` is the one to run. It walks through the room, one distance, another
 distance and the echo, waits for you between them, loads Whisper once, and
@@ -52,13 +53,24 @@ to every recording, because a microphone goes on listening after the sentence
 and a file does not. The constants change only when a pair beats them on
 these numbers; otherwise the measurement is the reason they stay.
 
-Nothing is written to disk and no audio leaves the machine.
+**The recordings come from here too** (`--takes`). ADR-001's table was taken
+with a synthetic voice, and its accuracy column is a floor until the owner's
+own sentences replace it. This mode records them the way `bench_stt.py` wants
+them: you type the sentence first, exactly as you are about to say it, then
+say it; the text file is written from what was typed and the recording is
+cut where the detector last heard speech, plus the tail the endpoint would
+keep. Through the same microphone `assistant run` opens - a fixture taken
+through Windows' effects path measures a signal the assistant never hears.
+
+Nothing is written to disk - except by `--takes`, which writes only into the
+directory you name - and no audio leaves the machine.
 """
 
 from __future__ import annotations
 
 import argparse
 import asyncio
+import re
 import sys
 import time
 from collections.abc import AsyncIterator
@@ -479,6 +491,69 @@ def split(pcm: Audio, *, endpoint: Endpoint, silence: float, name: str) -> Split
     return result
 
 
+# What `--takes` keeps after the last frame the detector called speech: the
+# window the endpoint waits before it hands a sentence over, so that a
+# fixture ends where a live recording would.
+TAKE_TAIL_SECONDS = SILENCE_SECONDS
+
+
+def trimmed(pcm: Audio) -> Audio | None:
+    """The take up to its last speech frame plus the tail, or `None` when no
+    frame read as speech - a fixture with nothing in it measures nothing."""
+    spoken = [at for at, p in enumerate(probabilities(pcm)) if p >= SPEECH_THRESHOLD]
+    if not spoken:
+        return None
+    end = (spoken[-1] + 1) * FRAME_SAMPLES + int(TAKE_TAIL_SECONDS * SAMPLE_RATE)
+    return pcm[:end]
+
+
+def slug(said: str) -> str:
+    """A file stem from the first words of the sentence: folded, ASCII, short."""
+    from assistant.store.normalize import normalize_search
+
+    words = re.sub(r"[^a-z0-9]+", " ", normalize_search(said)).split()
+    return "-".join(words[:3]) or "take"
+
+
+def next_number(directory: Path) -> int:
+    """One past the highest `NN-` prefix already in the directory."""
+    numbers = [
+        int(path.stem[:2])
+        for path in directory.iterdir()
+        if path.stem[:2].isdigit() and path.stem[2:3] == "-"
+    ]
+    return max(numbers, default=0) + 1
+
+
+def takes_mode(directory: Path, *, seconds: float, device: int | str | None) -> int:
+    """Records fixtures until an empty line: typed sentence, then spoken."""
+    import soundfile  # type: ignore[import-untyped]
+
+    directory.mkdir(parents=True, exist_ok=True)
+    print(f"Recording into {directory}. Each take is {seconds:.0f} s; speak once, then wait.")
+    print("Type each sentence exactly as you will say it - not corrected afterwards.")
+    written = 0
+    while True:
+        said = input("\nSentence to record (empty line to finish): ").strip()
+        if not said:
+            break
+        stem = f"{next_number(directory):02d}-{slug(said)}"
+        ready(f"Say: {said}")
+        pcm = trimmed(record(seconds, device=device))
+        if pcm is None:
+            print("  Nothing in that take reads as speech - not saved. Try it again.")
+            continue
+        measure(pcm, label=stem)
+        print(f"  {len(pcm) / SAMPLE_RATE:.1f} s kept")
+        soundfile.write(str(directory / f"{stem}.wav"), pcm, SAMPLE_RATE, subtype="PCM_16")
+        (directory / f"{stem}.txt").write_text(said + "\n", encoding="utf-8")
+        written += 1
+        print(f"  written: {stem}.wav and {stem}.txt")
+    print(f"\n{written} recordings written.")
+    print("Measure them: uv run python scripts/bench_stt.py --sizes small")
+    return 0
+
+
 def fixtures_mode(directory: Path) -> int:
     """The grid over every recording, and where the current pair stands."""
     from bench_stt import load_fixtures
@@ -568,6 +643,17 @@ def main() -> int:
             "silence windows (2.9); DIR defaults to fixtures/audio."
         ),
     )
+    parser.add_argument(
+        "--takes",
+        nargs="?",
+        const="",
+        default=None,
+        metavar="DIR",
+        help=(
+            "Record fixtures for bench_stt.py, one typed-then-spoken sentence at a time, "
+            "through the configured microphone; DIR defaults to fixtures/audio."
+        ),
+    )
     args = parser.parse_args()
 
     if args.fixtures is not None:
@@ -589,6 +675,12 @@ def main() -> int:
     device = device_choice(args.device if args.device is not None else configured_device())
 
     try:
+        if args.takes is not None:
+            from bench_stt import FIXTURES
+
+            return takes_mode(
+                Path(args.takes) if args.takes else FIXTURES, seconds=args.seconds, device=device
+            )
         return _measure(args, device)
     except MicrophoneUnavailableError as problem:
         # The same sentence `assistant run` would print, for the same reason:

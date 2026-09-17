@@ -55,9 +55,24 @@ bir şablonu kopyalayıp sağ tarafı çevirmek.
   abonelik istiyor — o yüzden Spotify isteği kaydın ISRC kodunu Deezer'dan (anahtarsız)
   bulup Spotify'ı o tek sonuçta açıyor, Deezer şarkıyı bilmiyorsa düz aramada; ve sen
   çal'a basana kadar hiçbir şeyin başlamadığını açıkça söylüyor.
+- **Makinenin ve günün hâlini biliyor.** "Pil ne durumda", "internete bağlı mıyım", "disk
+  dolu mu" doğrudan Windows'tan okunuyor (pil, işlemci, bellek, sistem sürücüsü, Wi-Fi'nin
+  adı); `psutil` yok, kabuk komutu yok. "İstanbul'da hava nasıl", "yarın Ankara'da yağmur
+  var mı" anahtarsız Open-Meteo'dan geliyor ve cevap bulduğu yerin adını söylüyor, yanlış
+  Kadıköy'se anlayasın diye. Kodda gömülü şehir yok: yer söylemeden sorarsan sana soruyor,
+  "İstanbul'da yaşıyorum" da her şey gibi hatırlanıyor. "Python öğrenmeyi ara" tarayıcında
+  bir web araması açıyor, `[web] search_url`'in söylediği motorda (değiştirmezsen Google).
 - **Saati kimseye sormadan söylüyor.** "Saat kaç", "dur", "iptal" ve yerel paketinin
   listelediği diğer kısa komutlar modele hiç gitmiyor: bekleme yok, token yok. Saat yine
   kapıdan geliyor, modelin çağıracağı aynı araçtan.
+- **Senin adına mesaj gönderiyor, önce soruyor.** "Ahmet'e WhatsApp'tan yaz: yarın
+  geliyorum" Ahmet'i `contacts.toml`'da buluyor ve hiçbir şey gitmeden kişiyi, uygulamayı
+  ve metni duyuyorsun — "'yarın geliyorum' mesajı Ahmet kişisine WhatsApp üzerinden
+  gönderilecek. Evet ya da hayır de." WhatsApp bu bilgisayardaki resmî uygulama: kendi
+  sohbet bağlantısı ve yalnız WhatsApp öndeki pencereyken basılan tek bir Enter. Telegram
+  senin kendi hesabın, Telegram'ın API'si üzerinden, bir kez `assistant telegram login`
+  ile. Bir kişiye yalnızca *benzeyen* bir ada asla gönderilmiyor: asistan kimi bulduğunu
+  söyleyip soruyor. Aşağıda *Mesajlaşma*.
 - **Yapmadan önce soruyor, yalnız o zaman.** Her araç riskini kendi bildiriyor. `safe`
   çalışıyor; `confirm` gerçek argüman değerleriyle sana okunuyor — "'…' kaydı unutulacak.
   Evet ya da hayır de." — ve yalnız altı saniye içinde net bir evet gelirse çalışıyor;
@@ -128,8 +143,9 @@ gidiyor — asla bir dosyaya değil. Sonra model sınanıyor: tek bir soru ve te
 alıyor, yalnız aracı çağırırsa kabul ediliyor. Ayarlar `%APPDATA%\assistant\config.toml`
 dosyasına düşüyor; elle düzenlenebilir düz TOML.
 
-Kurulumu yeniden koşmak `config.toml`'u sıfırdan yazıyor, `[audio] input_device` dahil —
-bir mikrofon seçmiştiysen sonra elle geri yaz.
+Son soru hangi mikrofonun dinleneceği — bir liste, en üstte "Windows'un seçtiği".
+`uv run assistant mic` yalnız o soruyu yeniden soruyor, kulaklığa geçtiğin gün için:
+`[audio]`'yu yeniden yazıyor, dosyanın kalanına dokunmuyor.
 
 ## Konuşma
 
@@ -164,13 +180,13 @@ Bilmeye değer şeyler:
   okunamayan cümleye "Seni anlayamadım, tekrar söyler misin?" deniyor, kelimeler ise
   dekoder ne kadar kararsız olursa olsun cevaplanıyor.
 
-Hangi mikrofonun dinleneceğini sen söylemedikçe sistem varsayılanı kullanılıyor.
-`uv run python scripts/bench_mic.py --list-devices` gördüğü bütün aygıtları listeliyor;
-seninkini satırındaki kelimelerle adlandır — `--device "Microphone Array 1"` — kulaklıklı
-bir akşam için `assistant run`'a, kalıcı olarak da `config.toml`'daki `[audio]` altına
-`input_device` olarak. İndeks değil kelime: indeksler her Bluetooth aygıtı bağlandığında
-kayıyor. 16 kHz'de çalışmayan bir aygıt kendi hızında açılıyor ve girişte yeniden
-örnekleniyor.
+Hangi mikrofonun dinleneceği, sen söylemedikçe, Windows'un seçtiği: `uv run assistant mic`
+PortAudio'nun gördüğü her aygıtı, host API başına bir kez, listeliyor ve seçtiğini
+saklıyor. Aynı liste `scripts/bench_mic.py --list-devices`; tek bir akşam için
+`assistant run --device "Microphone Array 1"` satırındaki kelimelerle bir aygıt adlandırır.
+İndeks değil kelime: indeksler her Bluetooth aygıtı bağlandığında kayıyor. 16 kHz'de
+çalışmayan bir aygıt kendi hızında açılıyor ve girişte yeniden örnekleniyor; hangi aygıtın
+açıldığını, nasıl seçilmiş olursa olsun, log söylüyor.
 
 **Hangi mikrofon yolu — ölçüldü.** Geliştirme dizüstünde (Intel Smart Sound dizisi)
 Windows'un ses geliştirmeleri açıkken varsayılan yol Whisper'ı bozuyordu: no-speech
@@ -221,9 +237,21 @@ adları söyleniyor — penceresine sığdığı kadar.
 ## Verilerin nereye gidiyor
 
 - **Sesin makineden çıkmıyor.** Whisper yerelde çalışıyor; sağlayıcıya yalnız metin gidiyor.
+  Tek istisna kendi yazacağın bir satır: `config.toml`'a `[stt] provider = "gemini"` yazarsan
+  mikrofon sesi Google'ın tanıyıcısına gider (deneme; Google hayır dediğinde Whisper arkada
+  yüklü durur). Yazmazsan makineden metinden başka hiçbir şey çıkmaz.
 - **Sende olmayan bir uygulamanın adı Microsoft'a gidiyor.** "X'i aç" makinede X bulamazsa
   X, `winget` üstünden Microsoft Store'da aranıyor. Başka hiçbir şey aranmıyor; `winget`
   kurulu değilse hiçbir şey.
+- **Mesaj, senin kendin göndereceğin yere gidiyor, başka hiçbir yere.** WhatsApp'ta metin
+  ve numara bu bilgisayardaki WhatsApp uygulamasına gidiyor — burada hiçbir şey WhatsApp'ın
+  protokolünü konuşmuyor, konuşmayacak da. Telegram'da metin, senin kendi hesabın
+  üzerinden Telegram'ın sunucularına gidiyor; hesabının yerine geçen oturum dizisi Kimlik
+  Bilgisi Yöneticisi'nde. `contacts.toml` makineden çıkmıyor ve bu deponun parçası değil.
+- **Havasını sorduğun yer Open-Meteo'ya, aramanın sözleri kendi motoruna gidiyor.** Şehir
+  adı Open-Meteo'nun geocoder'ına ve tahminine gönderiliyor (anahtar yok, hesap yok, senin
+  hakkında başka hiçbir şey yok). Web aramasının sözleri `[web] search_url`'deki motora,
+  kendi tarayıcında, elle yazılmış bir arama neyse aynen o.
 - **API anahtarın hiçbir dosyaya yazılmıyor.** `keyring` üzerinden Windows Kimlik Bilgisi
   Yöneticisi'nde duruyor.
 - **Söylediğin yazılmıyor; asistanın yaptığı yazılıyor.**
@@ -252,6 +280,35 @@ protokolünü sağlayan bir adaptör yaz, test dosyasına bir `build` fonksiyonu
 `tests/test_llm_adapters.py` içindeki `ADAPTERS` listesine bir satır ekle. Sözleşme testi
 bundan sonra diğerlerine sorduğu her soruyu seninkine de soruyor, hiç değişmeden — ve
 sözleşmeden geçirilmemiş bir adaptör kaydedilirse test kırmızıya dönüyor.
+
+## Mesajlaşma
+
+Mesaj attığın kişileri `config.toml`'un yanındaki `%APPDATA%\assistant\contacts.toml`'a yaz:
+
+```toml
+[[contact]]
+name = "Ahmet Yılmaz"
+aliases = ["Ahmet", "abi"]
+phone = "+90 532 000 00 00"      # WhatsApp için: uluslararası biçim, başta 0 olmaz
+telegram = "ahmetyilmaz"         # @ olmadan kullanıcı adı; boş bırakırsan adıyla aranır
+```
+
+Asistanın güvenemeyeceği bir dosya — ülke kodsuz numara, tanımadığı bir anahtar, aynı ada
+cevap veren iki kişi — açılışta satırı söyleyen bir cümleyle durduruyor; çünkü bu özelliğin
+yapabileceği en kötü şey yanlış kişiye yazmak.
+
+**WhatsApp** için Microsoft Store'daki WhatsApp uygulaması gerekiyor, telefonuna bağlı.
+Asistan sohbeti WhatsApp'ın kendi bağlantısıyla açıyor ve Enter'a yalnız WhatsApp öndeki
+pencereyken basıyor, tuştan hemen önce bir daha bakarak; değilse mesaj sohbette yazılı
+kalıyor ve sana söyleniyor.
+
+**Telegram** için https://my.telegram.org adresinden kendi `api_id` ve `api_hash`'in ("API
+development tools", iki dakika) ve bir kez `assistant telegram login`: telefon, Telegram'ın
+uygulamana gönderdiği kod, varsa iki adımlı şifren. `api_id` `config.toml`'a, hash ve oturum
+Kimlik Bilgisi Yöneticisi'ne gidiyor. Çıkış Telegram'ın kendi "Aktif oturumlar" ekranından.
+
+`config.toml`'da `[messaging] default_app = "WhatsApp"` her seferinde uygulamayı söylemekten
+kurtarıyor; yazmazsan asistan hangisi diye soruyor.
 
 ## Kendi aracını eklemek
 

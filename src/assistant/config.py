@@ -37,15 +37,18 @@ from pydantic_settings import (
 
 from assistant.agent.limits import Limits
 from assistant.media.youtube import SEARCH_SECONDS
+from assistant.tools.web import SEARCH_URL
 
 __all__ = [
     "CONFIG_DIR_ENV",
     "KEYRING_SERVICE",
+    "RECOGNISERS",
     "AudioSettings",
     "LLMSettings",
     "LimitSettings",
     "LocaleSettings",
     "MediaSettings",
+    "STTSettings",
     "Settings",
     "ToolSettings",
     "config_dir",
@@ -173,6 +176,35 @@ class AudioSettings(BaseModel):
     input_device: str = ""
 
 
+# The recognisers `[stt] provider` may name. `local` is Whisper on this
+# machine and never leaves the list (ADR-001); `gemini` is on trial since
+# 2026-09-14 and sends the microphone audio to Google.
+RECOGNISERS = ("local", "gemini")
+
+
+class STTSettings(BaseModel):
+    """Which engine turns speech into text (section 3.4).
+
+    `local` by default: no key, no cost, and the audio never leaves the
+    machine - the sentence the README makes, and the one that stays true for
+    everyone who did not change this. `gemini` is a choice made in this
+    file, calmly, and it is the one setting here that changes where the
+    voice goes; `model` names Google's recogniser and is only read then.
+    """
+
+    model_config = ConfigDict(extra="ignore")
+
+    provider: str = "local"
+    model: str = "gemini-3.5-transcribe-live"
+
+    @field_validator("provider")
+    @classmethod
+    def _must_be_a_recogniser(cls, value: str) -> str:
+        if value not in RECOGNISERS:
+            raise ValueError(f"expected one of {', '.join(RECOGNISERS)}, got {value!r}")
+        return value
+
+
 class ToolSettings(BaseModel):
     """Which `blocked` tools the user switched on, by name (section 3.9).
 
@@ -215,6 +247,49 @@ class MediaSettings(BaseModel):
     search_timeout_seconds: float = SEARCH_SECONDS
 
 
+class WebSettings(BaseModel):
+    """The `[web]` table: which search engine `search_web` opens.
+
+    `search_url` is the engine's own search address with `{query}` where
+    the words go. Google when the line is not there; a user who would rather
+    not be known to Google writes DuckDuckGo's address here and no code
+    changes (section 10).
+    """
+
+    model_config = ConfigDict(extra="ignore")
+
+    search_url: str = SEARCH_URL
+
+
+class MessagingSettings(BaseModel):
+    """The `[messaging]` table: which app `send_message` uses when the user
+    named none (spec of 2026-09-15, section 7.2).
+
+    `default_app` is "WhatsApp" or "Telegram"; empty means the model asks.
+    A name that is neither is refused at startup, in a sentence, rather
+    than in the middle of every turn.
+    """
+
+    model_config = ConfigDict(extra="ignore")
+
+    default_app: str = ""
+
+
+class TelegramSettings(BaseModel):
+    """The `[telegram]` table: the one thing about the user's Telegram
+    application that is not a secret.
+
+    `api_id` comes from my.telegram.org with the user's own account; the
+    `api_hash` beside it and the session `assistant telegram login` produces
+    are secrets and live in the Credential Manager, never here (section 10).
+    Zero means "not set up": `send_message` then says so for Telegram.
+    """
+
+    model_config = ConfigDict(extra="ignore")
+
+    api_id: int = 0
+
+
 # The numbers of section 3.11 are written once, in `agent/limits.py`; the
 # file's defaults are read off them so that the two cannot drift apart.
 _LIMITS = Limits()
@@ -255,9 +330,13 @@ class Settings(BaseSettings):
     llm: LLMSettings = LLMSettings()
     locale: LocaleSettings = LocaleSettings()
     audio: AudioSettings = AudioSettings()
+    stt: STTSettings = STTSettings()
     tools: ToolSettings = ToolSettings()
     limits: LimitSettings = LimitSettings()
     media: MediaSettings = MediaSettings()
+    web: WebSettings = WebSettings()
+    messaging: MessagingSettings = MessagingSettings()
+    telegram: TelegramSettings = TelegramSettings()
 
     @classmethod
     def settings_customise_sources(

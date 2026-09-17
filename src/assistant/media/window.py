@@ -134,6 +134,7 @@ class Desktop(Protocol):
 
 WM_CLOSE = 0x0010
 PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+KEYEVENTF_KEYUP = 0x0002
 _EnumWindowsProc = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
 
 
@@ -161,6 +162,7 @@ class Win32Desktop:
             wintypes.LPARAM,
         ]
         self._user32.EnumWindows.argtypes = [_EnumWindowsProc, wintypes.LPARAM]
+        self._user32.GetForegroundWindow.restype = wintypes.HWND
         self._kernel32.OpenProcess.restype = wintypes.HANDLE
         self._kernel32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
         self._kernel32.QueryFullProcessImageNameW.argtypes = [
@@ -177,6 +179,23 @@ class Win32Desktop:
     def windows_of(self, executable: Path) -> set[int]:
         """The visible top-level windows owned by `executable`."""
         wanted = str(executable).casefold()
+        return self._windows_where(lambda image: image.casefold() == wanted)
+
+    def windows_named(self, image: str) -> set[int]:
+        """The visible top-level windows of any program whose file is called
+        `image` - `Spotify.exe` - wherever it is installed.
+
+        By the name and not the path, because the same program lives under
+        `WindowsApps` when it came from the Store and under the user's
+        profile when it did not, and the caller has no business knowing
+        which (`media/spotify.py`).
+        """
+        wanted = image.casefold()
+        return self._windows_where(lambda path: Path(path).name.casefold() == wanted)
+
+    def _windows_where(self, owned: Callable[[str], bool]) -> set[int]:
+        """The visible top-level windows whose owning process's image
+        satisfies `owned`."""
         found: set[int] = set()
         # Each process is asked for its image once, not once per window.
         images: dict[int, str | None] = {}
@@ -188,7 +207,7 @@ class Win32Desktop:
                 if pid.value not in images:
                     images[pid.value] = self._image_of(pid.value)
                 image = images[pid.value]
-                if image is not None and image.casefold() == wanted:
+                if image is not None and owned(image):
                     found.add(handle)
             return True
 
@@ -210,6 +229,28 @@ class Win32Desktop:
             return str(buffer.value)
         finally:
             self._kernel32.CloseHandle(process)
+
+    def foreground_image(self) -> str | None:
+        """The file name of the program whose window is in front -
+        `WhatsApp.exe` - or `None` when there is none, or it cannot be asked.
+
+        Added for `messaging/whatsapp.py` (2026-09-15), which presses a key
+        only when this names the application it means to press it in.
+        """
+        handle = self._user32.GetForegroundWindow()
+        if not handle:
+            return None
+        pid = wintypes.DWORD()
+        self._user32.GetWindowThreadProcessId(handle, ctypes.byref(pid))
+        image = self._image_of(pid.value)
+        return None if image is None else Path(image).name
+
+    def press(self, code: int) -> None:
+        """One press and release of the key `code`, as the keyboard sends it -
+        the three lines `tools/media.py` presses the media keys with, kept
+        there as that module's own test seam."""
+        self._user32.keybd_event(code, 0, 0, 0)
+        self._user32.keybd_event(code, 0, KEYEVENTF_KEYUP, 0)
 
     def is_window(self, handle: int) -> bool:
         return bool(self._user32.IsWindow(handle))

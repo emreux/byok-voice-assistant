@@ -67,6 +67,10 @@ probing_tools = "Modelin araç çağırıp çağıramadığı sınanıyor..."
 tools_ok = "Model araç çağırabiliyor — ilk yanıt {ms} ms'de geldi."
 tools_failed = "Bu model araç çağıramıyor; asistanın işlerinin çoğu buna bağlı. Başka bir model seç."
 probe_refused = "Model sınanamadı: {problem}. Başka bir model seç ya da tekrar dene."
+microphone = "Asistan hangi mikrofonu dinlesin?"
+windows_microphone = "Windows'un seçtiği mikrofon (şu an: {name})"
+no_microphones = "Hiç mikrofon bulunamadı."
+microphone_saved = "Mikrofon: {microphone}. Ayarlar: {path}"
 saved = "Hazır. Ayarlar: {path} — anahtarın kendisi Windows Kimlik Bilgisi Yöneticisi'nde."
 cancelled = "Kurulum iptal edildi. Hiçbir şey değiştirilmedi."
 
@@ -95,6 +99,18 @@ forget_confirm = "'{fact}' kaydı unutulacak."
 # in for a publisher the Store did not name.
 store_install_confirm = "'{name}' ({publisher}) Microsoft Store'dan indirilecek."
 unknown_publisher = "yayıncısı bilinmiyor"
+# Asked before a message goes (2026-09-15); {text} is the message word for
+# word, {contact} the person as the user said them, {app} WhatsApp or
+# Telegram. The hint on how to answer is added after it.
+send_message_confirm = "'{text}' mesajı {contact} kişisine {app} üzerinden gönderilecek."
+# `assistant telegram login`: the questions, in order, and the two answers.
+telegram_api_id = "Telegram api_id'n (bir sayı). https://my.telegram.org adresinde 'API development tools' altından alınır"
+telegram_api_hash = "Telegram api_hash'in (yazarken görünmez)"
+telegram_phone = "Telegram hesabının telefon numarası, ülke koduyla (+90...)"
+telegram_code = "Telegram'ın az önce Telegram uygulamana gönderdiği kod (SMS değil)"
+telegram_password = "Telegram iki adımlı doğrulama şifren (yazarken görünmez)"
+telegram_logged_in = "Telegram'a {name} olarak giriş yapıldı. Oturum Windows Kimlik Bilgisi Yöneticisi'nde."
+telegram_login_failed = "Telegram girişi başarısız: {reason}"
 duplicate_done = "Bunu {ago} önce zaten yaptın."
 duplicate_uncertain = "Bunu {ago} önce denedin, sonucu belirsiz kaldı."
 seconds_ago = "{count} saniye"

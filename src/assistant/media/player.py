@@ -40,7 +40,6 @@ from typing import Protocol
 
 from loguru import logger
 
-from assistant import shell
 from assistant.config import MediaSettings
 from assistant.media.deezer import Deezer
 from assistant.media.now_playing import pause_current
@@ -331,15 +330,15 @@ class Player:
     async def _open(self, target: str) -> bool:
         """Hands `target` to Windows the way its scheme asks to be handled.
 
-        A `spotify:` URI goes to the shell, which is what starts the installed
-        application; everything else is a web address and goes to the
-        assistant's own browser window (`media/window.py`) - in the profile the
-        user is signed in to (`shell.py`).
+        A `spotify:` URI goes to the installed application - started first
+        when it is not running, so that the search is not lost on the way
+        (`spotify.py`); everything else is a web address and goes to the
+        assistant's own browser window (`media/window.py`) - in the profile
+        the user is signed in to (`shell.py`).
         """
         try:
             if target.startswith("spotify:"):
-                await shell.open_target(target)
-                return True
+                return await self.spotify.open(target)
             return await self.window.show(target)
         except OSError as failure:
             logger.warning("{} would not open: {}", target, failure)

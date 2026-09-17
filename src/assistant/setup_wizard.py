@@ -1,9 +1,9 @@
-"""`assistant setup` - the three questions phase 1 asks (design.md section 3.3).
+"""`assistant setup` - the few questions phase 1 asks (design.md section 3.3).
 
-Provider, key, model, and the language the assistant speaks. The fourteen step
-wizard of section 3.3 - device tests, tool probe, latency measurement, a
-fallback model - is phase 4.5; what is here is the smallest thing that can
-produce a working `config.toml`.
+Provider, key, model, the language the assistant speaks, and the microphone
+it listens through. The fourteen step wizard of section 3.3 - device tests,
+tool probe, latency measurement, a fallback model - is phase 4.5; what is
+here is the smallest thing that can produce a working `config.toml`.
 
 Two rules shape the code more than the questions do.
 
@@ -35,6 +35,12 @@ whether it answers, and that is all. One that has no address of its own -
 address goes to `config.toml` beside the model, where a text editor can
 reach it. Neither question names an adapter here: the registry says which
 entries need an address, the catalogue says which need a key.
+
+**The microphone is a list, not a name to type.** PortAudio's table, every
+input once per host API, with "whatever Windows has chosen" on top and stored
+as the empty string that has meant the default since phase 1. `assistant mic`
+asks this one question again on its own - the day a headset comes out - and
+rewrites `[audio]` alone, so that nobody edits `config.toml` by hand for it.
 """
 
 from __future__ import annotations
@@ -48,7 +54,9 @@ import questionary
 from rich.console import Console
 
 from assistant import locales
+from assistant.audio.capture import Microphones, available_microphones
 from assistant.config import (
+    AudioSettings,
     LLMSettings,
     LocaleSettings,
     Settings,
@@ -70,7 +78,15 @@ from assistant.llm.registry import (
 from assistant.store.db import open_database
 from assistant.store.repos import SettingsRepo
 
-__all__ = ["TEXT", "Option", "Prompter", "TerminalPrompter", "run_setup", "wording"]
+__all__ = [
+    "TEXT",
+    "Option",
+    "Prompter",
+    "TerminalPrompter",
+    "run_microphone_setup",
+    "run_setup",
+    "wording",
+]
 
 _OK = 0
 _GAVE_UP = 1
@@ -145,6 +161,10 @@ TEXT: dict[str, str] = {
     "probe_refused": (
         "The model could not be tested: {problem}. Choose another model, or try again."
     ),
+    "microphone": "Which microphone should the assistant listen through?",
+    "windows_microphone": "Whatever Windows has chosen (right now: {name})",
+    "no_microphones": "No microphone was found.",
+    "microphone_saved": "Microphone: {microphone}. Settings: {path}",
     "saved": "Ready. Settings: {path} - the key itself is in the Windows Credential Manager.",
     "cancelled": "Setup cancelled. Nothing was changed.",
 }
@@ -183,23 +203,52 @@ async def run_setup(
     *,
     catalog: Mapping[str, ProviderEntry] | None = None,
     database: sqlite3.Connection | None = None,
+    microphones: Microphones | None = None,
 ) -> int:
     """Asks the questions, then writes the answers. Returns a process exit code.
 
     `database` is where the verdict on the model goes; left out, the
     machine's own is opened for it at the end, and closed again.
+    `microphones` is what the last question offers; left out, PortAudio is
+    asked.
     """
     try:
-        return await _ask(prompter, catalog, database)
+        return await _ask(prompter, catalog, database, microphones)
     except _WalkedAwayError:
         prompter.say("cancelled")
         return _GAVE_UP
+
+
+async def run_microphone_setup(
+    prompter: Prompter, *, microphones: Microphones | None = None
+) -> int:
+    """`assistant mic`: the microphone question on its own.
+
+    Rewrites `[audio]` and leaves every other table as the file has it, so
+    that switching to a headset is one command rather than a text editor.
+    """
+    found = _found(microphones)
+    if not found.devices:
+        prompter.say("no_microphones")
+        return _GAVE_UP
+    options = _microphone_options(found)
+    try:
+        chosen = _answered(await prompter.choose("microphone", options))
+    except _WalkedAwayError:
+        prompter.say("cancelled")
+        return _GAVE_UP
+
+    path = save_settings(Settings(audio=AudioSettings(input_device=chosen)))
+    label = next(option.label for option in options if option.value == chosen)
+    prompter.say("microphone_saved", microphone=label, path=path)
+    return _OK
 
 
 async def _ask(
     prompter: Prompter,
     catalog: Mapping[str, ProviderEntry] | None,
     database: sqlite3.Connection | None,
+    microphones: Microphones | None,
 ) -> int:
     entries = load_catalog() if catalog is None else catalog
     buildable = {
@@ -235,6 +284,7 @@ async def _ask(
     model, verdict = await _model_that_calls_tools(
         prompter, provider, models, question=_probe_question(locale)
     )
+    input_device = await _pick_microphone(prompter, _found(microphones))
 
     # Everything above could still be abandoned; from here it is written down.
     if api_key:
@@ -243,6 +293,7 @@ async def _ask(
         Settings(
             llm=LLMSettings(primary=f"{provider_id}:{model}", base_url=base_url or ""),
             locale=LocaleSettings(code=locale),
+            audio=AudioSettings(input_device=input_device),
         )
     )
     _remember(database, provider_id, model, verdict)
@@ -375,6 +426,33 @@ async def _model_that_calls_tools(
             prompter.say("tools_ok", ms=_whole(verdict.first_token_ms))
             return model, verdict
         prompter.say("tools_failed")
+
+
+async def _pick_microphone(prompter: Prompter, found: Microphones) -> str:
+    """The `[audio] input_device` line - or nothing, for a machine with no
+    microphone yet: setup goes on, and the default is what it listens through
+    once something is plugged in."""
+    if not found.devices:
+        prompter.say("no_microphones")
+        return ""
+    return _answered(await prompter.choose("microphone", _microphone_options(found)))
+
+
+def _found(microphones: Microphones | None) -> Microphones:
+    return available_microphones() if microphones is None else microphones
+
+
+def _microphone_options(found: Microphones) -> list[Option]:
+    """Windows' own choice first, then PortAudio's table line by line.
+
+    The first label is the one option worded rather than named, so it is
+    the one place the wizard reads its own wording: the device it stands
+    for changes with every headset, and the label says which it is today.
+    """
+    current = " ".join((found.default or "?").split())
+    options = [Option("", wording()["windows_microphone"].format(name=current))]
+    options.extend(Option(device.setting, device.label) for device in found.devices)
+    return options
 
 
 def _probe_question(locale: str) -> str:

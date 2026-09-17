@@ -1,10 +1,11 @@
 """Command line entry point - and the composition root of the program.
 
-`setup` asks the three questions of item 1.4. `run` is item 1.11: it puts the
-pieces together, hands them to the state machine, and shows the one line of
-terminal that is the entire interface until the tray icon of phase 4.2.
-`cost` is 2.4: what the turns cost, read back from `usage_log`. `doctor`
-arrives in phase 3 (design.md section 8).
+`setup` asks the questions of item 1.4, the microphone among them since
+2026-09-15; `mic` asks that one again on its own. `run` is item 1.11: it
+puts the pieces together, hands them to the state machine, and shows the one
+line of terminal that is the entire interface until the tray icon of phase
+4.2. `cost` is 2.4: what the turns cost, read back from `usage_log`.
+`doctor` arrives in phase 3 (design.md section 8).
 
 This is the only file that knows the concrete names: which tools are on
 offer, which gate runs them, where the audit rows go. `agent/core.py` sees a
@@ -45,7 +46,7 @@ from collections.abc import Callable, Mapping, Sequence
 from typing import TYPE_CHECKING
 
 from assistant import __version__, locales
-from assistant.config import Settings, is_configured, load_settings
+from assistant.config import Settings, is_configured, load_api_key, load_settings
 
 if TYPE_CHECKING:
     from rich.table import Table
@@ -105,7 +106,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--version", action="version", version=f"assistant {__version__}")
 
     subparsers = parser.add_subparsers(dest="command", metavar="<command>")
-    subparsers.add_parser("setup", help="Choose a provider, store the API key, pick a model.")
+    subparsers.add_parser(
+        "setup", help="Choose a provider, store the API key, pick a model and a microphone."
+    )
+    subparsers.add_parser("mic", help="Choose which microphone the assistant listens through.")
     run = subparsers.add_parser(
         "run", help="Start the assistant. Ctrl+Alt+H pauses and resumes listening; Ctrl+C stops."
     )
@@ -115,10 +119,24 @@ def build_parser() -> argparse.ArgumentParser:
         help=(
             "Input device: an index, or words from its name as "
             "'scripts/bench_mic.py --list-devices' prints them. "
-            "Overrides [audio] input_device in config.toml."
+            "Overrides [audio] input_device in config.toml for this run; "
+            "'assistant mic' changes it for good."
         ),
     )
     subparsers.add_parser("cost", help="Show what the assistant has spent, today and this month.")
+    telegram = subparsers.add_parser(
+        "telegram", help="Telegram: log in once, so that messages can be sent as you."
+    )
+    telegram_commands = telegram.add_subparsers(
+        dest="telegram_command", metavar="<subcommand>", required=True
+    )
+    telegram_commands.add_parser(
+        "login",
+        help=(
+            "Ask for your api_id and api_hash (my.telegram.org), your phone and the code, "
+            "and keep the session in the Credential Manager."
+        ),
+    )
 
     return parser
 
@@ -142,8 +160,16 @@ def main(argv: Sequence[str] | None = None) -> int:
         # stand in for it; the wizard itself opens a prompt and would hang.
         return asyncio.run(setup_wizard.run_setup(setup_wizard.TerminalPrompter()))
 
+    if args.command == "mic":
+        from assistant import setup_wizard
+
+        return asyncio.run(setup_wizard.run_microphone_setup(setup_wizard.TerminalPrompter()))
+
     if args.command == "cost":
         return _cost()
+
+    if args.command == "telegram":
+        return _telegram_login()
 
     return _run(device=args.device)
 
@@ -169,6 +195,45 @@ def use_utf8(stream: object) -> None:
 # --------------------------------------------------------------------------
 
 
+def _telegram_login() -> int:
+    """`assistant telegram login`: the questions of `messaging/telegram.py`,
+    once, and the three things they produce stored where each belongs -
+    the `api_id` in `config.toml`, the hash and the session in the
+    Credential Manager (section 10). The settings are rewritten from what
+    was loaded, so nothing else in the file changes."""
+    from assistant import setup_wizard
+    from assistant.config import TelegramSettings, save_settings, store_api_key
+    from assistant.messaging import telegram
+
+    settings = load_settings()
+    pack = locales.load(settings.locale.code if is_configured() else locales.system_code())
+    text = {key: pack.say(key, default) for key, default in telegram.TEXT.items()}
+    text["cancelled"] = pack.say("cancelled", setup_wizard.TEXT["cancelled"])
+    prompter = setup_wizard.TerminalPrompter(text=text)
+
+    try:
+        done = asyncio.run(
+            telegram.login(
+                prompter,
+                api_id=settings.telegram.api_id,
+                api_hash=load_api_key(telegram.HASH_ENTRY) or "",
+            )
+        )
+    except telegram.LoginError as refusal:
+        prompter.say("telegram_login_failed", reason=refusal)
+        return _GAVE_UP
+    if done is None:
+        prompter.say("cancelled")
+        return _GAVE_UP
+
+    store_api_key(telegram.HASH_ENTRY, done.api_hash)
+    store_api_key(telegram.SESSION_ENTRY, done.session)
+    settings.telegram = TelegramSettings(api_id=done.api_id)
+    save_settings(settings)
+    prompter.say("telegram_logged_in", name=done.name)
+    return _OK
+
+
 def _run(*, device: str | None = None) -> int:
     """Starts the assistant, or says why it cannot.
 
@@ -181,8 +246,10 @@ def _run(*, device: str | None = None) -> int:
     from assistant.audio.capture import MicrophoneUnavailableError, device_choice
     from assistant.llm.registry import RegistryError
     from assistant.logs import setup_logging
+    from assistant.messaging.contacts import ContactsFileError
     from assistant.store.memory import MemoryFileError
     from assistant.stt.local_whisper import ModelUnavailableError
+    from assistant.tools.messaging import BadDefaultAppError
 
     settings = load_settings()
     ready = is_configured()
@@ -214,6 +281,8 @@ def _run(*, device: str | None = None) -> int:
         ModelUnavailableError,
         MicrophoneUnavailableError,
         MemoryFileError,
+        ContactsFileError,
+        BadDefaultAppError,
     )
     # The flag for one evening with a headset; the settings for every other
     # day; the system default when neither says anything.
@@ -241,15 +310,22 @@ async def _talk(settings: Settings, pack: Locale, *, device: int | str | None = 
     from assistant.audio.capture import HandsFree, SystemMicrophone
     from assistant.audio.player import SystemSpeaker
     from assistant.audio.vad import Endpoint, SileroVAD
-    from assistant.llm.registry import create_provider
+    from assistant.llm.registry import MissingAPIKeyError, create_provider
+    from assistant.machine import Win32Machine
     from assistant.media.player import Player
+    from assistant.messaging.contacts import AddressBook
+    from assistant.messaging.telegram import HASH_ENTRY, SESSION_ENTRY, Telegram, TelethonClient
+    from assistant.messaging.whatsapp import WhatsApp
     from assistant.store.db import open_database
     from assistant.store.memory import UserMemory
     from assistant.store.repos import AuditRepo, SettingsRepo, UsageRepo
+    from assistant.stt.gemini_stt import GeminiSTT
     from assistant.stt.local_whisper import LocalWhisper
     from assistant.tools import memory as memory_tools
+    from assistant.tools import messaging as messaging_tools
     from assistant.tools import store as store_tools
     from assistant.tools import system as system_tools
+    from assistant.tools import weather as weather_tools
     from assistant.tools.local import load_local_tools
     from assistant.tools.media import (
         media_control,
@@ -258,6 +334,7 @@ async def _talk(settings: Settings, pack: Locale, *, device: int | str | None = 
         play_video_for,
     )
     from assistant.tools.registry import ToolRegistry
+    from assistant.tools.status import system_status_for
     from assistant.tools.system import (
         PROMPT_NAMES,
         AppCatalog,
@@ -266,6 +343,7 @@ async def _talk(settings: Settings, pack: Locale, *, device: int | str | None = 
         open_settings,
         open_url,
     )
+    from assistant.tools.web import search_web_for
     from assistant.tts.sapi import SapiTTS
     from assistant.ui.status import StatusLine
     from assistant.usage.tracker import Pricing, UsageTracker
@@ -280,6 +358,10 @@ async def _talk(settings: Settings, pack: Locale, *, device: int | str | None = 
     # into the prompt at every request. Before the database for the same
     # reason as the provider - a file edited into nonsense is a sentence.
     memory = UserMemory.load()
+    # The people the user can message (`messaging/contacts.py`), read here
+    # for the same reason: a `contacts.toml` edited into nonsense - or into
+    # two people who answer to one name - is a sentence before anything slow.
+    book = AddressBook.load()
     database = open_database()
     # The table of section 3.11, once, for everyone who reads a row of it:
     # the loop, the gate, the state machine's clock and the tracker.
@@ -288,6 +370,24 @@ async def _talk(settings: Settings, pack: Locale, *, device: int | str | None = 
     # holds a connection open between searches and the `finally` below is what
     # gives it back; three tools and `open_app` share the one player.
     player = Player(settings=settings.media)
+    # The weather, from Open-Meteo over one kept connection (15 Sep 2026);
+    # built beside the player for the same reason, and given back in the
+    # same `finally`.
+    weather = weather_tools.OpenMeteo()
+    # The two ways of sending a message (spec of 2026-09-15). WhatsApp is
+    # the installed application, asked for at every send; Telegram is the
+    # user's own account, logged in once with `assistant telegram login` -
+    # without the three things that produces, the channel says so instead
+    # of connecting. Closed in the `finally` like the player.
+    whatsapp = WhatsApp()
+    api_hash = load_api_key(HASH_ENTRY)
+    session = load_api_key(SESSION_ENTRY)
+    telegram = Telegram(
+        book,
+        client=TelethonClient(settings.telegram.api_id, api_hash, session)
+        if settings.telegram.api_id and api_hash and session
+        else None,
+    )
     try:
         detector = SileroVAD()
 
@@ -305,9 +405,26 @@ async def _talk(settings: Settings, pack: Locale, *, device: int | str | None = 
             # The names this user has asked to open before lead the list;
             # the window holds few (`stt/local_whisper.py`).
             asked = AuditRepo(database).names_asked("open_app", limit=PROMPT_NAMES)
-            speech = LocalWhisper(
-                vocabulary=catalog.spoken_names(first=asked), prompt=pack.stt_prompt
-            )
+            # People first (spec A6): their names are the shortest, most
+            # ambiguous words the recogniser hears, and there are few of them.
+            names = [*book.names(), *catalog.spoken_names(first=asked)]
+            whisper = LocalWhisper(vocabulary=names, prompt=pack.stt_prompt)
+            speech: LocalWhisper | GeminiSTT = whisper
+            if settings.stt.provider == "gemini":
+                # On trial (2026-09-14, `stt/gemini_stt.py`): Google first,
+                # Whisper loaded behind it for the free tier's three
+                # requests a minute and for the network. The key is the
+                # entry the LLM uses when the LLM is Gemini; missing, it is
+                # a sentence before anything slow is loaded.
+                key = load_api_key("gemini")
+                if not key:
+                    raise MissingAPIKeyError(
+                        "no API key stored for 'gemini', which [stt] provider names - "
+                        "run 'assistant setup' to add one, or set provider = \"local\""
+                    )
+                speech = GeminiSTT(
+                    key, model=settings.stt.model, vocabulary=names, fallback=whisper
+                )
             # The Microsoft Store, asked last by `open_app` and installed from
             # by `install_app` - the one tool that changes what is on the
             # machine, and asks first (2026-09-13).
@@ -319,6 +436,11 @@ async def _talk(settings: Settings, pack: Locale, *, device: int | str | None = 
             tools = ToolRegistry(
                 [
                     get_current_time,
+                    # The machine's own state and the weather (15 Sep 2026):
+                    # the two questions about the world that need no
+                    # application opened.
+                    system_status_for(Win32Machine()),
+                    weather_tools.get_weather_for(weather),
                     # The catalogue answers first, the player second and the
                     # Store last, so an installed application always wins
                     # its own name.
@@ -331,6 +453,8 @@ async def _talk(settings: Settings, pack: Locale, *, device: int | str | None = 
                         ),
                     ),
                     open_url,
+                    # The engine is the user's (`[web] search_url`).
+                    search_web_for(settings.web.search_url),
                     open_settings,
                     media_control,
                     play_music_for(player),
@@ -348,6 +472,19 @@ async def _talk(settings: Settings, pack: Locale, *, device: int | str | None = 
                         store,
                         confirm_prompt=pack.say(
                             "store_install_confirm", store_tools.TEXT["store_install_confirm"]
+                        ),
+                    ),
+                    # One tool for both messaging apps; it asks first, in the
+                    # pack's words, and hears the contact, the app and the text.
+                    messaging_tools.send_message_for(
+                        {
+                            "whatsapp": messaging_tools.WhatsAppChannel(whatsapp, book),
+                            "telegram": telegram,
+                        },
+                        default_app=settings.messaging.default_app,
+                        confirm_prompt=pack.say(
+                            "send_message_confirm",
+                            messaging_tools.TEXT["send_message_confirm"],
                         ),
                     ),
                     # The owner's own, from %APPDATA%\assistant\tools: read
@@ -408,6 +545,8 @@ async def _talk(settings: Settings, pack: Locale, *, device: int | str | None = 
             await assistant.run()
     finally:
         await player.aclose()
+        await weather.aclose()
+        await telegram.close()
         database.close()
 
 

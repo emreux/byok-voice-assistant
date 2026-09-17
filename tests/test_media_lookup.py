@@ -25,7 +25,7 @@ import pytest
 
 from assistant.media import youtube
 from assistant.media.deezer import Deezer
-from assistant.media.spotify import APP_HOME, WEB_HOME, Spotify
+from assistant.media.spotify import APP_HOME, WEB_HOME, Spotify, app_installed
 from assistant.media.track import SearchError
 from assistant.media.youtube import YouTube, YouTubeMusic
 
@@ -607,6 +607,17 @@ async def test_a_deezer_client_handed_in_is_not_closed_underneath_its_owner() ->
 # --------------------------------------------------------------------------
 # Spotify: a search, and never a claim that something started
 # --------------------------------------------------------------------------
+
+
+def test_the_application_is_installed_when_windows_names_one_for_the_scheme() -> None:
+    """The Store build registers no `shell\\open\\command` for `spotify:` -
+    measured 2026-09-14 - so the question goes to the association Windows
+    itself resolves, which answers with the application's name."""
+    assert app_installed(named=lambda scheme: "Spotify" if scheme == "spotify" else None)
+
+
+def test_the_application_is_not_installed_when_nothing_answers_the_scheme() -> None:
+    assert not app_installed(named=lambda scheme: None)
 
 
 def test_an_isrc_opens_the_one_exact_recording_in_the_application() -> None:

@@ -18,9 +18,12 @@ alone) and nothing on the event loop may (section 3.1 rule 4).
 **The name the user said is not the name in the catalogue.** "krom" is
 "Google Chrome"; "IŞIK" and "isik" are one word; the recogniser misspells.
 `find` folds both sides with `normalize_search` and then tries the whole
-name, one word of it, a prefix, and last `difflib`'s closest match. The
-language of the catalogue never matters: on a Turkish Windows the shortcut is
-already called "Hesap Makinesi", on an English one "Calculator", and the code
+name, one word of it, a prefix, and last `difflib`'s closest match - the
+matcher of `store/names.py`, which the address book of
+`messaging/contacts.py` uses for people (moved out of here on 15 September
+2026; its constants and their measurements went with it). The language of
+the catalogue never matters: on a Turkish Windows the shortcut is already
+called "Hesap Makinesi", on an English one "Calculator", and the code
 carries neither (section 3.12).
 
 What a tool returns is addressed to the model, not the user, so it is written
@@ -40,13 +43,13 @@ import subprocess
 from collections.abc import Awaitable, Callable, Iterable, Iterator
 from dataclasses import dataclass
 from datetime import datetime
-from difflib import SequenceMatcher
 from pathlib import Path
 from typing import Annotated, Protocol
 
 from loguru import logger
 
 from assistant import shell
+from assistant.store.names import NameIndex
 from assistant.store.normalize import normalize_search
 from assistant.tools.registry import Tool, tool
 
@@ -80,21 +83,6 @@ PROMPT_NAMES = 120
 # (`Outlook (classic)`, `IDLE (Python 3.13 64-bit)`), in any order at the end.
 # `Paint 3D` and `7-Zip` are names, not versions, and stay.
 SPOKEN_TAIL = re.compile(r"(?:\s*\([^)]*\)|\s+v?\d+(?:\.\d+)+\S*|\s+\d{4})+\s*$", re.IGNORECASE)
-
-# Below this ratio `difflib` is guessing rather than matching. Measured on
-# this machine (2026-09-09) against its 173 apps: at 0.6, "spotify" - not
-# installed - opened Sticky Notes and "krom" the Command Prompt, because a
-# short word of a name is easy to be six tenths like. At 0.7 both are left
-# for the model to ask about, and a misspelling ("notpad", "kalkulator",
-# "vscode") still lands. Opening the wrong app is worse than asking.
-CLOSE_ENOUGH = 0.7
-
-# The bar for a *suggestion* is lower: when nothing matched, the model is
-# better off with three names that were nearly it than with none.
-NEAR_ENOUGH = 0.4
-
-# A prefix shorter than this matches too much: "a" starts half the catalogue.
-PREFIX_CHARS = 3
 
 # How long the shell's listing may take before it is given up on. Measured at
 # 3.4 s; a machine ten times slower still answers.
@@ -312,14 +300,12 @@ class AppCatalog:
     def __init__(self, entries: Iterable[AppEntry], *, scanners: Iterable[Scanner] = ()) -> None:
         self._scanners = tuple(scanners)
         self._entries: list[AppEntry] = []
-        self._by_name: dict[str, AppEntry] = {}
-        self._by_word: dict[str, AppEntry] = {}
+        self._index: NameIndex[AppEntry] = NameIndex()
         self._fill(entries)
 
     def _fill(self, entries: Iterable[AppEntry]) -> None:
         self._entries.clear()
-        self._by_name.clear()
-        self._by_word.clear()
+        self._index.clear()
         listed: set[str] = set()
         for entry in entries:
             key = normalize_search(entry.name).strip()
@@ -332,13 +318,8 @@ class AppCatalog:
             # The listed name always finds its own app, even when another
             # app is *said* the same way and was listed first ("Outlook
             # (classic)" before "Outlook"); the spoken form is an alias that
-            # only stands where no listed name does.
-            self._by_name[key] = entry
-            spoken = normalize_search(entry.spoken).strip()
-            if spoken and spoken != key:
-                self._by_name.setdefault(spoken, entry)
-            for word in _words(spoken or key):
-                self._by_word.setdefault(word, entry)
+            # only stands where no listed name does (`store/names.py`).
+            self._index.add(entry, entry.name, spoken=entry.spoken)
 
     @classmethod
     async def load(cls, *, scanners: Iterable[Scanner] | None = None) -> AppCatalog:
@@ -400,79 +381,18 @@ class AppCatalog:
         In order: the whole name, one word of a name ("chrome" is Google
         Chrome), the start of either ("spot"), and the closest by
         `difflib` ("krom"). Folded on both sides, so the case, the accents
-        and the recogniser's spelling of a foreign name do not decide.
+        and the recogniser's spelling of a foreign name do not decide
+        (`store/names.py`).
         """
-        wanted = normalize_search(spoken).strip()
-        if not wanted:
-            return None
-
-        found = self._by_name.get(wanted) or self._by_word.get(wanted)
-        if found is None and len(wanted) >= PREFIX_CHARS:
-            found = next(
-                (entry for key, entry in self._keys(words=True) if key.startswith(wanted)), None
-            )
-        if found is None:
-            found = self._one_close_enough(wanted)
-        return found
+        return self._index.find(spoken)
 
     def closest(self, spoken: str, *, limit: int = 3) -> list[str]:
         """Names near `spoken`, for the model to offer when nothing matched."""
-        wanted = normalize_search(spoken).strip()
-        return [entry.name for _, entry in self._ranked(wanted, cutoff=NEAR_ENOUGH)[:limit]]
-
-    def _one_close_enough(self, wanted: str) -> AppEntry | None:
-        """The closest app when one is clearly closest, otherwise nothing.
-
-        Two apps equally like what was said - "chrome" and "prompt" are both
-        six tenths of "krom" - is a question for the user, not a coin toss.
-        """
-        ranked = self._ranked(wanted, cutoff=CLOSE_ENOUGH)
-        if not ranked:
-            return None
-        (best_score, best), *others = ranked
-        if others and others[0][0] == best_score:
-            return None
-        return best
-
-    def _ranked(self, wanted: str, *, cutoff: float) -> list[tuple[float, AppEntry]]:
-        """Every app with a key at least `cutoff` like `wanted`, the most
-        alike first, each app once - scored by its best key, so that a name
-        and its words do not fill the list with one app.
-
-        One word said is measured against single words too ("krom" against
-        "chrome"); several words are measured against whole names only.
-        Measured 2026-09-13: "Text Editor" opened the Registry Editor because
-        the word "editor" alone is seven tenths of the phrase, while "Pay
-        Charm" - what the recogniser made of PyCharm - is closer to the whole
-        spoken name than to any word of it.
-        """
-        matcher = SequenceMatcher()
-        matcher.set_seq2(wanted)
-        best: dict[AppEntry, float] = {}
-        for key, entry in self._keys(words=" " not in wanted):
-            matcher.set_seq1(key)
-            # The two cheap upper bounds first, as `get_close_matches` does;
-            # the real ratio is the expensive one, and this runs on the loop.
-            if matcher.real_quick_ratio() < cutoff or matcher.quick_ratio() < cutoff:
-                continue
-            score = matcher.ratio()
-            if score >= cutoff and score > best.get(entry, 0.0):
-                best[entry] = score
-        return sorted(((score, entry) for entry, score in best.items()), key=lambda pair: -pair[0])
-
-    def _keys(self, *, words: bool) -> Iterator[tuple[str, AppEntry]]:
-        yield from self._by_name.items()
-        if words:
-            yield from self._by_word.items()
+        return self._index.closest(spoken, limit=limit)
 
 
 def _scan(scanners: Iterable[Scanner]) -> list[AppEntry]:
     return [entry for scanner in scanners for entry in scanner()]
-
-
-def _words(key: str) -> list[str]:
-    # The key is ASCII already; a single letter is not a word anyone asks for.
-    return [word for word in re.findall(r"[a-z0-9]+", key) if len(word) > 1]
 
 
 # --------------------------------------------------------------------------
