@@ -33,6 +33,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 import sqlite3
 import time
 from collections.abc import Callable, Mapping
@@ -40,14 +41,22 @@ from dataclasses import dataclass
 from typing import Any, Literal
 
 from assistant.llm.base import ToolCall, Usage
+from assistant.store.normalize import normalize_search
 
 __all__ = [
     "HASH_CHARS",
+    "MIN_QUERY_CHARS",
+    "SEARCH_LIMIT",
     "SUMMARY_CHARS",
     "AuditRepo",
     "EarlierCall",
     "ModelUsage",
+    "Note",
+    "NotesRepo",
     "Outcome",
+    "Reminder",
+    "ReminderRepo",
+    "ReminderStatus",
     "SettingsRepo",
     "UsageRepo",
     "args_hash",
@@ -319,6 +328,215 @@ class SettingsRepo:
                 " ON CONFLICT(key) DO UPDATE SET value = excluded.value",
                 (key, value),
             )
+
+
+# A trigram index matches nothing shorter than three characters, so a query
+# word shorter than that is not a query (section 3.7, phase 4.1).
+MIN_QUERY_CHARS = 3
+
+# How many notes a search answers with. Five is what can be read out loud.
+SEARCH_LIMIT = 5
+
+_QUERY_WORD = re.compile(r"\w+")
+
+
+@dataclass(frozen=True, slots=True)
+class Note:
+    """One note as the user said it, with when it was said (UTC epoch)."""
+
+    id: int
+    text: str
+    created_at: int
+
+
+class NotesRepo:
+    """The `notes` table and its FTS5 index (section 3.7, phase 4.1).
+
+    Text is kept as said and indexed folded (`store/normalize.py`), so that
+    `Işık`, `IŞIK` and `isik` are one word to the search and the note still
+    reads back the way it was written. A search is the query folded the
+    same way, each word of it a trigram phrase, all of them required.
+    """
+
+    def __init__(
+        self, connection: sqlite3.Connection, *, clock: Callable[[], float] = time.time
+    ) -> None:
+        self._connection = connection
+        self._clock = clock
+
+    def add(self, text: str) -> Note:
+        """Keeps `text` as it is and returns the note it became."""
+        now = int(self._clock())
+        with self._connection:
+            row = self._connection.execute(
+                "INSERT INTO notes (text, text_norm, created_at) VALUES (?, ?, ?) RETURNING id",
+                (text, normalize_search(text), now),
+            ).fetchone()
+        return Note(id=int(row[0]), text=text, created_at=now)
+
+    def get(self, note_id: int) -> Note | None:
+        row = self._connection.execute(
+            "SELECT id, text, created_at FROM notes WHERE id = ?", (note_id,)
+        ).fetchone()
+        return None if row is None else _note(row)
+
+    def delete(self, note_id: int) -> bool:
+        """Removes the note; `False` when there was none to remove."""
+        with self._connection:
+            cursor = self._connection.execute("DELETE FROM notes WHERE id = ?", (note_id,))
+        return cursor.rowcount > 0
+
+    def count(self) -> int:
+        row = self._connection.execute("SELECT COUNT(*) FROM notes").fetchone()
+        return int(row[0])
+
+    def latest(self, limit: int = SEARCH_LIMIT) -> list[Note]:
+        """The most recent notes, newest first."""
+        rows = self._connection.execute(
+            "SELECT id, text, created_at FROM notes ORDER BY created_at DESC, id DESC LIMIT ?",
+            (limit,),
+        ).fetchall()
+        return [_note(row) for row in rows]
+
+    def search(self, query: str, *, limit: int = SEARCH_LIMIT) -> list[Note]:
+        """The notes that contain every usable word of `query`, best match first.
+
+        A word is usable when it is at least `MIN_QUERY_CHARS` long once
+        folded; a query with none raises `ValueError`, since the index
+        cannot answer it and an empty list would read as "no such note".
+        """
+        match = query_terms(query)
+        if not match:
+            raise ValueError(f"a query needs a word of at least {MIN_QUERY_CHARS} characters")
+        rows = self._connection.execute(
+            "SELECT n.id, n.text, n.created_at FROM notes_fts"
+            " JOIN notes AS n ON n.id = notes_fts.rowid"
+            " WHERE notes_fts MATCH ? ORDER BY bm25(notes_fts), n.created_at DESC LIMIT ?",
+            (match, limit),
+        ).fetchall()
+        return [_note(row) for row in rows]
+
+
+ReminderStatus = Literal["pending", "fired", "missed", "cancelled"]
+
+
+@dataclass(frozen=True, slots=True)
+class Reminder:
+    """One reminder: what to say, when (UTC epoch), how it repeats, and
+    where it stands. `rrule` is `None` for one that fires once."""
+
+    id: int
+    text: str
+    fire_at: int
+    rrule: str | None
+    status: ReminderStatus
+    created_at: int
+    fired_at: int | None = None
+    missed_by_sec: int | None = None
+
+
+class ReminderRepo:
+    """The `reminders` table (section 3.10): the source of truth the
+    scheduler polls every twenty seconds and the model never sees."""
+
+    def __init__(
+        self, connection: sqlite3.Connection, *, clock: Callable[[], float] = time.time
+    ) -> None:
+        self._connection = connection
+        self._clock = clock
+
+    def add(self, text: str, *, fire_at: int, rrule: str | None = None) -> Reminder:
+        now = int(self._clock())
+        with self._connection:
+            row = self._connection.execute(
+                "INSERT INTO reminders (text, fire_at, rrule, status, created_at)"
+                " VALUES (?, ?, ?, 'pending', ?) RETURNING id",
+                (text, fire_at, rrule, now),
+            ).fetchone()
+        return Reminder(
+            id=int(row[0]),
+            text=text,
+            fire_at=fire_at,
+            rrule=rrule,
+            status="pending",
+            created_at=now,
+        )
+
+    def get(self, reminder_id: int) -> Reminder | None:
+        row = self._connection.execute(
+            "SELECT * FROM reminders WHERE id = ?", (reminder_id,)
+        ).fetchone()
+        return None if row is None else _reminder(row)
+
+    def pending(self, *, limit: int = 20) -> list[Reminder]:
+        """What is still to come, soonest first."""
+        rows = self._connection.execute(
+            "SELECT * FROM reminders WHERE status = 'pending' ORDER BY fire_at, id LIMIT ?",
+            (limit,),
+        ).fetchall()
+        return [_reminder(row) for row in rows]
+
+    def due(self, now: float) -> list[Reminder]:
+        """Every pending reminder whose time has come, earliest first."""
+        rows = self._connection.execute(
+            "SELECT * FROM reminders WHERE status = 'pending' AND fire_at <= ?"
+            " ORDER BY fire_at, id",
+            (int(now),),
+        ).fetchall()
+        return [_reminder(row) for row in rows]
+
+    def close(self, reminder_id: int, *, status: ReminderStatus, at: int, late_by: int) -> None:
+        """Ends a one-off reminder as `fired` or `missed`, and says how late."""
+        with self._connection:
+            self._connection.execute(
+                "UPDATE reminders SET status = ?, fired_at = ?, missed_by_sec = ? WHERE id = ?",
+                (status, at, late_by, reminder_id),
+            )
+
+    def advance(self, reminder_id: int, *, fire_at: int, at: int, late_by: int) -> None:
+        """Moves a repeating reminder on to its next time, noting this one."""
+        with self._connection:
+            self._connection.execute(
+                "UPDATE reminders SET fire_at = ?, fired_at = ?, missed_by_sec = ? WHERE id = ?",
+                (fire_at, at, late_by, reminder_id),
+            )
+
+    def cancel(self, reminder_id: int) -> bool:
+        """Cancels a pending reminder; `False` when there was none to cancel."""
+        with self._connection:
+            cursor = self._connection.execute(
+                "UPDATE reminders SET status = 'cancelled' WHERE id = ? AND status = 'pending'",
+                (reminder_id,),
+            )
+        return cursor.rowcount > 0
+
+
+def _reminder(row: sqlite3.Row) -> Reminder:
+    return Reminder(
+        id=int(row["id"]),
+        text=str(row["text"]),
+        fire_at=int(row["fire_at"]),
+        rrule=None if row["rrule"] is None else str(row["rrule"]),
+        status=row["status"],
+        created_at=int(row["created_at"]),
+        fired_at=None if row["fired_at"] is None else int(row["fired_at"]),
+        missed_by_sec=None if row["missed_by_sec"] is None else int(row["missed_by_sec"]),
+    )
+
+
+def query_terms(query: str) -> str:
+    """`query` as an FTS5 match expression: each usable word folded and
+    quoted as a phrase, all of them required; empty when no word is usable."""
+    words = [
+        word
+        for word in _QUERY_WORD.findall(normalize_search(query))
+        if len(word) >= MIN_QUERY_CHARS
+    ]
+    return " AND ".join(f'"{word}"' for word in words)
+
+
+def _note(row: sqlite3.Row) -> Note:
+    return Note(id=int(row["id"]), text=str(row["text"]), created_at=int(row["created_at"]))
 
 
 def args_hash(arguments: Mapping[str, Any]) -> str:

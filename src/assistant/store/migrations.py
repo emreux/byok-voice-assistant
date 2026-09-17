@@ -80,6 +80,52 @@ MIGRATIONS: tuple[str, ...] = (
         value TEXT NOT NULL
     );
     """,
+    # 4 - notes (section 3.7, phase 4.1; 17 Sep 2026). `text` is what the user
+    # said, kept as said; `text_norm` is the same folded the way search folds
+    # (`store/normalize.py`), and is the one column the FTS5 index reads.
+    # Trigram tokens, so that "fatura" finds "faturası" and a query is a
+    # substring rather than a word; `bm25()` ranks. The index is external
+    # content - the words live in `notes` once - and two triggers keep it in
+    # step. No update trigger: a note is never edited, only kept or deleted.
+    """
+    CREATE TABLE notes (
+        id         INTEGER PRIMARY KEY,
+        text       TEXT    NOT NULL,
+        text_norm  TEXT    NOT NULL,
+        created_at INTEGER NOT NULL
+    );
+    CREATE VIRTUAL TABLE notes_fts USING fts5(
+        text_norm, content='notes', content_rowid='id', tokenize='trigram'
+    );
+    CREATE TRIGGER notes_after_insert AFTER INSERT ON notes BEGIN
+        INSERT INTO notes_fts(rowid, text_norm) VALUES (new.id, new.text_norm);
+    END;
+    CREATE TRIGGER notes_after_delete AFTER DELETE ON notes BEGIN
+        INSERT INTO notes_fts(notes_fts, rowid, text_norm)
+        VALUES ('delete', old.id, old.text_norm);
+    END;
+    """,
+    # 5 - reminders (section 3.10, phase 4.2; 17 Sep 2026). The source of
+    # truth the scheduler polls; it never asks the model (invariant 7).
+    # `fire_at` is UTC epoch seconds like every time here, and for a
+    # repeating reminder it is the *next* time: `rrule` holds the rule
+    # (`FREQ=DAILY`, RFC 5545 syntax) and the row moves forward each time it
+    # fires. status is pending | fired | missed | cancelled: `fired` and
+    # `missed` are the two ways a one-off ends, `missed_by_sec` says how
+    # late the assistant was to it, and `fired_at` when it was last said.
+    """
+    CREATE TABLE reminders (
+        id            INTEGER PRIMARY KEY,
+        text          TEXT    NOT NULL,
+        fire_at       INTEGER NOT NULL,
+        rrule         TEXT,
+        status        TEXT    NOT NULL,
+        created_at    INTEGER NOT NULL,
+        fired_at      INTEGER,
+        missed_by_sec INTEGER
+    );
+    CREATE INDEX reminders_due ON reminders(status, fire_at);
+    """,
 )
 
 

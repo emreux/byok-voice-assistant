@@ -495,11 +495,19 @@ def test_every_tool_of_phase_two_is_on_offer(configured: Path, wiring: Wiring) -
             "open_app",
             "open_url",
             "search_web",
+            "read_clipboard",
+            "fetch_page",
             "open_settings",
             "media_control",
             "play_music",
             "play_video",
             "open_media",
+            "add_note",
+            "search_notes",
+            "delete_note",
+            "create_reminder",
+            "list_reminders",
+            "cancel_reminder",
             "remember",
             "forget",
             "install_app",
@@ -534,11 +542,19 @@ def test_a_tool_file_beside_the_settings_is_on_offer(configured: Path, wiring: W
         "open_app",
         "open_url",
         "search_web",
+        "read_clipboard",
+        "fetch_page",
         "open_settings",
         "media_control",
         "play_music",
         "play_video",
         "open_media",
+        "add_note",
+        "search_notes",
+        "delete_note",
+        "create_reminder",
+        "list_reminders",
+        "cancel_reminder",
         "remember",
         "forget",
         "install_app",
@@ -764,15 +780,20 @@ def test_what_the_user_asked_to_be_kept_is_in_front_of_every_request(
     assert "Ada" in prompt
 
 
-def test_with_nothing_remembered_the_prompt_is_the_frozen_one_byte_for_byte(
+def test_with_nothing_remembered_the_prompt_is_the_frozen_one_and_the_time(
     configured: Path, wiring: Wiring
 ) -> None:
+    """The frozen prompt first, byte for byte, so that a provider's cache
+    holds; the time last (4.2), the one line that changes between requests."""
     from assistant.agent.prompts import SYSTEM_PROMPT
+    from assistant.tools.reminders import NOW_LINE
 
     main(["run"])
 
     [source] = wiring.prompts
-    assert source() == SYSTEM_PROMPT
+    prompt = source()
+    assert prompt.startswith(SYSTEM_PROMPT + "\n\n")
+    assert prompt.rsplit("\n", 1)[1].startswith(NOW_LINE.split("{")[0])
 
 
 def test_a_memory_file_that_does_not_parse_is_a_sentence_rather_than_a_traceback(

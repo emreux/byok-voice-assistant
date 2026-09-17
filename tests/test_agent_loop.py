@@ -57,6 +57,7 @@ from assistant.agent.prompts import (
     LANGUAGE_RULE,
     PERSONALITY,
     SYSTEM_PROMPT,
+    UNTRUSTED_RULE,
 )
 from assistant.llm.base import Delta, Message, ModelInfo, ToolCall, ToolSpec, Usage
 from assistant.tools.registry import ToolRegistry, tool
@@ -384,8 +385,10 @@ async def test_a_model_that_said_nothing_is_not_remembered_as_having_spoken() ->
 
 def test_the_prompt_is_made_of_the_rules_it_names() -> None:
     """Each rule is a separate constant so that it can be read, argued with and
-    replaced on its own; the prompt is the four of them and nothing else."""
-    assert "\n\n".join((PERSONALITY, BREVITY, LANGUAGE_RULE, LANGUAGE_FALLBACK)) == SYSTEM_PROMPT
+    replaced on its own; the prompt is the five of them and nothing else."""
+    rules = (PERSONALITY, BREVITY, LANGUAGE_RULE, LANGUAGE_FALLBACK, UNTRUSTED_RULE)
+
+    assert "\n\n".join(rules) == SYSTEM_PROMPT
 
 
 def test_the_prompt_pins_no_language() -> None:

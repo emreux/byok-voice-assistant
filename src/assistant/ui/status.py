@@ -64,6 +64,7 @@ TEXT: dict[str, str] = {
     "state_thinking": "thinking",
     "state_confirming": "waiting for a yes or no",
     "state_speaking": "speaking",
+    "state_announcing": "reminding",
     "you_said": "you",
     "it_said": "assistant",
     "turn_cost": "{input} in, {output} out",

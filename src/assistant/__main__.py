@@ -306,6 +306,7 @@ async def _talk(settings: Settings, pack: Locale, *, device: int | str | None = 
     from assistant.agent.core import Agent
     from assistant.agent.limits import Limits
     from assistant.agent.prompts import SYSTEM_PROMPT
+    from assistant.announce.queue import AnnounceQueue
     from assistant.app import Assistant
     from assistant.audio.capture import HandsFree, SystemMicrophone
     from assistant.audio.player import SystemSpeaker
@@ -316,13 +317,22 @@ async def _talk(settings: Settings, pack: Locale, *, device: int | str | None = 
     from assistant.messaging.contacts import AddressBook
     from assistant.messaging.telegram import HASH_ENTRY, SESSION_ENTRY, Telegram, TelethonClient
     from assistant.messaging.whatsapp import WhatsApp
+    from assistant.scheduler import runner as scheduler_runner
     from assistant.store.db import open_database
     from assistant.store.memory import UserMemory
-    from assistant.store.repos import AuditRepo, SettingsRepo, UsageRepo
+    from assistant.store.repos import (
+        AuditRepo,
+        NotesRepo,
+        ReminderRepo,
+        SettingsRepo,
+        UsageRepo,
+    )
     from assistant.stt.gemini_stt import GeminiSTT
     from assistant.stt.local_whisper import LocalWhisper
     from assistant.tools import memory as memory_tools
     from assistant.tools import messaging as messaging_tools
+    from assistant.tools import notes as notes_tools
+    from assistant.tools import reminders as reminder_tools
     from assistant.tools import store as store_tools
     from assistant.tools import system as system_tools
     from assistant.tools import weather as weather_tools
@@ -343,10 +353,11 @@ async def _talk(settings: Settings, pack: Locale, *, device: int | str | None = 
         open_settings,
         open_url,
     )
-    from assistant.tools.web import search_web_for
+    from assistant.tools.web import fetch_page_for, read_clipboard_for, search_web_for
     from assistant.tts.sapi import SapiTTS
     from assistant.ui.status import StatusLine
     from assistant.usage.tracker import Pricing, UsageTracker
+    from assistant.web.page import PageReader
 
     # First, and before anything slow: a provider that cannot be built is the
     # likeliest thing to be wrong, and the cheapest to find out about. The
@@ -374,6 +385,9 @@ async def _talk(settings: Settings, pack: Locale, *, device: int | str | None = 
     # built beside the player for the same reason, and given back in the
     # same `finally`.
     weather = weather_tools.OpenMeteo()
+    # Pages the user asks about (17 Sep 2026), over a kept connection like
+    # the weather; how long one may take is the user's `[web]` setting.
+    reader = PageReader(seconds=settings.web.timeout_seconds)
     # The two ways of sending a message (spec of 2026-09-15). WhatsApp is
     # the installed application, asked for at every send; Telegram is the
     # user's own account, logged in once with `assistant telegram login` -
@@ -429,6 +443,8 @@ async def _talk(settings: Settings, pack: Locale, *, device: int | str | None = 
             # by `install_app` - the one tool that changes what is on the
             # machine, and asks first (2026-09-13).
             store = store_tools.WingetStore()
+            notes = NotesRepo(database)
+            reminders = ReminderRepo(database)
             # The tools on offer, by name, in one place. Every one of them
             # runs through the gate below and nowhere else (section 3.9).
             # `forget` and `install_app` are declared with the questions they
@@ -455,11 +471,37 @@ async def _talk(settings: Settings, pack: Locale, *, device: int | str | None = 
                     open_url,
                     # The engine is the user's (`[web] search_url`).
                     search_web_for(settings.web.search_url),
+                    # What was copied, and what a page says: both come back
+                    # inside the `<untrusted>` block the prompt explains.
+                    read_clipboard_for(),
+                    fetch_page_for(reader),
                     open_settings,
                     media_control,
                     play_music_for(player),
                     play_video_for(player),
                     open_media_for(player),
+                    # The user's notes (4.1, 17 Sep 2026): kept as said,
+                    # found in any spelling, deleted only after the user has
+                    # heard which.
+                    notes_tools.add_note_for(notes),
+                    notes_tools.search_notes_for(notes),
+                    notes_tools.delete_note_for(
+                        notes,
+                        confirm_prompt=pack.say(
+                            "note_delete_confirm", notes_tools.TEXT["note_delete_confirm"]
+                        ),
+                    ),
+                    # Reminders (4.2): the row here, the saying by the
+                    # scheduler below, between turns.
+                    reminder_tools.create_reminder_for(reminders),
+                    reminder_tools.list_reminders_for(reminders),
+                    reminder_tools.cancel_reminder_for(
+                        reminders,
+                        confirm_prompt=pack.say(
+                            "reminder_cancel_confirm",
+                            reminder_tools.TEXT["reminder_cancel_confirm"],
+                        ),
+                    ),
                     memory_tools.remember_for(memory),
                     memory_tools.forget_for(
                         memory,
@@ -505,6 +547,17 @@ async def _talk(settings: Settings, pack: Locale, *, device: int | str | None = 
             # second gate would be a second way to run a tool, which is the
             # thing section 3.9 forbids.
             gate = _gate(settings, tools, AuditRepo(database), limits=limits, pack=pack)
+            # The one announce queue (invariant 5) and the loop that feeds it
+            # (invariant 7): the scheduler never sees the model, and the
+            # state machine reads the queue only between turns.
+            announcements = AnnounceQueue()
+            scheduler = scheduler_runner.Scheduler(
+                reminders,
+                announcements,
+                wording={
+                    key: pack.say(key, default) for key, default in scheduler_runner.TEXT.items()
+                },
+            )
             assistant = Assistant(
                 capture=HandsFree(
                     microphone=SystemMicrophone(device=device),
@@ -516,8 +569,11 @@ async def _talk(settings: Settings, pack: Locale, *, device: int | str | None = 
                     model=settings.llm.model,
                     # The frozen prompt with the user's facts behind it, read
                     # at every request so that a fact just kept is in the
-                    # next one; `prompts.py` stays without an import.
-                    system_prompt=lambda: memory.prompt(SYSTEM_PROMPT),
+                    # next one, and the time last of all so that "yarın" is
+                    # a date (4.2); `prompts.py` stays without an import.
+                    system_prompt=lambda: (
+                        f"{memory.prompt(SYSTEM_PROMPT)}\n\n{reminder_tools.current_time_line()}"
+                    ),
                     tools=tools,
                     dispatch=gate,
                     limits=limits,
@@ -541,11 +597,19 @@ async def _talk(settings: Settings, pack: Locale, *, device: int | str | None = 
                     limits=limits,
                 ),
                 dispatch=gate,
+                announcements=announcements,
             )
-            await assistant.run()
+            ticking = asyncio.create_task(scheduler.run())
+            try:
+                await assistant.run()
+            finally:
+                ticking.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await ticking
     finally:
         await player.aclose()
         await weather.aclose()
+        await reader.aclose()
         await telegram.close()
         database.close()
 

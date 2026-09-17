@@ -38,6 +38,7 @@ from pydantic_settings import (
 from assistant.agent.limits import Limits
 from assistant.media.youtube import SEARCH_SECONDS
 from assistant.tools.web import SEARCH_URL
+from assistant.web.page import FETCH_SECONDS
 
 __all__ = [
     "CONFIG_DIR_ENV",
@@ -253,12 +254,14 @@ class WebSettings(BaseModel):
     `search_url` is the engine's own search address with `{query}` where
     the words go. Google when the line is not there; a user who would rather
     not be known to Google writes DuckDuckGo's address here and no code
-    changes (section 10).
+    changes (section 10). `timeout_seconds` is how long `fetch_page` waits
+    for a page before saying it did not answer.
     """
 
     model_config = ConfigDict(extra="ignore")
 
     search_url: str = SEARCH_URL
+    timeout_seconds: float = FETCH_SECONDS
 
 
 class MessagingSettings(BaseModel):

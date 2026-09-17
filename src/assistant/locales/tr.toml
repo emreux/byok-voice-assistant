@@ -93,6 +93,17 @@ time_is = "Saat {hour} {minute}."
 # Asked before a remembered fact is removed (2.10); {fact} is the fact as
 # the model named it. The hint on how to answer is added after it.
 forget_confirm = "'{fact}' kaydı unutulacak."
+# Asked before a note is deleted (4.1); {text} is the note as it was written.
+note_delete_confirm = "'{text}' notu silinecek."
+# Asked before a reminder is cancelled (4.2); {text} is the reminder as
+# the user gave it.
+reminder_cancel_confirm = "'{text}' hatırlatıcısı iptal edilecek."
+# Said by the scheduler, without the model (4.2): a reminder said late,
+# and the one sentence for reminders that went by while the assistant was
+# off. {minutes} is how late, {count} how many, {text} the reminder.
+reminder_late = "{minutes} dakika gecikmeli hatırlatma: {text}"
+reminder_missed_one = "Kapalıyken bir hatırlatıcın geçti: {text}"
+reminder_missed_many = "Kapalıyken {count} hatırlatıcın geçti. Sonuncusu: {text}"
 # Asked before an app is downloaded from the Microsoft Store (2026-09-13);
 # {name} is the app as the Store lists it and {publisher} who made it - said
 # out loud because the Store is full of look-alikes. The word below stands
@@ -128,6 +139,7 @@ state_transcribing = "yazıya döküyor"
 state_thinking = "düşünüyor"
 state_confirming = "onay bekliyor"
 state_speaking = "konuşuyor"
+state_announcing = "hatırlatıyor"
 you_said = "sen"
 it_said = "asistan"
 turn_cost = "{input} girdi, {output} çıktı"

@@ -3,9 +3,8 @@
 `IDLE`, then `LISTENING` while a sentence is being collected, then
 `TRANSCRIBING`, `THINKING` and `SPEAKING`, and back to `IDLE`. `CONFIRMING` is
 the window of phase 2.3, opened from inside `THINKING` when a tool wants a
-yes; `ANNOUNCING` arrives with the announce queue in phase 4.2. The diagram
-in section 3.1 is the
-target, not this file (rule 6).
+yes; `ANNOUNCING` is the announce queue of phase 4.2 being read, between
+turns. The diagram in section 3.1 is the target, not this file (rule 6).
 
 Everything is injected - the microphone, the recogniser, the model, the voice,
 the sound card - so the whole turn can be driven in a test without any of them.
@@ -108,6 +107,14 @@ played is the one exception, and it is not said out loud either - there is
 nothing left to say it with. The words are already on the screen and in the
 turn; the failure goes to the log, and the turn ends the way any other does.
 
+**A reminder is said between turns, and only then** (invariant 5, 4.2).
+The scheduler writes to the announce queue and never to the speaker; `run`
+reads the queue when the machine is `IDLE` - never over an answer, never
+into a confirmation window, never while a sentence is being collected -
+and says what it finds with the microphone deaf, like an answer. Listening
+switched off does not silence it: the assistant was asked not to listen,
+not to forget the dentist. A voice that starts cuts it off like an answer.
+
 **No user-facing sentence is written here.** The pack answers first and the
 English constants below are the end of the chain, exactly as in the wizard
 (section 3.12).
@@ -132,6 +139,7 @@ from loguru import logger
 from assistant.agent.core import Agent, Answer, Dispatch
 from assistant.agent.intents import GET_TIME, TIME_TOOL, match_intent
 from assistant.agent.limits import Limits
+from assistant.announce.queue import Announcement, AnnounceQueue
 from assistant.audio.player import PlaybackError, Speaker
 from assistant.llm.base import AuthenticationError, ProviderError, ToolCall, Usage
 from assistant.locales import Locale
@@ -179,6 +187,7 @@ class State(StrEnum):
     THINKING = "thinking"
     CONFIRMING = "confirming"
     SPEAKING = "speaking"
+    ANNOUNCING = "announcing"
 
 
 # Section 3.1 rule 5. A turn that has not finished in a minute is not going to.
@@ -407,6 +416,7 @@ class Assistant:
         on_mode: Callable[[bool], None] | None = None,
         tracker: UsageTracker | None = None,
         dispatch: Dispatch | None = None,
+        announcements: AnnounceQueue | None = None,
     ) -> None:
         self._capture = capture
         self._stt = stt
@@ -427,6 +437,10 @@ class Assistant:
         # Without it the fast path cannot tell the time, and "saat kaç" goes
         # to the model as it did before 2.5.
         self._dispatch = dispatch
+        # What the scheduler wants said (invariant 5), read between turns.
+        # Without one - most tests, and a run with no scheduler - nothing
+        # is ever announced.
+        self._announcements = announcements
 
         self._said = {key: locale.say(key, default) for key, default in TEXT.items()}
         self._yes = locale.yes_words or YES_WORDS
@@ -469,15 +483,53 @@ class Assistant:
         self._enter(State.IDLE)
 
     async def run(self) -> None:
-        """Answers utterances until something stops the program."""
+        """Answers utterances, and says what is queued in between, until
+        something stops the program.
+
+        Two things are waited for at once: the next sentence, and the next
+        announcement. A sentence always takes its turn; an announcement is
+        said only when the machine is `IDLE` afterwards - a sentence the
+        detector has begun collecting (`LISTENING`) is answered first, and
+        the announcement waits for the turn it becomes.
+        """
         await self.begin()
+        hearing = asyncio.ensure_future(self._capture.utterance())
+        queued: asyncio.Future[Announcement] | None = None
+        pending: Announcement | None = None
         try:
             while True:
-                finished = await self.turn(await self._capture.utterance())
-                if self._on_turn is not None:
-                    self._on_turn(finished)
+                if pending is None and self._announcements is not None and queued is None:
+                    queued = asyncio.ensure_future(self._announcements.get())
+                watched: set[asyncio.Future[Any]] = {hearing}
+                if queued is not None:
+                    watched.add(queued)
+                done, _ = await asyncio.wait(watched, return_when=asyncio.FIRST_COMPLETED)
+
+                if queued is not None and queued in done:
+                    pending = queued.result()
+                    queued = None
+                if hearing in done:
+                    finished = await self.turn(hearing.result())
+                    if self._on_turn is not None:
+                        self._on_turn(finished)
+                    hearing = asyncio.ensure_future(self._capture.utterance())
+                if pending is not None and self._state is State.IDLE:
+                    await self._announce(pending)
+                    pending = None
         finally:
+            hearing.cancel()
+            if queued is not None:
+                queued.cancel()
             self._capture.stop()
+
+    async def _announce(self, announcement: Announcement) -> None:
+        """Says one announcement, the way an answer is said: microphone
+        deaf, a voice cutting it off, nothing added."""
+        self._interrupted.clear()
+        self._enter(State.ANNOUNCING)
+        logger.info("announcing reminder {id}", id=announcement.reminder_id)
+        await self._play(_one(announcement.text))
+        self._rest()
 
     async def turn(self, pcm: Audio) -> Turn:
         """One recording, from what was heard to what was said back."""
@@ -830,7 +882,7 @@ class Assistant:
         # A question being read is cut off like an answer: the user is talking
         # over it. A voice inside the window itself never arrives here - the
         # capture keeps it as the answer (`Capture.listen_for`).
-        was_talking = self._state in (State.SPEAKING, State.CONFIRMING)
+        was_talking = self._state in (State.SPEAKING, State.CONFIRMING, State.ANNOUNCING)
         self._enter(State.LISTENING)
         self._interrupted.set()
         if was_talking:
@@ -851,7 +903,7 @@ class Assistant:
         if self._state is State.IDLE:
             return
         self._interrupted.set()
-        if self._state in (State.SPEAKING, State.CONFIRMING):
+        if self._state in (State.SPEAKING, State.CONFIRMING, State.ANNOUNCING):
             self._speaker.stop()
         if self._state is State.LISTENING:
             # A sentence the detector announced and the capture has now thrown

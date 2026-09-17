@@ -49,6 +49,7 @@ from assistant.agent.core import Agent, Confirm, Dispatch
 from assistant.agent.intents import CANCEL, GET_TIME, STOP, TIME_TOOL
 from assistant.agent.limits import Limits
 from assistant.agent.policy import DECLINED, NO_SUCH_TOOL, dispatch
+from assistant.announce.queue import AnnounceQueue
 from assistant.app import (
     CONFIRM_WINDOW_SECONDS,
     FILLER_DELAY_SECONDS,
@@ -272,6 +273,7 @@ def assistant_with(
     agent: Agent | None = None,
     tracker: UsageTracker | None = None,
     dispatch: Dispatch | None = None,
+    announcements: AnnounceQueue | None = None,
 ) -> Assistant:
     return Assistant(
         capture=capture if capture is not None else FakeCapture(),
@@ -292,6 +294,7 @@ def assistant_with(
         on_mode=on_mode,
         tracker=tracker,
         dispatch=dispatch,
+        announcements=announcements,
     )
 
 

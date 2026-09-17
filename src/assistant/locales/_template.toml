@@ -141,6 +141,19 @@ time_is = "It is {hour} {minute}."
 # Asked before something the user asked to be remembered is forgotten again;
 # {fact} is the fact itself. "Say yes or no." is added after it.
 forget_confirm = "'{fact}' will be forgotten."
+# Asked before one of the user's notes is deleted; {text} is the note as it
+# was written. "Say yes or no." is added after it.
+note_delete_confirm = "The note '{text}' will be deleted."
+# Asked before a reminder is cancelled; {text} is the reminder as the user
+# gave it. "Say yes or no." is added after it.
+reminder_cancel_confirm = "The reminder '{text}' will be cancelled."
+# Said by the reminder scheduler on its own, with no model involved: a
+# reminder said late, and one sentence for the reminders that went by
+# while the assistant was not running. {minutes} is how late it is,
+# {count} how many went by, {text} the reminder itself.
+reminder_late = "A reminder from {minutes} minutes ago: {text}"
+reminder_missed_one = "While I was off, one reminder went by: {text}"
+reminder_missed_many = "While I was off, {count} reminders went by. The last was: {text}"
 # Asked before an app is downloaded from the Microsoft Store; {name} is the
 # app as the Store lists it and {publisher} who made it. The second sentence
 # is the word used for a publisher the Store did not name.
@@ -180,6 +193,7 @@ state_transcribing = "writing it down"
 state_thinking = "thinking"
 state_confirming = "waiting for a yes or no"
 state_speaking = "speaking"
+state_announcing = "reminding"
 you_said = "you"
 it_said = "assistant"
 turn_cost = "{input} in, {output} out"
