@@ -10,6 +10,9 @@ The key is fetched from the Windows Credential Manager at the last moment and
 handed straight to the adapter. It is never stored on the entry, never logged,
 and never written back to disk.
 
+Since 4.5 (17 Sep 2026) the third adapter, Anthropic's, is here too, and
+the catalogue's `anthropic` entry builds it.
+
 Since 2.7 most of the catalogue is one adapter under different addresses:
 `openai_compat` with the entry's `base_url`. The one entry with no address
 of its own, `custom`, gets it from the caller - the wizard asked the user
@@ -25,6 +28,7 @@ from importlib import resources
 from pathlib import Path
 
 from assistant.config import load_api_key
+from assistant.llm.anthropic_adapter import AnthropicAdapter
 from assistant.llm.base import LLMProvider
 from assistant.llm.gemini_adapter import GeminiAdapter
 from assistant.llm.openai_compat_adapter import OpenAICompatAdapter
@@ -89,6 +93,10 @@ def _build_gemini(entry: ProviderEntry, api_key: str) -> LLMProvider:
     return GeminiAdapter(api_key=api_key)
 
 
+def _build_anthropic(entry: ProviderEntry, api_key: str) -> LLMProvider:
+    return AnthropicAdapter(api_key=api_key)
+
+
 def _build_openai_compat(entry: ProviderEntry, api_key: str) -> LLMProvider:
     if not entry.base_url:
         raise MissingBaseURLError(
@@ -100,6 +108,7 @@ def _build_openai_compat(entry: ProviderEntry, api_key: str) -> LLMProvider:
 ADAPTERS: dict[str, AdapterBuilder] = {
     "gemini": _build_gemini,
     "openai_compat": _build_openai_compat,
+    "anthropic": _build_anthropic,
 }
 
 # The adapters that speak to an address rather than to one vendor. An entry

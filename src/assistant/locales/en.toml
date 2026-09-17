@@ -28,3 +28,6 @@ prompt = "Installed apps: {apps}. Open the app, open the site, show settings, pl
 # for this language is used instead. Zira is one of the voices Windows ships
 # for English.
 sapi = "Zira"
+# Google's synthesiser (`[tts] provider = "gemini"`): the thirty voices read
+# every language, so this is a matter of timbre.
+gemini = "Kore"

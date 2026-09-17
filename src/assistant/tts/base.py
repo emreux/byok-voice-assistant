@@ -18,7 +18,7 @@ front of this module, not inside it.
 
 from __future__ import annotations
 
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Sequence
 from dataclasses import dataclass
 from typing import Protocol, runtime_checkable
 
@@ -27,6 +27,7 @@ __all__ = [
     "TERMINATORS",
     "TTSProvider",
     "VoiceInfo",
+    "choose_voice",
     "sentences",
 ]
 
@@ -101,6 +102,28 @@ async def sentences(chunks: AsyncIterator[str]) -> AsyncIterator[str]:
     # and the last sentence of one that does not is still worth speaking.
     if buffer.strip():
         yield buffer.strip()
+
+
+def choose_voice(voices: Sequence[VoiceInfo], preferred: str | None) -> str:
+    """Which of the installed voices to speak with, given the pack's preference.
+
+    The pack names a preference rather than an identifier (item 1.8): `tr.toml`
+    says `Tolga`, and what is installed is `Microsoft Tolga` under a registry
+    path nobody would put in a TOML file. A preference that matches nothing is
+    not an error - it is a machine where that voice was never installed.
+    Shared by the state machine, which picks the voice an answer is read in,
+    and by a hosted engine picking the local voice it falls back to.
+    """
+    if not voices:
+        return ""
+
+    if preferred:
+        wanted = preferred.casefold()
+        for voice in voices:
+            if wanted in voice.display_name.casefold():
+                return voice.id
+
+    return voices[0].id
 
 
 def _end_of_sentence(text: str) -> int | None:

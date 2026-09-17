@@ -226,7 +226,7 @@ class HandsFree:
         it is in."""
         self._loop = asyncio.get_running_loop()
         self._microphone.open(self._heard)
-        self._toggle.watch(on_press=self._toggled, on_release=_nothing)
+        self._toggle.watch(on_press=self.toggle, on_release=_nothing)
         # On the loop already, so said directly rather than posted: the status
         # line would otherwise show the paused hint over a live microphone
         # until the first press.
@@ -301,7 +301,13 @@ class HandsFree:
         if self._answering.is_set() or (self._on.is_set() and not self._muted.is_set()):
             self._to_loop(self._examine, chunk)
 
-    def _toggled(self) -> None:
+    def toggle(self) -> None:
+        """What the key does, from any thread: the other mode, at once.
+
+        Public since the tray icon (4.3): its menu line and the key are one
+        road, so that whatever "off" interrupts is interrupted the same way
+        whichever of the two asked.
+        """
         if self._on.is_set():
             self._on.clear()
         else:

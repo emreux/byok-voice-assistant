@@ -25,6 +25,14 @@ adapter      = "gemini"
 display_name = "Google Gemini"
 key_url      = "https://aistudio.google.com/apikey"
 
+# The third adapter (phase 4.5, 17 Sep 2026). Written against the SDK and
+# the contract suite, not against a live key; the README says so.
+[anthropic]
+adapter      = "anthropic"
+display_name = "Anthropic (Claude)"
+key_url      = "https://console.anthropic.com/settings/keys"
+key_prefix   = "sk-ant-"
+
 [openai]
 adapter      = "openai_compat"
 display_name = "OpenAI"

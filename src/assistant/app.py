@@ -127,7 +127,7 @@ import contextlib
 import re
 import time
 import uuid
-from collections.abc import AsyncGenerator, AsyncIterator, Callable, Iterable, Sequence
+from collections.abc import AsyncGenerator, AsyncIterator, Callable, Iterable
 from contextlib import aclosing
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -145,7 +145,7 @@ from assistant.llm.base import AuthenticationError, ProviderError, ToolCall, Usa
 from assistant.locales import Locale
 from assistant.store.normalize import normalize_search
 from assistant.stt.base import NO_SPEECH_CEILING, SAMPLE_RATE, Audio, STTProvider, Transcript
-from assistant.tts.base import TTSProvider, VoiceInfo
+from assistant.tts.base import TTSProvider, choose_voice
 from assistant.usage.tracker import UsageTracker
 
 __all__ = [
@@ -922,26 +922,6 @@ class Assistant:
                 return voice
 
         raise NoVoiceError(f"no speech voice is installed, for {self._locale.code!r} or otherwise")
-
-
-def choose_voice(voices: Sequence[VoiceInfo], preferred: str | None) -> str:
-    """Which of the installed voices to speak with, given the pack's preference.
-
-    The pack names a preference rather than an identifier (item 1.8): `tr.toml`
-    says `Tolga`, and what is installed is `Microsoft Tolga` under a registry
-    path nobody would put in a TOML file. A preference that matches nothing is
-    not an error - it is a machine where that voice was never installed.
-    """
-    if not voices:
-        return ""
-
-    if preferred:
-        wanted = preferred.casefold()
-        for voice in voices:
-            if wanted in voice.display_name.casefold():
-                return voice.id
-
-    return voices[0].id
 
 
 def hear(transcript: Transcript) -> Heard:

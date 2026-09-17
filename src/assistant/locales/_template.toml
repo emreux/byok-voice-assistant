@@ -77,6 +77,10 @@ question = "What time is it in Istanbul?"
 # `assistant setup` lists what is installed, and phase 3 adds more engines
 # here (azure, elevenlabs) with their own identifiers.
 sapi = "Name as Windows lists it"
+# The voice Google's synthesiser reads with when `[tts] provider = "gemini"`
+# is set. Its thirty voices - Kore, Charon, Puck, Zephyr and the rest - read
+# every language, so pick the one whose sound suits yours.
+gemini = "Kore"
 
 [ui]
 # Everything the assistant says in words rather than in speech: the setup
@@ -217,3 +221,89 @@ cost_tokens = "in / out / cached"
 cost_spent = "spent"
 cost_total = "total"
 cost_unpriced = "{count} turns of {model} have no price in pricing.toml and are not in the total."
+
+# Shown by `assistant purge --all`: what will go, what stays, and the one
+# word that is asked for before anything is deleted. The word is `yes` in
+# every language; the sentence names it.
+purge_will_delete = "This will delete everything the assistant recorded:"
+purge_file = "  file: {path}"
+purge_secret = "  Credential Manager entry: {name}"
+purge_keeps = "config.toml and contacts.toml stay: you wrote those."
+purge_confirm = "Type yes to delete all of it:"
+purge_cancelled = "Nothing was deleted."
+purge_done = "Deleted {count} items."
+purge_nothing = "There is nothing to delete."
+
+# The tray icon (`run --tray`): its menu, and the tooltip of an idle
+# microphone that is off. The states themselves use the `state_*` labels.
+tray_not_listening = "not listening"
+tray_stop_listening = "Stop listening"
+tray_start_listening = "Start listening"
+tray_open_settings = "Open the settings folder"
+tray_quit = "Quit"
+
+# `assistant autostart on | off | status`: the Run key of your own sign-in.
+autostart_on = "The assistant will start when you sign in, as: {command}"
+autostart_off = "The assistant will no longer start when you sign in."
+autostart_status_on = "Starts when you sign in, as: {command}"
+autostart_status_off = "Does not start when you sign in. 'assistant autostart on' changes that."
+
+# Asked and said by `assistant mail login`: the IMAP server, the address,
+# an app password, and how it went.
+mail_host = "The IMAP server of your mail account (imap.gmail.com, outlook.office365.com)"
+mail_user = "The address you sign in with"
+mail_password = "An app password for IMAP - not your account password (nothing is shown as you type)"
+mail_logged_in = "Signed in to {host} as {user}: {count} messages in {mailbox}. The password is in the Credential Manager."
+mail_login_failed = "Mail login failed: {reason}"
+
+# `assistant doctor`: one screen of labels. Values - paths, numbers,
+# names - are written by the code; a key is never one of them.
+doctor_pack = "language pack: {name} ({code})"
+doctor_who_answers = "Who answers"
+doctor_model = "  model: {model} ({provider})"
+doctor_key_stored = "  API key: stored in the Credential Manager"
+doctor_key_missing = "  API key: none stored - run 'assistant setup'"
+doctor_key_not_needed = "  API key: not needed"
+doctor_verdict_ok = "  tool calling: passed, checked {days} days ago"
+doctor_verdict_failed = "  tool calling: FAILED, checked {days} days ago - most tools will not work"
+doctor_verdict_none = "  tool calling: not checked yet (checked at the next start)"
+doctor_stt_local = "  recogniser: Whisper '{size}', on this machine"
+doctor_stt_gemini = "  recogniser: Google ({model}), Whisper '{size}' behind it"
+doctor_tts_sapi = "  voice: Windows ({voice})"
+doctor_tts_gemini = "  voice: Google ({model}), Windows behind it"
+doctor_leaves = "What leaves this machine"
+doctor_voice_stays = "  your voice: stays here"
+doctor_voice_goes = "  your voice: goes to Google (the recogniser)"
+doctor_text_goes = "  what you said, as text: goes to {provider}"
+doctor_content_goes = "  pages, clipboard text and mail you ask about: go to {provider}"
+doctor_answer_stays = "  what the assistant says: stays here"
+doctor_answer_goes = "  what the assistant says: goes to Google (the voice)"
+doctor_weather = "  a place you ask the weather for: goes to Open-Meteo"
+doctor_store = "  the name of an app you do not have: goes to the Microsoft Store"
+doctor_messages = "  a message: the WhatsApp app on this PC, or Telegram's servers as you"
+doctor_where = "Where things are"
+doctor_settings = "  settings: {path}"
+doctor_contacts = "  contacts: {path} ({count} people)"
+doctor_contacts_none = "  contacts: {path} (not written yet)"
+doctor_memory = "  memory: {path} ({count} facts)"
+doctor_tools_dir = "  your tools: {path}"
+doctor_database = "  database: {path} ({size})"
+doctor_database_none = "  database: {path} (not created yet)"
+doctor_log = "  log: {path}"
+doctor_tools = "Tools"
+doctor_builtin = "  built in: {count}"
+doctor_local = "  your own: {count} ({names})"
+doctor_local_none = "  your own: none"
+doctor_limits = "Limits"
+doctor_per_turn = "  per turn: {calls} tool calls, {tokens} output tokens, {seconds} s"
+doctor_spend_warn = "  spend: ${daily} a day, ${monthly} a month - a warning past either"
+doctor_spend_stop = "  spend: ${daily} a day, ${monthly} a month - the model is not asked past either"
+doctor_retention = "  what a tool answered is kept in the audit for {days} days"
+doctor_retention_forever = "  what a tool answered is kept in the audit for good"
+doctor_set_up = "Set up"
+doctor_mail = "  mail: {user} at {host} ({mailbox})"
+doctor_mail_none = "  mail: not set up ('assistant mail login')"
+doctor_telegram = "  telegram: logged in (api_id {api_id})"
+doctor_telegram_none = "  telegram: not set up ('assistant telegram login')"
+doctor_autostart_on = "  starts when you sign in: yes ({command})"
+doctor_autostart_off = "  starts when you sign in: no ('assistant autostart on')"

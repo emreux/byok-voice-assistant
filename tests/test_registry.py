@@ -189,11 +189,23 @@ def test_an_unknown_provider_names_the_ones_that_exist() -> None:
 
 
 def test_a_provider_whose_adapter_is_not_written_yet_says_so() -> None:
-    """Phase 4.5 adds `anthropic`; until then the entry must fail clearly."""
-    catalog = {"claude": ProviderEntry(id="claude", adapter="anthropic", display_name="Claude")}
+    """A catalogue entry naming an adapter this build does not have - the
+    `litellm` escape hatch of section 5.11, say - must fail clearly, not
+    after the user has typed their key in."""
+    catalog = {"proxy": ProviderEntry(id="proxy", adapter="litellm", display_name="Proxy")}
 
-    with pytest.raises(UnsupportedAdapterError, match="anthropic"):
-        create_provider("claude", api_key="test-key", catalog=catalog)
+    with pytest.raises(UnsupportedAdapterError, match="litellm"):
+        create_provider("proxy", api_key="test-key", catalog=catalog)
+
+
+def test_the_anthropic_entry_builds_the_anthropic_adapter() -> None:
+    """Phase 4.5 (17 Sep 2026): the third adapter, from the packaged catalogue."""
+    from assistant.llm.anthropic_adapter import AnthropicAdapter
+
+    provider = create_provider("anthropic", api_key="sk-ant-not-a-real-key")
+
+    assert isinstance(provider, AnthropicAdapter)
+    assert provider.id == "anthropic"
 
 
 # --------------------------------------------------------------------------

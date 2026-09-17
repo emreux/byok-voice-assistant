@@ -4,8 +4,9 @@
 2026-09-15; `mic` asks that one again on its own. `run` is item 1.11: it
 puts the pieces together, hands them to the state machine, and shows the one
 line of terminal that is the entire interface until the tray icon of phase
-4.2. `cost` is 2.4: what the turns cost, read back from `usage_log`.
-`doctor` arrives in phase 3 (design.md section 8).
+4.2. `cost` is 2.4: what the turns cost, read back from `usage_log`. `purge --all`
+is 4.6: everything the machine recorded, listed and then deleted after the
+word `yes`. `doctor` arrives in phase 3 (design.md section 8).
 
 This is the only file that knows the concrete names: which tools are on
 offer, which gate runs them, where the audit rows go. `agent/core.py` sees a
@@ -43,10 +44,18 @@ import contextlib
 import sys
 import time
 from collections.abc import Callable, Mapping, Sequence
+from pathlib import Path
 from typing import TYPE_CHECKING
 
 from assistant import __version__, locales
-from assistant.config import Settings, is_configured, load_api_key, load_settings
+from assistant.config import (
+    Settings,
+    config_dir,
+    config_path,
+    is_configured,
+    load_api_key,
+    load_settings,
+)
 
 if TYPE_CHECKING:
     from rich.table import Table
@@ -57,10 +66,11 @@ if TYPE_CHECKING:
     from assistant.llm.base import LLMProvider, ToolCall
     from assistant.locales import Locale
     from assistant.store.repos import AuditRepo, ModelUsage, SettingsRepo
+    from assistant.tools.mail import Mailbox
     from assistant.tools.registry import ToolRegistry
     from assistant.ui.status import StatusLine
 
-__all__ = ["TEXT", "build_parser", "main", "use_utf8"]
+__all__ = ["BUILTIN_TOOLS", "DOCTOR_TEXT", "TEXT", "build_parser", "main", "use_utf8"]
 
 _OK = 0
 _GAVE_UP = 1
@@ -94,6 +104,120 @@ TEXT: dict[str, str] = {
     "cost_unpriced": (
         "{count} turns of {model} have no price in pricing.toml and are not in the total."
     ),
+    # `assistant purge --all` (4.6): what will go is listed first, what
+    # stays is said, and nothing is deleted before the word is typed.
+    "purge_will_delete": "This will delete everything the assistant recorded:",
+    "purge_file": "  file: {path}",
+    "purge_secret": "  Credential Manager entry: {name}",
+    "purge_keeps": "config.toml and contacts.toml stay: you wrote those.",
+    "purge_confirm": "Type yes to delete all of it:",
+    "purge_cancelled": "Nothing was deleted.",
+    "purge_done": "Deleted {count} items.",
+    "purge_nothing": "There is nothing to delete.",
+    # `assistant autostart on | off | status` (4.2): the `Run` key of the
+    # user's own sign-in, and what is written there.
+    "autostart_on": "The assistant will start when you sign in, as: {command}",
+    "autostart_off": "The assistant will no longer start when you sign in.",
+    "autostart_status_on": "Starts when you sign in, as: {command}",
+    "autostart_status_off": (
+        "Does not start when you sign in. 'assistant autostart on' changes that."
+    ),
+}
+
+# The one word `purge --all` accepts, in any letter case. The question
+# names it, so it is the same in every language rather than the pack's
+# yes-word - a typed answer to a question about deleting everything should
+# not depend on which pack is loaded.
+PURGE_WORD = "yes"
+
+# The tools `run` puts on offer, by name and in order, so that `doctor` can
+# count them without building them. `test_cli.py` checks that the registry
+# `run` builds is this list followed by the user's own.
+BUILTIN_TOOLS: tuple[str, ...] = (
+    "get_current_time",
+    "system_status",
+    "get_weather",
+    "open_app",
+    "open_url",
+    "search_web",
+    "read_clipboard",
+    "fetch_page",
+    "read_latest_emails",
+    "search_emails",
+    "open_settings",
+    "media_control",
+    "play_music",
+    "play_video",
+    "open_media",
+    "add_note",
+    "search_notes",
+    "delete_note",
+    "create_reminder",
+    "list_reminders",
+    "cancel_reminder",
+    "remember",
+    "forget",
+    "install_app",
+    "send_message",
+)
+
+# What `assistant doctor` says, line by line. Labels rather than sentences,
+# and every value written by the code: a path, a number, a name. Never a
+# key - the report says whether one is stored, and nothing else about it.
+DOCTOR_TEXT: dict[str, str] = {
+    "doctor_pack": "language pack: {name} ({code})",
+    "doctor_who_answers": "Who answers",
+    "doctor_model": "  model: {model} ({provider})",
+    "doctor_key_stored": "  API key: stored in the Credential Manager",
+    "doctor_key_missing": "  API key: none stored - run 'assistant setup'",
+    "doctor_key_not_needed": "  API key: not needed",
+    "doctor_verdict_ok": "  tool calling: passed, checked {days} days ago",
+    "doctor_verdict_failed": (
+        "  tool calling: FAILED, checked {days} days ago - most tools will not work"
+    ),
+    "doctor_verdict_none": "  tool calling: not checked yet (checked at the next start)",
+    "doctor_stt_local": "  recogniser: Whisper '{size}', on this machine",
+    "doctor_stt_gemini": "  recogniser: Google ({model}), Whisper '{size}' behind it",
+    "doctor_tts_sapi": "  voice: Windows ({voice})",
+    "doctor_tts_gemini": "  voice: Google ({model}), Windows behind it",
+    "doctor_leaves": "What leaves this machine",
+    "doctor_voice_stays": "  your voice: stays here",
+    "doctor_voice_goes": "  your voice: goes to Google (the recogniser)",
+    "doctor_text_goes": "  what you said, as text: goes to {provider}",
+    "doctor_content_goes": "  pages, clipboard text and mail you ask about: go to {provider}",
+    "doctor_answer_stays": "  what the assistant says: stays here",
+    "doctor_answer_goes": "  what the assistant says: goes to Google (the voice)",
+    "doctor_weather": "  a place you ask the weather for: goes to Open-Meteo",
+    "doctor_store": "  the name of an app you do not have: goes to the Microsoft Store",
+    "doctor_messages": "  a message: the WhatsApp app on this PC, or Telegram's servers as you",
+    "doctor_where": "Where things are",
+    "doctor_settings": "  settings: {path}",
+    "doctor_contacts": "  contacts: {path} ({count} people)",
+    "doctor_contacts_none": "  contacts: {path} (not written yet)",
+    "doctor_memory": "  memory: {path} ({count} facts)",
+    "doctor_tools_dir": "  your tools: {path}",
+    "doctor_database": "  database: {path} ({size})",
+    "doctor_database_none": "  database: {path} (not created yet)",
+    "doctor_log": "  log: {path}",
+    "doctor_tools": "Tools",
+    "doctor_builtin": "  built in: {count}",
+    "doctor_local": "  your own: {count} ({names})",
+    "doctor_local_none": "  your own: none",
+    "doctor_limits": "Limits",
+    "doctor_per_turn": "  per turn: {calls} tool calls, {tokens} output tokens, {seconds} s",
+    "doctor_spend_warn": "  spend: ${daily} a day, ${monthly} a month - a warning past either",
+    "doctor_spend_stop": (
+        "  spend: ${daily} a day, ${monthly} a month - the model is not asked past either"
+    ),
+    "doctor_retention": "  what a tool answered is kept in the audit for {days} days",
+    "doctor_retention_forever": "  what a tool answered is kept in the audit for good",
+    "doctor_set_up": "Set up",
+    "doctor_mail": "  mail: {user} at {host} ({mailbox})",
+    "doctor_mail_none": "  mail: not set up ('assistant mail login')",
+    "doctor_telegram": "  telegram: logged in (api_id {api_id})",
+    "doctor_telegram_none": "  telegram: not set up ('assistant telegram login')",
+    "doctor_autostart_on": "  starts when you sign in: yes ({command})",
+    "doctor_autostart_off": "  starts when you sign in: no ('assistant autostart on')",
 }
 
 
@@ -123,7 +247,55 @@ def build_parser() -> argparse.ArgumentParser:
             "'assistant mic' changes it for good."
         ),
     )
+    run.add_argument(
+        "--tray",
+        action="store_true",
+        help=(
+            "Also show an icon in the notification area: the state, a switch for "
+            "listening, the settings folder, quit. The terminal stays."
+        ),
+    )
     subparsers.add_parser("cost", help="Show what the assistant has spent, today and this month.")
+    subparsers.add_parser(
+        "doctor",
+        help=(
+            "Report who answers, what leaves this machine and where, where the files are, "
+            "how many tools there are and what the limits are. Never prints a key."
+        ),
+    )
+    purge = subparsers.add_parser(
+        "purge",
+        help=(
+            "Delete what the assistant recorded: the database, the memory file, the logs "
+            "and the keys in the Credential Manager. Lists it first and asks for 'yes'."
+        ),
+    )
+    purge.add_argument(
+        "--all",
+        action="store_true",
+        required=True,
+        help="Everything. The only choice there is, and the one to be explicit about.",
+    )
+    autostart = subparsers.add_parser(
+        "autostart", help="Start the assistant, with its tray icon, when you sign in to Windows."
+    )
+    autostart.add_argument(
+        "autostart_command",
+        choices=("on", "off", "status"),
+        metavar="on|off|status",
+        help="Register it under your own Run key, take it off again, or say which it is.",
+    )
+    mail = subparsers.add_parser(
+        "mail", help="Mail: sign in once over IMAP, so that your messages can be read to you."
+    )
+    mail_commands = mail.add_subparsers(dest="mail_command", metavar="<subcommand>", required=True)
+    mail_commands.add_parser(
+        "login",
+        help=(
+            "Ask for the IMAP server and your address if config.toml has neither, and for an "
+            "app password; connect once; keep the password in the Credential Manager."
+        ),
+    )
     telegram = subparsers.add_parser(
         "telegram", help="Telegram: log in once, so that messages can be sent as you."
     )
@@ -168,10 +340,22 @@ def main(argv: Sequence[str] | None = None) -> int:
     if args.command == "cost":
         return _cost()
 
+    if args.command == "doctor":
+        return _doctor()
+
+    if args.command == "purge":
+        return _purge()
+
+    if args.command == "autostart":
+        return _autostart(args.autostart_command)
+
+    if args.command == "mail":
+        return _mail_login()
+
     if args.command == "telegram":
         return _telegram_login()
 
-    return _run(device=args.device)
+    return _run(device=args.device, tray=args.tray)
 
 
 def use_utf8(stream: object) -> None:
@@ -234,11 +418,379 @@ def _telegram_login() -> int:
     return _OK
 
 
-def _run(*, device: str | None = None) -> int:
+def _doctor() -> int:
+    """`assistant doctor` (3.5): what this installation is, in one screen.
+
+    Who answers and through what; which of the user's data leaves the
+    machine and for where - the sentence the README makes, checked against
+    the settings actually in force; where every file is; how many tools
+    there are; the limits. Everything is read, nothing is loaded and nothing
+    is connected to: no Whisper, no microphone, no request to any provider.
+    A key is reported as stored or not, and never shown, the way
+    `describe_myself` of section 10 has it: named fields, not a dump.
+    """
+    from rich.console import Console
+
+    from assistant import autostart
+    from assistant.llm.probe import probe_key, remembered
+    from assistant.llm.registry import load_catalog
+    from assistant.logs import log_path
+    from assistant.messaging.contacts import AddressBook, ContactsFileError, contacts_path
+    from assistant.messaging.telegram import HASH_ENTRY, SESSION_ENTRY
+    from assistant.store.db import database_path, open_database
+    from assistant.store.memory import MemoryFileError, UserMemory, memory_path
+    from assistant.store.repos import SettingsRepo
+    from assistant.stt.local_whisper import DEFAULT_MODEL_SIZE
+    from assistant.tools.local import load_local_tools, local_tools_dir
+    from assistant.tools.mail import MAIL_ENTRY
+
+    settings = load_settings()
+    ready = is_configured()
+    pack = locales.load(settings.locale.code if ready else locales.system_code())
+    said = {key: pack.say(key, default) for key, default in {**TEXT, **DOCTOR_TEXT}.items()}
+    console = Console()
+    lines: list[str] = []
+
+    def say(key: str, **fields: object) -> None:
+        lines.append(said[key].format(**fields))
+
+    lines.append(f"assistant {__version__}")
+    say("doctor_pack", name=pack.name, code=pack.code)
+    if not ready:
+        lines.append("")
+        say("not_set_up")
+        console.print("\n".join(lines), markup=False, highlight=False, soft_wrap=True)
+        return _GAVE_UP
+
+    # Who answers.
+    catalogue = load_catalog()
+    provider_id = settings.llm.provider
+    entry = catalogue.get(provider_id)
+    provider_name = entry.display_name if entry is not None else provider_id
+    lines.append("")
+    say("doctor_who_answers")
+    say("doctor_model", model=settings.llm.primary, provider=provider_name)
+    if entry is not None and not entry.requires_key:
+        say("doctor_key_not_needed")
+    elif load_api_key(provider_id) is not None:
+        say("doctor_key_stored")
+    else:
+        say("doctor_key_missing")
+    verdict, age = None, 0
+    if database_path().is_file():
+        connection = open_database()
+        try:
+            verdicts = SettingsRepo(connection)
+            verdict = remembered(verdicts, provider_id, settings.llm.model, ttl=float("inf"))
+            stored = verdicts.get(probe_key(provider_id, settings.llm.model))
+            age = _days_since(stored)
+        finally:
+            connection.close()
+    if verdict is None:
+        say("doctor_verdict_none")
+    elif verdict.ok:
+        say("doctor_verdict_ok", days=age)
+    else:
+        say("doctor_verdict_failed", days=age)
+    if settings.stt.provider == "gemini":
+        say("doctor_stt_gemini", model=settings.stt.model, size=DEFAULT_MODEL_SIZE)
+    else:
+        say("doctor_stt_local", size=DEFAULT_MODEL_SIZE)
+    if settings.tts.provider == "gemini":
+        say("doctor_tts_gemini", model=settings.tts.model)
+    else:
+        say("doctor_tts_sapi", voice=pack.voice("sapi") or "the default voice")
+
+    # What leaves this machine.
+    lines.append("")
+    say("doctor_leaves")
+    say("doctor_voice_goes" if settings.stt.provider == "gemini" else "doctor_voice_stays")
+    say("doctor_text_goes", provider=provider_name)
+    say("doctor_content_goes", provider=provider_name)
+    say("doctor_answer_goes" if settings.tts.provider == "gemini" else "doctor_answer_stays")
+    say("doctor_weather")
+    say("doctor_store")
+    say("doctor_messages")
+
+    # Where things are.
+    lines.append("")
+    say("doctor_where")
+    say("doctor_settings", path=config_path())
+    contacts = contacts_path()
+    if contacts.is_file():
+        try:
+            people = len(AddressBook.load().names())
+            say("doctor_contacts", path=contacts, count=people)
+        except ContactsFileError as problem:
+            lines.append(f"  contacts: {contacts} ({problem})")
+    else:
+        say("doctor_contacts_none", path=contacts)
+    try:
+        say("doctor_memory", path=memory_path(), count=len(UserMemory.load().facts))
+    except MemoryFileError as problem:
+        lines.append(f"  memory: {memory_path()} ({problem})")
+    say("doctor_tools_dir", path=local_tools_dir())
+    database = database_path()
+    if database.is_file():
+        say("doctor_database", path=database, size=_size(database.stat().st_size))
+    else:
+        say("doctor_database_none", path=database)
+    say("doctor_log", path=log_path())
+
+    # Tools.
+    lines.append("")
+    say("doctor_tools")
+    say("doctor_builtin", count=len(BUILTIN_TOOLS))
+    own = [tool.spec.name for tool in load_local_tools()]
+    if own:
+        say("doctor_local", count=len(own), names=", ".join(own))
+    else:
+        say("doctor_local_none")
+
+    # Limits.
+    limits = settings.limits
+    lines.append("")
+    say("doctor_limits")
+    say(
+        "doctor_per_turn",
+        calls=limits.tool_calls_per_turn,
+        tokens=limits.output_tokens,
+        seconds=_number(limits.turn_seconds),
+    )
+    say(
+        "doctor_spend_stop" if limits.hard_stop else "doctor_spend_warn",
+        daily=f"{limits.daily_usd:.2f}",
+        monthly=f"{limits.monthly_usd:.2f}",
+    )
+    if settings.retention.audit_days:
+        say("doctor_retention", days=settings.retention.audit_days)
+    else:
+        say("doctor_retention_forever")
+
+    # Set up.
+    lines.append("")
+    say("doctor_set_up")
+    mail = settings.mail
+    if mail.host.strip() and mail.user.strip() and load_api_key(MAIL_ENTRY) is not None:
+        say("doctor_mail", user=mail.user, host=mail.host, mailbox=mail.mailbox)
+    else:
+        say("doctor_mail_none")
+    if (
+        settings.telegram.api_id
+        and load_api_key(HASH_ENTRY) is not None
+        and load_api_key(SESSION_ENTRY) is not None
+    ):
+        say("doctor_telegram", api_id=settings.telegram.api_id)
+    else:
+        say("doctor_telegram_none")
+    command = autostart.status(autostart.WindowsRegistry())
+    if command is not None:
+        say("doctor_autostart_on", command=command)
+    else:
+        say("doctor_autostart_off")
+
+    # Without wrapping: a path folded at eighty columns is a path nobody
+    # can copy.
+    console.print("\n".join(lines), markup=False, highlight=False, soft_wrap=True)
+    return _OK
+
+
+def _days_since(stored: str | None) -> int:
+    """How many days ago a probe verdict was written, from its own record."""
+    import json
+
+    if stored is None:
+        return 0
+    try:
+        record = json.loads(stored)
+    except ValueError:
+        return 0
+    reached = record.get("ts") if isinstance(record, dict) else None
+    if not isinstance(reached, int | float):
+        return 0
+    return max(int((time.time() - reached) // 86_400), 0)
+
+
+def _size(octets: int) -> str:
+    """`1.2 MB`, `340 KB`, `512 B` - for a file size on the doctor's screen."""
+    if octets >= 1_000_000:
+        return f"{octets / 1_000_000:.1f} MB"
+    if octets >= 1_000:
+        return f"{octets // 1_000} KB"
+    return f"{octets} B"
+
+
+def _number(value: float) -> str:
+    """`90` for `90.0`, `2.5` for `2.5`."""
+    return str(int(value)) if value == int(value) else str(value)
+
+
+def _mail_login() -> int:
+    """`assistant mail login`: the questions of `tools/mail.py`, once, and
+    what they produce stored where each belongs - the server and the
+    address in `config.toml`, the app password in the Credential Manager
+    under `mail` (section 10). The settings are rewritten from what was
+    loaded, so nothing else in the file changes."""
+    from assistant import setup_wizard
+    from assistant.config import MailSettings, save_settings, store_api_key
+    from assistant.tools import mail
+
+    settings = load_settings()
+    pack = locales.load(settings.locale.code if is_configured() else locales.system_code())
+    text = {key: pack.say(key, default) for key, default in mail.TEXT.items()}
+    text["cancelled"] = pack.say("cancelled", setup_wizard.TEXT["cancelled"])
+    prompter = setup_wizard.TerminalPrompter(text=text)
+
+    try:
+        done = asyncio.run(
+            mail.login(
+                prompter,
+                host=settings.mail.host,
+                port=settings.mail.port,
+                user=settings.mail.user,
+                mailbox=settings.mail.mailbox,
+            )
+        )
+    except mail.MailError as refusal:
+        prompter.say("mail_login_failed", reason=refusal)
+        return _GAVE_UP
+    if done is None:
+        prompter.say("cancelled")
+        return _GAVE_UP
+
+    store_api_key(mail.MAIL_ENTRY, done.password)
+    settings.mail = MailSettings(
+        host=done.host,
+        port=settings.mail.port,
+        user=done.user,
+        mailbox=settings.mail.mailbox,
+    )
+    save_settings(settings)
+    prompter.say(
+        "mail_logged_in",
+        host=done.host,
+        user=done.user,
+        count=done.count,
+        mailbox=settings.mail.mailbox,
+    )
+    return _OK
+
+
+def _purge() -> int:
+    """`assistant purge --all`: what the machine recorded, gone (section 3.7, 4.6).
+
+    The database with its audit rows, notes and reminders; the memory file;
+    the logs; and every key and session in the Credential Manager. What is
+    there is listed first - by path and by entry name, never by value - and
+    nothing is deleted before `yes` is typed. `config.toml` and
+    `contacts.toml` stay: the user wrote those by hand, and a file edited
+    calmly is not "what the assistant recorded".
+    """
+    from assistant import setup_wizard
+    from assistant.config import delete_api_key
+
+    settings = load_settings()
+    pack = locales.load(settings.locale.code if is_configured() else locales.system_code())
+    text = {key: pack.say(key, default) for key, default in TEXT.items()}
+    prompter = setup_wizard.TerminalPrompter(text=text)
+
+    files = [path for path in _recorded_files() if path.is_file()]
+    secrets = [entry for entry in _secret_entries() if load_api_key(entry) is not None]
+    if not files and not secrets:
+        prompter.say("purge_nothing")
+        return _OK
+
+    prompter.say("purge_will_delete")
+    for path in files:
+        prompter.say("purge_file", path=path)
+    for entry in secrets:
+        prompter.say("purge_secret", name=entry)
+    prompter.say("purge_keeps")
+
+    answer = asyncio.run(prompter.ask("purge_confirm"))
+    if answer is None or answer.strip().lower() != PURGE_WORD:
+        prompter.say("purge_cancelled")
+        return _GAVE_UP
+
+    for path in files:
+        path.unlink()
+    for entry in secrets:
+        delete_api_key(entry)
+    prompter.say("purge_done", count=len(files) + len(secrets))
+    return _OK
+
+
+def _recorded_files() -> list[Path]:
+    """Every file the assistant writes for itself, whether or not it exists.
+
+    The database and the two files SQLite keeps beside it in WAL mode - a
+    write-ahead log holds rows too; the memory file; the log and what
+    rotation left of it.
+    """
+    from assistant.logs import LOG_FILE, log_path
+    from assistant.store.db import database_path
+    from assistant.store.memory import memory_path
+
+    database = database_path()
+    logs = log_path().parent
+    rotated = sorted(logs.glob(f"{Path(LOG_FILE).stem}*{Path(LOG_FILE).suffix}"))
+    return [
+        database,
+        database.with_name(f"{database.name}-wal"),
+        database.with_name(f"{database.name}-shm"),
+        database.with_name(f"{database.name}-journal"),
+        memory_path(),
+        *rotated,
+    ]
+
+
+def _secret_entries() -> list[str]:
+    """Every name a secret may be stored under: one per provider in the
+    catalogue, the two of Telegram, and the mail password."""
+    from assistant.llm.registry import load_catalog
+    from assistant.messaging.telegram import HASH_ENTRY, SESSION_ENTRY
+    from assistant.tools.mail import MAIL_ENTRY
+
+    return [*load_catalog(), HASH_ENTRY, SESSION_ENTRY, MAIL_ENTRY]
+
+
+def _autostart(action: str) -> int:
+    """`assistant autostart on | off | status` (4.2): the user's own `Run`
+    key, written with the assistant as installed here and `run --tray`,
+    cleared, or read back. No administrator, no service (`autostart.py`)."""
+    from rich.console import Console
+
+    from assistant import autostart
+
+    settings = load_settings()
+    pack = locales.load(settings.locale.code if is_configured() else locales.system_code())
+    said = {key: pack.say(key, default) for key, default in TEXT.items()}
+    console = Console()
+    registry = autostart.WindowsRegistry()
+
+    if action == "on":
+        line = said["autostart_on"].format(command=autostart.enable(registry))
+    elif action == "off":
+        autostart.disable(registry)
+        line = said["autostart_off"]
+    else:
+        command = autostart.status(registry)
+        line = (
+            said["autostart_status_off"]
+            if command is None
+            else said["autostart_status_on"].format(command=command)
+        )
+    console.print(line, markup=False, highlight=False)
+    return _OK
+
+
+def _run(*, device: str | None = None, tray: bool = False) -> int:
     """Starts the assistant, or says why it cannot.
 
     `device` is the `--device` flag: a microphone by index or by words from its
-    name, outranking the settings for this one run.
+    name, outranking the settings for this one run. `tray` is `--tray`: the
+    icon of 4.3 beside the terminal, whose "quit" ends the run the way Ctrl+C
+    does.
     """
     from rich.console import Console
 
@@ -288,11 +840,12 @@ def _run(*, device: str | None = None) -> int:
     # day; the system default when neither says anything.
     microphone = device_choice(device if device is not None else settings.audio.input_device)
     try:
-        asyncio.run(_talk(settings, pack, device=microphone))
-    except KeyboardInterrupt:
-        # The only way to stop it in phase 1, so it is an ending rather than a
-        # crash - and the microphone and the keyboard hook are already closed
-        # by the time this is printed (`app.run`).
+        asyncio.run(_talk(settings, pack, device=microphone, tray=tray))
+    except (KeyboardInterrupt, asyncio.CancelledError):
+        # Ctrl+C, or "quit" on the tray's menu, which cancels the run from
+        # its own thread (4.3): an ending rather than a crash - and the
+        # microphone and the keyboard hook are already closed by the time
+        # this is printed (`app.run`).
         say("stopped")
     except fixable as problem:
         say("cannot_start", problem=problem)
@@ -301,8 +854,12 @@ def _run(*, device: str | None = None) -> int:
     return _OK
 
 
-async def _talk(settings: Settings, pack: Locale, *, device: int | str | None = None) -> None:
+async def _talk(
+    settings: Settings, pack: Locale, *, device: int | str | None = None, tray: bool = False
+) -> None:
     """Builds the pieces and lets the state machine drive them."""
+    from loguru import logger
+
     from assistant.agent.core import Agent
     from assistant.agent.limits import Limits
     from assistant.agent.prompts import SYSTEM_PROMPT
@@ -327,8 +884,10 @@ async def _talk(settings: Settings, pack: Locale, *, device: int | str | None = 
         SettingsRepo,
         UsageRepo,
     )
+    from assistant.store.retention import blank_old_audit_summaries
     from assistant.stt.gemini_stt import GeminiSTT
     from assistant.stt.local_whisper import LocalWhisper
+    from assistant.tools import mail as mail_tools
     from assistant.tools import memory as memory_tools
     from assistant.tools import messaging as messaging_tools
     from assistant.tools import notes as notes_tools
@@ -354,7 +913,9 @@ async def _talk(settings: Settings, pack: Locale, *, device: int | str | None = 
         open_url,
     )
     from assistant.tools.web import fetch_page_for, read_clipboard_for, search_web_for
+    from assistant.tts.gemini_tts import GeminiTTS
     from assistant.tts.sapi import SapiTTS
+    from assistant.ui import tray as tray_ui
     from assistant.ui.status import StatusLine
     from assistant.usage.tracker import Pricing, UsageTracker
     from assistant.web.page import PageReader
@@ -374,6 +935,12 @@ async def _talk(settings: Settings, pack: Locale, *, device: int | str | None = 
     # two people who answer to one name - is a sentence before anything slow.
     book = AddressBook.load()
     database = open_database()
+    # What the audit rows still say (section 3.7, 4.6): a summary older
+    # than the user's `[retention] audit_days` is blanked here, once per
+    # start and before anything reads the table. The rows themselves stay.
+    blanked = blank_old_audit_summaries(database, days=settings.retention.audit_days)
+    if blanked:
+        logger.info("retention: {count} audit summaries blanked", count=blanked)
     # The table of section 3.11, once, for everyone who reads a row of it:
     # the loop, the gate, the state machine's clock and the tracker.
     limits = Limits.from_settings(settings.limits)
@@ -439,12 +1006,35 @@ async def _talk(settings: Settings, pack: Locale, *, device: int | str | None = 
                 speech = GeminiSTT(
                     key, model=settings.stt.model, vocabulary=names, fallback=whisper
                 )
+            # The voice (section 3.5): Windows' own, or Google's with Windows
+            # behind it for the sentence Google refuses (17 Sep 2026). The
+            # same key as the recogniser; missing, a sentence before anything
+            # slow is loaded, like the recogniser's.
+            voice: SapiTTS | GeminiTTS = SapiTTS()
+            if settings.tts.provider == "gemini":
+                key = load_api_key("gemini")
+                if not key:
+                    raise MissingAPIKeyError(
+                        "no API key stored for 'gemini', which [tts] provider names - "
+                        "run 'assistant setup' to add one, or set provider = \"sapi\""
+                    )
+                voice = GeminiTTS(
+                    key,
+                    model=settings.tts.model,
+                    fallback=voice,
+                    fallback_language=pack.code,
+                    fallback_preference=pack.voice("sapi"),
+                )
             # The Microsoft Store, asked last by `open_app` and installed from
             # by `install_app` - the one tool that changes what is on the
             # machine, and asks first (2026-09-13).
             store = store_tools.WingetStore()
             notes = NotesRepo(database)
             reminders = ReminderRepo(database)
+            # The user's mailbox (3.3, 17 Sep 2026), opened afresh for each
+            # question by the two tools below - or not set up, in which
+            # case the tools say so and what to run.
+            mailbox = _mailbox_of(settings, load_api_key(mail_tools.MAIL_ENTRY))
             # The tools on offer, by name, in one place. Every one of them
             # runs through the gate below and nowhere else (section 3.9).
             # `forget` and `install_app` are declared with the questions they
@@ -475,6 +1065,10 @@ async def _talk(settings: Settings, pack: Locale, *, device: int | str | None = 
                     # inside the `<untrusted>` block the prompt explains.
                     read_clipboard_for(),
                     fetch_page_for(reader),
+                    # The user's mail, read and never written, inside the
+                    # same block.
+                    mail_tools.read_latest_emails_for(mailbox),
+                    mail_tools.search_emails_for(mailbox),
                     open_settings,
                     media_control,
                     play_music_for(player),
@@ -558,11 +1152,25 @@ async def _talk(settings: Settings, pack: Locale, *, device: int | str | None = 
                     key: pack.say(key, default) for key, default in scheduler_runner.TEXT.items()
                 },
             )
+            capture = HandsFree(
+                microphone=SystemMicrophone(device=device),
+                endpoint=Endpoint(detector),
+            )
+            # The icon of 4.3, when asked for: a second surface over the
+            # same state, and a second hand on the same switch - its menu
+            # line is the key's `toggle`, its "quit" is this task's cancel,
+            # and both reach the loop through `call_soon_threadsafe`.
+            icon: tray_ui.Tray | None = None
+            if tray:
+                icon = tray_ui.Tray(
+                    pack,
+                    loop=asyncio.get_running_loop(),
+                    on_toggle=capture.toggle,
+                    on_quit=_stopper(),
+                    settings_folder=config_dir(),
+                )
             assistant = Assistant(
-                capture=HandsFree(
-                    microphone=SystemMicrophone(device=device),
-                    endpoint=Endpoint(detector),
-                ),
+                capture=capture,
                 stt=speech,
                 agent=Agent(
                     provider,
@@ -578,15 +1186,17 @@ async def _talk(settings: Settings, pack: Locale, *, device: int | str | None = 
                     dispatch=gate,
                     limits=limits,
                 ),
-                tts=SapiTTS(),
+                tts=voice,
                 speaker=SystemSpeaker(),
                 locale=pack,
                 thinking_timeout=limits.turn_seconds,
-                on_state=screen.state,
+                on_state=screen.state if icon is None else _each(screen.state, icon.state),
                 on_turn=_finished(screen),
                 # The toggle's news goes to the state machine first - off is
                 # an interruption - and to the screen after it.
-                on_mode=screen.hands_free,
+                on_mode=screen.hands_free
+                if icon is None
+                else _each(screen.hands_free, icon.hands_free),
                 # Every turn's tokens, priced, to `usage_log`: what `assistant
                 # cost` reads and what the spending limits are checked against.
                 tracker=UsageTracker(
@@ -599,6 +1209,8 @@ async def _talk(settings: Settings, pack: Locale, *, device: int | str | None = 
                 dispatch=gate,
                 announcements=announcements,
             )
+            if icon is not None:
+                icon.start()
             ticking = asyncio.create_task(scheduler.run())
             try:
                 await assistant.run()
@@ -606,6 +1218,8 @@ async def _talk(settings: Settings, pack: Locale, *, device: int | str | None = 
                 ticking.cancel()
                 with contextlib.suppress(asyncio.CancelledError):
                     await ticking
+                if icon is not None:
+                    icon.stop()
     finally:
         await player.aclose()
         await weather.aclose()
@@ -793,6 +1407,42 @@ def _finished(screen: StatusLine) -> Callable[[Turn], None]:
         screen.turn(finished)
 
     return turn
+
+
+def _mailbox_of(settings: Settings, password: str | None) -> Callable[[], Mailbox] | None:
+    """How the mail tools reach the mailbox `[mail]` names: a fresh
+    connection per question (`tools/mail.py`), or nothing when the table
+    is empty or the password was never stored."""
+    from assistant.tools.mail import ImapMailbox
+
+    mail = settings.mail
+    if not (mail.host.strip() and mail.user.strip() and password):
+        return None
+    return lambda: ImapMailbox(mail.host, mail.port, mail.user, password, mail.mailbox)
+
+
+def _each[T](*listeners: Callable[[T], None]) -> Callable[[T], None]:
+    """One listener made of several, told in the order given: the screen
+    first, the tray after it (4.3)."""
+
+    def tell(value: T) -> None:
+        for listener in listeners:
+            listener(value)
+
+    return tell
+
+
+def _stopper() -> Callable[[], None]:
+    """Ends the task this is called from, when called later - from the
+    loop, where the tray's "quit" is posted to. Cancelling is what Ctrl+C
+    does from the outside, so the ending is the same one (`_run`)."""
+    task = asyncio.current_task()
+
+    def stop() -> None:
+        if task is not None:
+            task.cancel()
+
+    return stop
 
 
 if __name__ == "__main__":

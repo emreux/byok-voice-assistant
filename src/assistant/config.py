@@ -37,6 +37,7 @@ from pydantic_settings import (
 
 from assistant.agent.limits import Limits
 from assistant.media.youtube import SEARCH_SECONDS
+from assistant.store.retention import AUDIT_DAYS
 from assistant.tools.web import SEARCH_URL
 from assistant.web.page import FETCH_SECONDS
 
@@ -44,13 +45,17 @@ __all__ = [
     "CONFIG_DIR_ENV",
     "KEYRING_SERVICE",
     "RECOGNISERS",
+    "VOICES",
     "AudioSettings",
     "LLMSettings",
     "LimitSettings",
     "LocaleSettings",
+    "MailSettings",
     "MediaSettings",
+    "RetentionSettings",
     "STTSettings",
     "Settings",
+    "TTSSettings",
     "ToolSettings",
     "config_dir",
     "config_path",
@@ -206,6 +211,35 @@ class STTSettings(BaseModel):
         return value
 
 
+# The voices `[tts] provider` may name. `sapi` is Windows' own and never
+# leaves the list; `gemini` is Google's synthesiser (17 Sep 2026) and sends
+# every sentence the assistant says to Google.
+VOICES = ("sapi", "gemini")
+
+
+class TTSSettings(BaseModel):
+    """Which engine turns the answer into speech (section 3.5).
+
+    `sapi` by default: no key, no cost, and the words never leave the
+    machine. `gemini` is a choice made in this file, and it changes where
+    the answer goes; `model` names Google's synthesiser and is only read
+    then. Which voice is a preference of the locale pack (`[tts.voice]`),
+    matched against what the engine offers, not a setting here.
+    """
+
+    model_config = ConfigDict(extra="ignore")
+
+    provider: str = "sapi"
+    model: str = "gemini-3.1-flash-tts-preview"
+
+    @field_validator("provider")
+    @classmethod
+    def _must_be_a_voice(cls, value: str) -> str:
+        if value not in VOICES:
+            raise ValueError(f"expected one of {', '.join(VOICES)}, got {value!r}")
+        return value
+
+
 class ToolSettings(BaseModel):
     """Which `blocked` tools the user switched on, by name (section 3.9).
 
@@ -293,6 +327,46 @@ class TelegramSettings(BaseModel):
     api_id: int = 0
 
 
+class MailSettings(BaseModel):
+    """The `[mail]` table: the one mailbox `read_latest_emails` and
+    `search_emails` read (section 3.6, phase 3.3; 17 Sep 2026).
+
+    The server, the port, the address signed in with and the folder. The
+    password - an app password, on any account with two-step sign-in - is
+    in the Credential Manager under `mail`, put there by `assistant mail
+    login`, never here (section 10). An empty host or user means mail is
+    not set up, and the two tools say so instead of connecting.
+    """
+
+    model_config = ConfigDict(extra="ignore")
+
+    host: str = ""
+    port: int = 993
+    user: str = ""
+    mailbox: str = "INBOX"
+
+
+class RetentionSettings(BaseModel):
+    """The `[retention]` table: how long an audit row keeps what the tool
+    answered (section 3.7, `store/retention.py`).
+
+    After `audit_days` the row stays and its `result_summary` is blanked,
+    at the next start. Zero keeps every summary for good; a negative number
+    is refused rather than read as one of the two.
+    """
+
+    model_config = ConfigDict(extra="ignore")
+
+    audit_days: int = AUDIT_DAYS
+
+    @field_validator("audit_days")
+    @classmethod
+    def _cannot_be_negative(cls, value: int) -> int:
+        if value < 0:
+            raise ValueError(f"expected 0 or more days, got {value}")
+        return value
+
+
 # The numbers of section 3.11 are written once, in `agent/limits.py`; the
 # file's defaults are read off them so that the two cannot drift apart.
 _LIMITS = Limits()
@@ -334,12 +408,15 @@ class Settings(BaseSettings):
     locale: LocaleSettings = LocaleSettings()
     audio: AudioSettings = AudioSettings()
     stt: STTSettings = STTSettings()
+    tts: TTSSettings = TTSSettings()
     tools: ToolSettings = ToolSettings()
     limits: LimitSettings = LimitSettings()
     media: MediaSettings = MediaSettings()
     web: WebSettings = WebSettings()
     messaging: MessagingSettings = MessagingSettings()
     telegram: TelegramSettings = TelegramSettings()
+    retention: RetentionSettings = RetentionSettings()
+    mail: MailSettings = MailSettings()
 
     @classmethod
     def settings_customise_sources(

@@ -21,7 +21,7 @@ import asyncio
 import sqlite3
 import sys
 import time
-from collections.abc import Iterable, Iterator, Mapping
+from collections.abc import Awaitable, Callable, Iterable, Iterator, Mapping
 from dataclasses import dataclass, field
 from io import StringIO
 from pathlib import Path
@@ -30,8 +30,9 @@ from typing import Any, ClassVar
 import pytest
 from loguru import logger
 
+from assistant import __main__ as cli
 from assistant import app, locales, logs, setup_wizard
-from assistant.__main__ import TEXT, build_parser, main, use_utf8
+from assistant.__main__ import BUILTIN_TOOLS, TEXT, build_parser, main, use_utf8
 from assistant.agent import core
 from assistant.agent.limits import Limits
 from assistant.agent.policy import NO_SUCH_TOOL
@@ -44,8 +45,10 @@ from assistant.config import (
     LLMSettings,
     LocaleSettings,
     MessagingSettings,
+    RetentionSettings,
     Settings,
     STTSettings,
+    TTSSettings,
     config_path,
     load_settings,
     save_settings,
@@ -57,7 +60,8 @@ from assistant.llm.probe import ProbeResult, remember, remembered
 from assistant.messaging.contacts import CONTACTS_FILE_NAME
 from assistant.store import db
 from assistant.store.memory import MEMORY_FILE_NAME
-from assistant.store.repos import SettingsRepo, UsageRepo
+from assistant.store.repos import AuditRepo, SettingsRepo, UsageRepo
+from assistant.store.retention import SECONDS_PER_DAY
 from assistant.stt import gemini_stt, local_whisper
 from assistant.tools import system
 from assistant.tools.system import AppCatalog, AppEntry
@@ -120,6 +124,9 @@ class Wiring:
     probes: list[tuple[str, str, str]] = field(default_factory=list)
     verdict: ProbeResult = field(default_factory=lambda: PASSED)
     probe_refusal: Exception | None = None
+    # What the state machine does while it "runs", when a test wants more
+    # than one turn reported: the tray's "quit" arrives in the middle of it.
+    during_run: Callable[[], Awaitable[None]] | None = None
 
 
 @pytest.fixture
@@ -195,6 +202,8 @@ def wiring(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Wiring:
             parts = seen.built[-1]
             parts["on_state"](State.THINKING)
             parts["on_turn"](TURN)
+            if seen.during_run is not None:
+                await seen.during_run()
 
     async def probed(provider: Any, model: str, *, question: str) -> ProbeResult:
         seen.happened.append("probe")
@@ -224,7 +233,7 @@ INSTALLED = [
 
 def said(key: str, code: str = "tr") -> str:
     """A sentence as the pack for `code` has it - whatever it was reworded to."""
-    return locales.load(code).say(key, {**TEXT, **status.TEXT}[key])
+    return locales.load(code).say(key, {**TEXT, **status.TEXT, **cli.DOCTOR_TEXT}[key])
 
 
 # --------------------------------------------------------------------------
@@ -247,6 +256,12 @@ def test_no_command_prints_usage(capsys: pytest.CaptureFixture[str]) -> None:
 @pytest.mark.parametrize("command", ["setup", "run", "cost", "mic"])
 def test_the_command_names_are_declared(command: str) -> None:
     assert build_parser().parse_args([command]).command == command
+
+
+def test_run_can_be_asked_for_the_tray() -> None:
+    """`run --tray` (4.3); without the flag there is only the terminal."""
+    assert build_parser().parse_args(["run", "--tray"]).tray is True
+    assert build_parser().parse_args(["run"]).tray is False
 
 
 def test_telegram_login_is_a_command_of_its_own() -> None:
@@ -497,6 +512,8 @@ def test_every_tool_of_phase_two_is_on_offer(configured: Path, wiring: Wiring) -
             "search_web",
             "read_clipboard",
             "fetch_page",
+            "read_latest_emails",
+            "search_emails",
             "open_settings",
             "media_control",
             "play_music",
@@ -544,6 +561,8 @@ def test_a_tool_file_beside_the_settings_is_on_offer(configured: Path, wiring: W
         "search_web",
         "read_clipboard",
         "fetch_page",
+        "read_latest_emails",
+        "search_emails",
         "open_settings",
         "media_control",
         "play_music",
@@ -692,6 +711,60 @@ def test_gemini_as_recogniser_without_a_gemini_key_is_one_sentence(
     assert "gemini" in printed and "assistant setup" in printed
     assert "speech model" not in wiring.happened
     assert wiring.recognisers == []
+
+
+def test_with_the_setting_the_voice_is_gemini_with_windows_behind_it(
+    configured: Path, wiring: Wiring
+) -> None:
+    """`[tts] provider = "gemini"` (17 Sep 2026): Google's synthesiser with
+    the same key entry, Windows' own engine behind it for the sentence
+    Google refuses, and the pack's local preference for that engine."""
+    from assistant.tts.gemini_tts import GeminiTTS
+    from assistant.tts.sapi import SapiTTS
+
+    save_settings(
+        Settings(
+            llm=LLMSettings(primary=f"gemini:{MODEL}"),
+            locale=LocaleSettings(code="tr"),
+            tts=TTSSettings(provider="gemini", model="gemini-3.1-flash-tts-preview"),
+        )
+    )
+
+    main(["run"])
+
+    voice = wiring.built[-1]["tts"]
+    assert isinstance(voice, GeminiTTS)
+    assert voice._model == "gemini-3.1-flash-tts-preview"
+    assert isinstance(voice._fallback, SapiTTS)
+    assert (voice._fallback_language, voice._fallback_preference) == ("tr", "Tolga")
+
+
+def test_gemini_as_voice_without_a_gemini_key_is_one_sentence(
+    configured: Path, vault: MemoryKeyring, wiring: Wiring, capsys: pytest.CaptureFixture[str]
+) -> None:
+    save_settings(
+        Settings(
+            llm=LLMSettings(primary="groq:llama"),
+            locale=LocaleSettings(code="tr"),
+            tts=TTSSettings(provider="gemini"),
+        )
+    )
+    vault.vault.clear()
+    store_api_key("groq", "gsk-not-a-real-key")
+
+    assert main(["run"]) == 1
+
+    printed = capsys.readouterr().out
+    assert "gemini" in printed and "[tts]" in printed and "assistant setup" in printed
+    assert "speech model" not in wiring.happened
+
+
+def test_without_the_setting_the_voice_is_windows(configured: Path, wiring: Wiring) -> None:
+    from assistant.tts.sapi import SapiTTS
+
+    main(["run"])
+
+    assert isinstance(wiring.built[-1]["tts"], SapiTTS)
 
 
 def test_the_gate_the_agent_is_handed_is_the_permission_gate(
@@ -1281,3 +1354,558 @@ def test_a_wrong_code_is_telegrams_reason_and_nothing_is_stored(
     [(key, fields)] = terminal.said
     assert key == "telegram_login_failed"
     assert "phone code entered was invalid" in str(fields["reason"])
+
+
+# --------------------------------------------------------------------------
+# purge --all, and what the audit rows still say (4.6, 17 Sep 2026)
+# --------------------------------------------------------------------------
+
+
+def test_purge_has_to_be_told_all() -> None:
+    """The one flag there is, required: deleting everything is said twice,
+    once on the command line and once at the question."""
+    parsed = build_parser().parse_args(["purge", "--all"])
+
+    assert (parsed.command, parsed.all) == ("purge", True)
+    with pytest.raises(SystemExit):
+        build_parser().parse_args(["purge"])
+
+
+@dataclass
+class Recorded:
+    """What a machine that has run for a while holds, by path."""
+
+    database: Path
+    sidecars: list[Path]
+    memory: Path
+    logs: list[Path]
+    contacts: Path
+
+    def files(self) -> list[Path]:
+        return [self.database, *self.sidecars, self.memory, *self.logs]
+
+
+@pytest.fixture
+def recorded(configured: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Recorded:
+    """A database with the two files SQLite keeps beside it, a memory file,
+    the log and one rotation left of it, a contacts file the user wrote, and
+    three secrets - the key `configured` stored and Telegram's two."""
+    data = tmp_path / "data"
+    monkeypatch.setattr(db, "database_path", lambda: data / "assistant.db")
+    db.open_database().close()
+    sidecars = [data / "assistant.db-wal", data / "assistant.db-shm"]
+    for sidecar in sidecars:
+        sidecar.write_bytes(b"rows")
+    memory = configured / MEMORY_FILE_NAME
+    memory.write_text('name = "Cuma"', encoding="utf-8")
+    log = logs.log_path()
+    log.parent.mkdir(parents=True, exist_ok=True)
+    rotated = log.with_name("assistant.2026-09-01_00-00-00_000000.log")
+    for path in (log, rotated):
+        path.write_text("turn: 300 in, 10 out", encoding="utf-8")
+    contacts = configured / CONTACTS_FILE_NAME
+    contacts.write_text("# the people I message", encoding="utf-8")
+    store_api_key("telegram", "abcdef")
+    store_api_key("telegram-session", "1BVts-the-session")
+    return Recorded(
+        database=data / "assistant.db",
+        sidecars=sidecars,
+        memory=memory,
+        logs=[log, rotated],
+        contacts=contacts,
+    )
+
+
+def test_purge_lists_what_goes_and_deletes_it_only_after_yes(
+    recorded: Recorded, vault: MemoryKeyring, terminal: type[ScriptedTerminal]
+) -> None:
+    """Section 3.7, 4.6: everything the assistant recorded goes - the rows,
+    the WAL that holds rows too, the memory, the logs, the secrets - and
+    the two files the user wrote by hand stay. Listed by path and by entry
+    name: no value of a key is ever said."""
+    terminal.answers = {"purge_confirm": "yes"}
+
+    assert main(["purge", "--all"]) == 0
+
+    assert not any(path.exists() for path in recorded.files())
+    assert config_path().is_file()
+    assert recorded.contacts.is_file()
+    assert vault.vault == {}
+
+    keys = [key for key, _ in terminal.said]
+    assert keys[0] == "purge_will_delete"
+    assert keys[-2:] == ["purge_keeps", "purge_done"]
+    listed = {fields["path"] for key, fields in terminal.said if key == "purge_file"}
+    assert listed == set(recorded.files())
+    named = [fields["name"] for key, fields in terminal.said if key == "purge_secret"]
+    assert named == ["gemini", "telegram", "telegram-session"]
+    assert terminal.said[-1] == ("purge_done", {"count": 9})
+    spoken = str(terminal.said)
+    assert "AIza-not-a-real-key" not in spoken
+    assert "abcdef" not in spoken
+    assert "1BVts" not in spoken
+
+
+@pytest.mark.parametrize("answer", ["evet", "y", "", None])
+def test_purge_deletes_nothing_without_the_word(
+    recorded: Recorded,
+    vault: MemoryKeyring,
+    terminal: type[ScriptedTerminal],
+    answer: str | None,
+) -> None:
+    """The pack's yes-word is for the voice; the typed word is `yes` and
+    the question says so. Anything else, and walking away, is a no."""
+    terminal.answers = {"purge_confirm": answer}
+
+    assert main(["purge", "--all"]) == 1
+
+    assert all(path.is_file() for path in recorded.files())
+    assert len(vault.vault) == 3
+    assert terminal.said[-1] == ("purge_cancelled", {})
+
+
+def test_purge_takes_the_word_in_any_case(
+    recorded: Recorded, vault: MemoryKeyring, terminal: type[ScriptedTerminal]
+) -> None:
+    terminal.answers = {"purge_confirm": "  YES "}
+
+    assert main(["purge", "--all"]) == 0
+
+    assert vault.vault == {}
+    assert not recorded.database.exists()
+
+
+def test_purge_on_a_machine_with_nothing_recorded_says_so(
+    config_home: Path,
+    vault: MemoryKeyring,
+    terminal: type[ScriptedTerminal],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(db, "database_path", lambda: tmp_path / "data" / "assistant.db")
+
+    assert main(["purge", "--all"]) == 0
+
+    assert terminal.said == [("purge_nothing", {})]
+
+
+def test_purge_speaks_the_language_of_the_pack(
+    recorded: Recorded, terminal: type[ScriptedTerminal]
+) -> None:
+    terminal.answers = {"purge_confirm": None}
+
+    main(["purge", "--all"])
+
+    turkish = locales.load("tr")
+    for key in ("purge_will_delete", "purge_confirm", "purge_cancelled"):
+        assert terminal.built_text[key] == turkish.say(key, TEXT[key])
+        assert terminal.built_text[key] != TEXT[key]
+
+
+def audited(*, days_ago: float, summary: str) -> int:
+    """One finished `fetch_page` row, `days_ago` days old, in the database
+    `run` will open; returns its id."""
+    connection = db.open_database()
+    try:
+        audit = AuditRepo(connection, clock=lambda: time.time() - days_ago * SECONDS_PER_DAY)
+        call = ToolCall(id="c", name="fetch_page", arguments={"url": "https://example.test"})
+        row_id = audit.start(call, turn_id="turn", risk="safe")
+        audit.finish(row_id, status="ok", summary=summary)
+    finally:
+        connection.close()
+    return row_id
+
+
+def summaries() -> dict[int, str | None]:
+    connection = sqlite3.connect(db.database_path())
+    try:
+        rows = connection.execute("SELECT id, result_summary FROM tool_audit").fetchall()
+    finally:
+        connection.close()
+    return {int(row_id): summary for row_id, summary in rows}
+
+
+def test_run_blanks_the_old_audit_summaries_and_keeps_the_rows(
+    configured: Path, wiring: Wiring
+) -> None:
+    """`store/retention.py` at startup: a summary older than
+    `[retention] audit_days` is gone before the first turn, the row is not."""
+    old = audited(days_ago=40, summary="a page from last month")
+    fresh = audited(days_ago=1, summary="a page from yesterday")
+
+    assert main(["run"]) == 0
+
+    assert summaries() == {old: None, fresh: "a page from yesterday"}
+
+
+def test_a_retention_of_zero_days_keeps_every_summary(configured: Path, wiring: Wiring) -> None:
+    save_settings(
+        Settings(
+            llm=LLMSettings(primary=f"gemini:{MODEL}"),
+            locale=LocaleSettings(code="tr"),
+            retention=RetentionSettings(audit_days=0),
+        )
+    )
+    old = audited(days_ago=400, summary="a page from last year")
+
+    assert main(["run"]) == 0
+
+    assert summaries() == {old: "a page from last year"}
+
+
+# --------------------------------------------------------------------------
+# run --tray (4.3, 17 Sep 2026)
+# --------------------------------------------------------------------------
+
+
+class FakeTray:
+    """Stands in for `ui/tray.py`'s `Tray`: what it was built with, what it
+    was told, and whether it is up."""
+
+    built: ClassVar[list[FakeTray]] = []
+
+    def __init__(self, locale: locales.Locale, **parts: Any) -> None:
+        self.code = locale.code
+        self.parts = parts
+        self.states: list[State] = []
+        self.modes: list[bool] = []
+        self.up: list[str] = []
+        FakeTray.built.append(self)
+
+    def start(self) -> None:
+        self.up.append("start")
+
+    def stop(self) -> None:
+        self.up.append("stop")
+
+    def state(self, state: State) -> None:
+        self.states.append(state)
+
+    def hands_free(self, listening: bool) -> None:
+        self.modes.append(listening)
+
+
+@pytest.fixture
+def trays(monkeypatch: pytest.MonkeyPatch) -> type[FakeTray]:
+    from assistant.ui import tray
+
+    FakeTray.built = []
+    monkeypatch.setattr(tray, "Tray", FakeTray)
+    return FakeTray
+
+
+def test_without_the_flag_there_is_no_tray(
+    configured: Path, wiring: Wiring, trays: type[FakeTray]
+) -> None:
+    assert main(["run"]) == 0
+
+    assert trays.built == []
+    assert wiring.built[0]["on_state"] is not None
+
+
+def test_with_the_flag_the_icon_is_up_while_it_runs_and_hears_what_the_screen_hears(
+    configured: Path, wiring: Wiring, trays: type[FakeTray]
+) -> None:
+    """Built with the pack and the settings folder, started before the
+    state machine runs and stopped after; every state the screen is told
+    reaches it too, and its switch is the key's own `toggle`."""
+    assert main(["run", "--tray"]) == 0
+
+    [icon] = trays.built
+    assert icon.code == "tr"
+    assert icon.parts["settings_folder"] == configured
+    assert icon.up == ["start", "stop"]
+    assert icon.states == [State.THINKING]
+    capture = wiring.built[0]["capture"]
+    assert icon.parts["on_toggle"] == capture.toggle
+
+    wiring.built[0]["on_mode"](False)
+    assert icon.modes == [False]
+
+
+def test_quit_on_the_tray_ends_the_run_the_way_ctrl_c_does(
+    configured: Path, wiring: Wiring, trays: type[FakeTray], capsys: pytest.CaptureFixture[str]
+) -> None:
+    """ "Quit" is posted from the tray's thread and cancels the run: the
+    icon comes down, the terminal says it stopped, and the exit code is
+    the one Ctrl+C gives."""
+
+    async def quit_from_the_tray() -> None:
+        [icon] = trays.built
+        loop = asyncio.get_running_loop()
+        await asyncio.to_thread(loop.call_soon_threadsafe, icon.parts["on_quit"])
+        await asyncio.sleep(5)
+        raise AssertionError("the run was not cancelled")
+
+    wiring.during_run = quit_from_the_tray
+
+    assert main(["run", "--tray"]) == 0
+
+    [icon] = trays.built
+    assert icon.up == ["start", "stop"]
+    assert said("stopped") in capsys.readouterr().out
+
+
+# --------------------------------------------------------------------------
+# autostart on | off | status (4.2, 17 Sep 2026)
+# --------------------------------------------------------------------------
+
+
+class FakeRunKey:
+    """The user's `Run` key as a dictionary, shared by every instance the
+    command builds."""
+
+    values: ClassVar[dict[str, str]] = {}
+
+    def get(self, name: str) -> str | None:
+        return FakeRunKey.values.get(name)
+
+    def set(self, name: str, command: str) -> None:
+        FakeRunKey.values[name] = command
+
+    def delete(self, name: str) -> None:
+        FakeRunKey.values.pop(name, None)
+
+
+@pytest.fixture
+def run_key(monkeypatch: pytest.MonkeyPatch) -> type[FakeRunKey]:
+    from assistant import autostart
+
+    FakeRunKey.values = {}
+    monkeypatch.setattr(autostart, "WindowsRegistry", FakeRunKey)
+    monkeypatch.setattr(autostart, "command_line", lambda: '"C:\\x\\assistant.exe" run --tray')
+    return FakeRunKey
+
+
+def test_autostart_takes_exactly_one_of_three_words() -> None:
+    for word in ("on", "off", "status"):
+        assert build_parser().parse_args(["autostart", word]).autostart_command == word
+    with pytest.raises(SystemExit):
+        build_parser().parse_args(["autostart"])
+    with pytest.raises(SystemExit):
+        build_parser().parse_args(["autostart", "maybe"])
+
+
+def test_autostart_on_writes_the_run_key_and_says_what_it_wrote(
+    configured: Path, run_key: type[FakeRunKey], capsys: pytest.CaptureFixture[str]
+) -> None:
+    assert main(["autostart", "on"]) == 0
+
+    assert run_key.values == {"assistant": '"C:\\x\\assistant.exe" run --tray'}
+    printed = unwrapped(capsys.readouterr().out)
+    assert unwrapped(said("autostart_on").format(command='"C:\\x\\assistant.exe" run --tray')) == (
+        printed
+    )
+
+
+def test_autostart_off_clears_it_and_status_says_which(
+    configured: Path, run_key: type[FakeRunKey], capsys: pytest.CaptureFixture[str]
+) -> None:
+    main(["autostart", "on"])
+    capsys.readouterr()
+
+    assert main(["autostart", "status"]) == 0
+    assert '"C:\\x\\assistant.exe" run --tray' in capsys.readouterr().out
+
+    assert main(["autostart", "off"]) == 0
+    assert run_key.values == {}
+    assert unwrapped(capsys.readouterr().out) == unwrapped(said("autostart_off"))
+
+    assert main(["autostart", "status"]) == 0
+    assert unwrapped(capsys.readouterr().out) == unwrapped(said("autostart_status_off"))
+
+
+def test_autostart_speaks_the_machines_language_before_setup(
+    config_home: Path, run_key: type[FakeRunKey], capsys: pytest.CaptureFixture[str]
+) -> None:
+    """No `config.toml` yet: the sentence is the system's language, as
+    every other command before setup."""
+    assert main(["autostart", "status"]) == 0
+
+    code = locales.system_code()
+    assert unwrapped(capsys.readouterr().out) == unwrapped(said("autostart_status_off", code))
+
+
+# --------------------------------------------------------------------------
+# run: the mailbox (3.3, 17 Sep 2026)
+# --------------------------------------------------------------------------
+
+
+def test_without_a_mail_table_the_mail_tools_are_on_offer_but_not_set_up(
+    configured: Path, wiring: Wiring
+) -> None:
+    """The tools are always on the list, so that the model can tell the
+    user what to run; without `[mail]` and a stored password they open
+    nothing."""
+    from assistant.tools.mail import NOT_SET_UP
+
+    main(["run"])
+
+    latest = wiring.registries[0].get("read_latest_emails")
+    assert latest is not None
+    assert asyncio.run(latest.run()) == NOT_SET_UP
+
+
+def test_with_a_mail_table_and_a_password_the_mailbox_is_the_one_named(
+    configured: Path, wiring: Wiring, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from assistant.tools import mail
+    from assistant.tools.mail import MAIL_ENTRY, ImapMailbox
+
+    save_settings(
+        Settings(
+            llm=LLMSettings(primary=f"gemini:{MODEL}"),
+            locale=LocaleSettings(code="tr"),
+            mail=mail_settings("imap.example.test", "emre@example.test", mailbox="Archive"),
+        )
+    )
+    store_api_key(MAIL_ENTRY, "app-password")
+    built: list[tuple[Any, ...]] = []
+
+    class Recorded(ImapMailbox):
+        def __init__(self, *parts: Any, **rest: Any) -> None:
+            built.append(parts)
+
+        def latest(self, count: int) -> list[Any]:
+            return []
+
+    monkeypatch.setattr(mail, "ImapMailbox", Recorded)
+
+    main(["run"])
+
+    latest = wiring.registries[0].get("read_latest_emails")
+    assert latest is not None
+    assert asyncio.run(latest.run()) == mail.NO_MAIL
+    assert built == [("imap.example.test", 993, "emre@example.test", "app-password", "Archive")]
+
+
+def mail_settings(host: str, user: str, *, mailbox: str = "INBOX") -> Any:
+    from assistant.config import MailSettings
+
+    return MailSettings(host=host, user=user, mailbox=mailbox)
+
+
+# --------------------------------------------------------------------------
+# doctor (3.5, 17 Sep 2026)
+# --------------------------------------------------------------------------
+
+
+def test_the_tools_run_offers_are_the_ones_doctor_counts(configured: Path, wiring: Wiring) -> None:
+    """`BUILTIN_TOOLS` is what `doctor` reports without building anything;
+    it has to be the registry `run` builds, in order."""
+    main(["run"])
+
+    assert wiring.tools == [list(BUILTIN_TOOLS)]
+
+
+def test_doctor_before_setup_says_so(
+    config_home: Path, vault: MemoryKeyring, capsys: pytest.CaptureFixture[str]
+) -> None:
+    assert main(["doctor"]) == 1
+
+    assert said("not_set_up", locales.system_code()) in unwrapped(capsys.readouterr().out)
+
+
+def test_doctor_reports_the_installation_and_never_a_key(
+    configured: Path,
+    vault: MemoryKeyring,
+    run_key: type[FakeRunKey],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """One screen: who answers, what leaves, where the files are, the
+    tools, the limits, what is set up. The key is reported as stored and
+    is not on the screen; the Telegram hash and the mail password are not
+    either."""
+    monkeypatch.setattr(db, "database_path", lambda: tmp_path / "data" / "assistant.db")
+    write_verdict(PASSED, age=3 * 86_400 + 60)
+    (configured / MEMORY_FILE_NAME).write_text(
+        '[assistant]\nname = ""\n\n[user]\nfacts = ["a", "b", "c"]\n', encoding="utf-8"
+    )
+    (configured / CONTACTS_FILE_NAME).write_text(
+        '[[contact]]\nname = "Ahmet"\nphone = "+90 532 000 00 00"\n', encoding="utf-8"
+    )
+    folder = configured / "tools"
+    folder.mkdir()
+    (folder / "mine.py").write_text(
+        "from assistant.tools.registry import tool\n\n\n"
+        '@tool(risk="safe")\nasync def start_my_project() -> str:\n'
+        '    """Starts the owner\'s project."""\n    return "started"\n',
+        encoding="utf-8",
+    )
+    store_api_key("telegram", "the-hash")
+    store_api_key("telegram-session", "the-session")
+    store_api_key("mail", "the-app-password")
+    save_settings(
+        Settings(
+            llm=LLMSettings(primary=f"gemini:{MODEL}"),
+            locale=LocaleSettings(code="tr"),
+            stt=STTSettings(provider="gemini"),
+            limits=LimitSettings(hard_stop=True),
+            mail=mail_settings("imap.example.test", "emre@example.test"),
+        )
+    )
+    from assistant.config import TelegramSettings
+
+    loaded = load_settings()
+    loaded.telegram = TelegramSettings(api_id=123456)
+    save_settings(loaded)
+    command = '"C:\\x\\assistant.exe" run --tray'
+    run_key.values["assistant"] = command
+
+    assert main(["doctor"]) == 0
+
+    out = unwrapped(capsys.readouterr().out)
+
+    def line(key: str, **fields: object) -> str:
+        return unwrapped(said(key).format(**fields))
+
+    assert line("doctor_model", model=f"gemini:{MODEL}", provider="Google Gemini") in out
+    assert line("doctor_key_stored") in out
+    assert line("doctor_verdict_ok", days=3) in out
+    assert line("doctor_stt_gemini", model="gemini-3.5-transcribe-live", size="small") in out
+    assert line("doctor_voice_goes") in out
+    assert line("doctor_answer_stays") in out
+    assert line("doctor_text_goes", provider="Google Gemini") in out
+    assert line("doctor_memory", path=configured / MEMORY_FILE_NAME, count=3) in out
+    assert line("doctor_contacts", path=configured / CONTACTS_FILE_NAME, count=1) in out
+    assert line("doctor_builtin", count=len(BUILTIN_TOOLS)) in out
+    assert line("doctor_local", count=1, names="start_my_project") in out
+    assert line("doctor_spend_stop", daily="2.00", monthly="30.00") in out
+    assert line("doctor_retention", days=30) in out
+    mail_line = line(
+        "doctor_mail", user="emre@example.test", host="imap.example.test", mailbox="INBOX"
+    )
+    assert mail_line in out
+    assert line("doctor_telegram", api_id=123456) in out
+    assert line("doctor_autostart_on", command=command) in out
+    for secret in ("AIza-not-a-real-key", "the-hash", "the-session", "the-app-password"):
+        assert secret not in out
+
+
+def test_doctor_on_a_bare_setup_says_what_is_not_there(
+    configured: Path,
+    vault: MemoryKeyring,
+    run_key: type[FakeRunKey],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    monkeypatch.setattr(db, "database_path", lambda: tmp_path / "data" / "assistant.db")
+
+    assert main(["doctor"]) == 0
+
+    out = unwrapped(capsys.readouterr().out)
+    for key in (
+        "doctor_verdict_none",
+        "doctor_voice_stays",
+        "doctor_answer_stays",
+        "doctor_local_none",
+        "doctor_mail_none",
+        "doctor_telegram_none",
+        "doctor_autostart_off",
+    ):
+        assert unwrapped(said(key)) in out, key
+    assert "(henüz oluşmadı)" in out
+    assert "speech model" not in out

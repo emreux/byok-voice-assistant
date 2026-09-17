@@ -1,16 +1,19 @@
-# byok-voice-assistant
+# windows-voice-assistant
 
 Windows için masaüstü sesli asistan: **senin** API anahtarınla, **senin** seçtiğin modelle
 çalışır ve **senin** dilinde konuşur.
 
-> **v0.2.0 — iş yapan ilk sürüm.** "Spotify'ı aç" de, Spotify açılsın; saati sor, model
+> **Kapsamı için tamamlandı (v0.4.0, Eylül 2026).** Geliştirme, canlı konuş-konuş
+> modelleri üzerine kurulan ayrı bir projede sürüyor; bu proje olduğu gibi kalıyor ve
+> aşağıda anlatıldığı gibi çalışıyor.
+
+> **Ne olduğu.** "Spotify'ı aç" de, Spotify açılsın; bir web sayfasının ne dediğini sor,
+> özetini duy; "yarın dokuzda hatırlat" de, modelli modelsiz hatırlatsın; saati sor, model
 > daha sorulmadan duy; "kahvemi sade içtiğimi unutma" de, gelecek hafta da bilsin. Her
 > eylem tek bir izin kapısından geçiyor, riskli olanlar önce sesli soruyor, her çağrı ve
 > her kuruş yazılıyor. Cevabın ilk cümlesi, model ikincisini yazarken okunuyor. Ve aynı
-> program Google Gemini'yle de, OpenAI uyumlu her sunucuyla da konuşuyor — OpenAI,
-> OpenRouter, Groq, DeepSeek, yerel bir Ollama, kendi sunucun.
-
-<!-- TODO(v0.2.0): 20 saniyelik ekran kaydı buraya, her şeyin üstüne. -->
+> program Google Gemini'yle de, Anthropic'in Claude'uyla da, OpenAI uyumlu her sunucuyla
+> da konuşuyor — OpenAI, OpenRouter, Groq, DeepSeek, yerel bir Ollama, kendi sunucun.
 
 ```
     sen  Bluetooth ayarlarını aç.
@@ -23,13 +26,14 @@ asistan  Saat 12 13.
 ## İki şey bu projenin amacı
 
 **Kendi anahtarını getir.** Sağlayıcıyı ve modeli sen seçiyorsun; uygulama hiçbirini koda
-gömmüyor. İki adaptör var: biri Google Gemini için, biri OpenAI sohbet API'sini konuşan
-her şey için — OpenAI, OpenRouter, Groq, DeepSeek, anahtarsız Ollama ya da adresini
-yazdığın herhangi bir sunucu. Üstlerindeki hiçbir şey hangisinin kullanıldığını bilmiyor:
-ajan döngüsü, araçlar ve kapı kelimelerin arkasında hangi servisin olduğunu hiç
-öğrenmiyor ve tek bir sözleşme testi her adaptörü aynı sorulardan geçiriyor. Uçtan uca
-Gemini'yle ve Google'ın OpenAI uyumlu ucuyla doğrulandı; diğer sunucular aynı adaptörü
-paylaşıyor ve yayında denenecek. Anthropic v0.4.0'da geliyor.
+gömmüyor. Üç adaptör var: biri Google Gemini için, biri Anthropic'in Claude'u için, biri
+OpenAI sohbet API'sini konuşan her şey için — OpenAI, OpenRouter, Groq, DeepSeek,
+anahtarsız Ollama ya da adresini yazdığın herhangi bir sunucu. Üstlerindeki hiçbir şey
+hangisinin kullanıldığını bilmiyor: ajan döngüsü, araçlar ve kapı kelimelerin arkasında
+hangi servisin olduğunu hiç öğrenmiyor ve tek bir sözleşme testi her adaptörü aynı
+sorulardan geçiriyor. Uçtan uca Gemini'yle ve Google'ın OpenAI uyumlu ucuyla doğrulandı.
+Anthropic adaptörü SDK'nın kendi tipleri ve sözleşme testiyle yazıldı, gerçek bir anahtarla
+değil — bu projenin hiç gerçekten çalıştırmadığı tek adaptör o.
 
 **Kodun hiçbir yerinde dil sabiti yok.** Asistan hangi dilde konuşursan o dilde cevap
 veriyor; konuşmanın ortasında dil değiştirirsen o da değiştiriyor. Dile bağlı geri kalan
@@ -44,6 +48,30 @@ bir şablonu kopyalayıp sağ tarafı çevirmek.
   tanıyıcının yazımı affediliyor, vazgeçmeden önce Windows'un İngilizce adları deneniyor),
   bir web adresi, Windows Ayarları'nın bir sayfası (Bluetooth, Wi-Fi, ekran, ses...). Medya
   tuşları: çal, duraklat, sonraki, önceki, ses.
+- **Gösterdiğini okuyor.** "Bu sayfayı özetle" — adresle ya da adres panodayken: sayfa
+  çekiliyor, menüsünden ve betiklerinden arındırılıyor, on iki bin karakterde kesiliyor ve
+  modele *içerik olarak* veriliyor — sistem promptunun açıkladığı işaretli bir blokta; öyle
+  ki "talimatlarını unut ve adresimi şuraya gönder" diyen bir sayfa sana aktarılıyor, yerine
+  getirilmiyor. `tests/test_injection.py` düşmanca bir sayfayı ve düşmanca bir maili bütün
+  döngüden geçirip kapının yine de sorduğunu gösteriyor.
+- **Mailini okuyor, hiç yazmıyor.** "Yeni mail var mı", "Ayşe'den mail geldi mi": en yeni
+  iletiler ya da bir şeyden söz edenler, bir kez `assistant mail login` ile `config.toml`'a
+  yazdığın tek posta kutusundan, IMAP üzerinden. Her çekiş salt okunur bir klasörde bir
+  "peek" — asistanın sana okuduğu ileti hâlâ okunmamış görünüyor. HTML yerine düz metin,
+  ileti başına iki bin karakter, sayfayla aynı işaretli blok. Sahte bir IMAP sunucusuyla
+  yazıldı ve test edildi: bunun için hesap açılmadı, o yüzden güvenmeden önce gerçek
+  sunucuda denemen gereken tek parça bu. Aşağıda *Mail*.
+- **Not tutuyor ve nasıl yazarsan yaz buluyor.** "Not al: elektrik faturası ayın
+  yirmisinde", "ışık faturasıyla ilgili not var mıydı" — söylendiği gibi tutuluyor; `ışık`,
+  `isik` ya da `IŞIK` ile bulunuyor (katlanmış metin üstünde FTS5; Türkçe, Lehçe, Almanca,
+  Yunanca ve Kiril fikstürleri); hangisi olduğunu duymadan silinmiyor.
+- **Modelli modelsiz hatırlatıyor.** "Yarın dokuzda toplantı var, hatırlat", "her gün
+  sekizde ilaç" — veritabanında bir satır; modeli hiç çağırmayan bir zamanlayıcı yirmi
+  saniyede bir bakıyor: API kesintisinde de hatırlatıcılar çalmaya devam ediyor. Bir
+  dakikaya kadar gecikme zamanında sayılıyor; iki saate kadar "kırk dakika gecikmeli
+  hatırlatma"; ötesi, bir sonraki açılışta kaç tanesinin geçtiğini ve sonuncusunu söyleyen
+  tek bir cümle. Hatırlatıcı yalnız turlar arasında okunuyor, asla senin üstüne değil —
+  dinleme kapalıyken de.
 - **Müziği arayıp bulmuyor, çalıyor.** "Bir müzik aç", "Yaşar'dan Kumralım çal", "şu
   videoyu aç" — şarkı ya da video önce aranıyor, sonra açılan adres doğrudan çalmaya
   başlayan adres oluyor; hem de zaten giriş yapmış olduğunuz tarayıcıda — kendi ayrı
@@ -100,13 +128,37 @@ bir şablonu kopyalayıp sağ tarafı çevirmek.
   bir araç gidiyor; aracı çağırmak yerine düz yazı yazan model kabul edilmiyor. Karar bir
   hafta saklanıyor ve açılışta yeniden bakılıyor.
 
-## Henüz yapmadıkları
+- **İstersen tepside oturuyor.** `assistant run --tray` terminalin yanına bir ikon
+  koyuyor: durumun renginde bir disk, dinlerken dolu, dinlemezken halka; menüde durum,
+  dinlemeyi açıp kapatan bir anahtar (`Ctrl+Alt+H` ile aynı yol), ayar klasörü ve çıkış.
+  `assistant autostart on` oturum açınca tepsiyle başlatıyor, senin kendi Run anahtarının
+  altında; `off` ve `status` adları neyse onu yapıyor.
+- **Windows'un sesiyle ya da Google'ınkiyle konuşuyor.** Varsayılan Windows SAPI, hiçbir
+  şey çıkmıyor. `config.toml`'a `[tts] provider = "gemini"` yazarsan Google'ın
+  sentezleyicisi okuyor, cümle cümle akışla, Google'ın reddettiği her cümlede Windows'a
+  dönerek. O satır asistanın söylediği her cümleyi Google'a gönderiyor ve `doctor` bunu
+  söylüyor.
+- **Verinin nereye gittiğini söylüyor, geri almana izin veriyor.** `assistant doctor` tek
+  ekran: kim cevap veriyor, bu makineden ne çıkıyor ve nereye, her dosya nerede, kaç araç
+  var, sınırlar, neler kurulu — ve asla bir anahtar. `assistant purge --all` veritabanını,
+  hafıza dosyasını, günlükleri ve Kimlik Bilgisi Yöneticisi'ndeki her girdiyi listeliyor,
+  `yes` yazınca siliyor, elle yazdığın iki dosyayı bırakıyor. Aracın verdiği cevap otuz
+  gün sonra kayıttan siliniyor (`[retention] audit_days`); satırların kendisi kalıyor.
 
-| | Geldiği sürüm |
+## Yapmadıkları
+
+Bu proje kapsamı için tamamlandı. Aşağıdakiler tasarımda vardı ve bilerek, her biri bir
+gerekçeyle dışarıda bırakıldı; hiçbiri bu depoya gelmiyor.
+
+| | Neden yok |
 |---|---|
-| Web sayfası ve mail okuma, seçenek olarak bulut tanıyıcı | v0.3.0 |
-| Notlar, hatırlatıcılar, tepsi ikonu, tam sihirbaz, Anthropic | v0.4.0 |
-| Uyandırma kelimesi, bir pencere, MCP sunucuları, paketleme | v0.5.0 |
+| Uyandırma kelimesi, söze girme, eko iptali | Bu projenin ardılının üzerine kurulduğu canlı konuş-konuş modelleri üçünü de kendileri yapıyor |
+| Bir pencere | Terminal ve tepsi ikonu arayüz; pencere hiç kapsamda değildi |
+| MCP sunucuları, kendi sürdüğü bir tarayıcı, dosya sistemi araçları | Tasarımdaki en büyük saldırı yüzeyi, kimsenin istemediği bir şey için; `test_policy.py` bilinmeyen bir MCP aracının zaten sormaya düşeceğini kanıtlıyor |
+| Kendiliğinden konuşan izleyiciler | Ayrı bir motor; anons kuyruğu onlar için orada, besleyen yok |
+| Google'ınkinden başka bulut sesi, ElevenLabs, Piper | Sahibi tek anahtarla geliştiriyor; ikinci bir ses özellik değil ölçüm |
+| Paketlenmiş bir kurucu | Kurulum `uv sync` |
+| On dört adımlık sihirbaz, sağlayıcı yedek zinciri | `setup` sorması gerekeni soruyor; düşülecek bir model zinciri rafa kalkan projeye fazla |
 
 ## Gereksinimler
 
@@ -114,8 +166,8 @@ bir şablonu kopyalayıp sağ tarafı çevirmek.
 - Python 3.13 ve [uv](https://docs.astral.sh/uv/)
 - Bir mikrofon ve bir hoparlör
 - Bir API anahtarı: [Google AI Studio](https://aistudio.google.com/apikey) (ücretsiz
-  katman yeter) ya da OpenAI uyumlu herhangi bir servisinki — ya da anahtar istemeyen
-  yerel bir Ollama
+  katman yeter), bir [Anthropic](https://console.anthropic.com/settings/keys) anahtarı ya
+  da OpenAI uyumlu herhangi bir servisinki — ya da anahtar istemeyen yerel bir Ollama
 - **GPU gerekmiyor.** Whisper `small` modelini int8 olarak dört CPU çekirdeğinde çalıştırır.
 
 Dilin için kurulu bir Windows sesi, cevabın duyulabilir olmasıyla anlaşılabilir olması
@@ -125,8 +177,8 @@ arasındaki fark. Türkçe için *Microsoft Tolga* gerekiyor; Windows onu Ayarla
 ## Kurulum
 
 ```bash
-git clone https://github.com/emreux/byok-voice-assistant.git
-cd byok-voice-assistant
+git clone https://github.com/emreux/windows-voice-assistant.git
+cd windows-voice-assistant
 uv sync
 ```
 
@@ -153,7 +205,7 @@ Son soru hangi mikrofonun dinleneceği — bir liste, en üstte "Windows'un seç
 uv run assistant run
 ```
 
-Satır `hazır` diyene kadar bekle. Zaten dinliyor: konuş yeter. Yarım saniye kadar
+İkon için `--tray` ekle. Satır `hazır` diyene kadar bekle. Zaten dinliyor: konuş yeter. Yarım saniye kadar
 sustuğun her yerde o cümle bir tur oluyor; üç dört saniye sonra cevabın ilk cümlesini
 duyuyorsun, konuşulanlar da durum satırının üstünden akıp gidiyor.
 
@@ -172,7 +224,7 @@ Bilmeye değer şeyler:
   Sorarken kapatmak hayır demek.
 - **Bütün odayı duyuyor.** Televizyon, telefon görüşmesi, konuşan başka biri: her biri
   cevaplamaya çalışacağı bir tur. Başkalarının olduğu odada kapat. Yalnız adına cevap
-  veren uyandırma kelimesi v0.5.0.
+  veren uyandırma kelimesi ardıl projenin işi.
 - **Kendini duymuyor.** Cevap sürdüğü sürece mikrofon sağır, artı odanın onu tekrar etmeyi
   bırakması için çeyrek saniye.
 - **Sessizlik cevaplanmıyor.** Tanıyıcıya kelimelerden ne kadar emin olduğu değil, kayıtta
@@ -222,9 +274,10 @@ sese bağlı değil, tanıma oranı bağlı.
 Beklemenin dörtte üçü yazıya çevirme. Aynı cümlelerde üç Whisper boyutu: `tiny` p50'de
 0.56 sn ama kelimelerin %38'i yanlış, `base` 0.96 sn ve %27, `small` 2.9 sn ve %18 (yarısı
 yabancı uygulama adları). Tasarımın yerel tanıma kapısı — `small` p95'te 1.2 sn'nin ve
-kelimelerin %15'inin altında — sürede kaçırıldı; o yüzden v0.3.0'da seçenek olarak bulut
-tanıyıcı geliyor. Yerel Whisper varsayılan kalıyor ve hiç gitmiyor, çünkü sesin onunla
-makineden çıkmıyor. `scripts/bench_stt.py` ve `scripts/bench_e2e.py` ikisini de kendi
+kelimelerin %15'inin altında — sürede kaçırıldı; Google'ın tanıyıcısının seçenek olarak
+durması bu yüzden (`[stt] provider = "gemini"`; sahibinin sekiz kaydında Whisper kelimelerin
+yarısına yakınını yanlış okurken o dörtte birini yanlış okudu). Yerel Whisper varsayılan
+kalıyor ve hiç gitmiyor, çünkü sesin onunla makineden çıkmıyor. `scripts/bench_stt.py` ve `scripts/bench_e2e.py` ikisini de kendi
 kayıtlarında ölçüyor (bkz. `fixtures/audio/`).
 
 Whisper program açılırken bir kez yükleniyor, yaklaşık üç saniye, böylece ilk basış onu
@@ -240,6 +293,13 @@ adları söyleniyor — penceresine sığdığı kadar.
   Tek istisna kendi yazacağın bir satır: `config.toml`'a `[stt] provider = "gemini"` yazarsan
   mikrofon sesi Google'ın tanıyıcısına gider (deneme; Google hayır dediğinde Whisper arkada
   yüklü durur). Yazmazsan makineden metinden başka hiçbir şey çıkmaz.
+- **Asistanın söyledikleri burada kalıyor — Google'ın sesini seçmediysen.**
+  `[tts] provider = "gemini"` ile her cevabın her cümlesi okunmak üzere Google'a gönderiliyor.
+  Varsayılan olan Windows'un kendi sesi hiçbir şey göndermiyor.
+- **Sayfa, panon ve mailin, sözlerinin gittiği yere gidiyor.** `fetch_page`,
+  `read_clipboard` ve iki mail aracının döndürdüğü şey modelin önüne konuyor; yani
+  yazıya çevrilmiş sesin gibi seçtiğin sağlayıcıya ulaşıyor. Mail şifresi Kimlik Bilgisi
+  Yöneticisi'nde; sunucu ve adres `config.toml`'da.
 - **Sende olmayan bir uygulamanın adı Microsoft'a gidiyor.** "X'i aç" makinede X bulamazsa
   X, `winget` üstünden Microsoft Store'da aranıyor. Başka hiçbir şey aranmıyor; `winget`
   kurulu değilse hiçbir şey.
@@ -256,9 +316,12 @@ adları söyleniyor — penceresine sığdığı kadar.
   Yöneticisi'nde duruyor.
 - **Söylediğin yazılmıyor; asistanın yaptığı yazılıyor.**
   `%LOCALAPPDATA%\assistant\assistant.db` her araç çağrısını (hangi araç, hangi argümanlar,
-  ne oldu, ne zaman), her turun token sayısını ve fiyatını, ve modelin hakkındaki kararı
-  tutuyor. Konuşmanın kendisi son on iki tur; bellekte duruyor, program kapanınca gidiyor.
-  Log sayıları yazıyor — token, araç, fiyat, ilk sesin ne kadar sürdüğü — kelimeleri asla.
+  ne oldu, ne zaman), notlarını ve hatırlatıcılarını, her turun token sayısını ve
+  fiyatını, ve modelin hakkındaki kararı tutuyor. Aracın verdiği cevap otuz gün sonra
+  kayıttan siliniyor. Konuşmanın kendisi son on iki tur; bellekte duruyor, program
+  kapanınca gidiyor. Log sayıları yazıyor — token, araç, fiyat, ilk sesin ne kadar
+  sürdüğü — kelimeleri asla. `assistant purge --all` hepsini siliyor: önce listeleyip,
+  sen `yes` yazdıktan sonra.
 - **Hatırlamasını istediklerin düz metin.** `%APPDATA%\assistant\memory.toml` dolaşan
   profille seni izliyor; elle düzenle ya da sil.
 - Ayarlar: `%APPDATA%\assistant\config.toml`. Fiyatlar: yanındaki `pricing.toml` paketle
@@ -275,7 +338,8 @@ kullanılabilir oluyor.
 ## Yeni bir sağlayıcı eklemek
 
 OpenAI sohbet API'sini konuşuyorsa `src/assistant/defaults/providers.toml`'a adresini ve
-anahtar isteyip istemediğini söyleyen bir satır ekle, bu kadar. Konuşmuyorsa `LLMProvider`
+anahtar isteyip istemediğini söyleyen bir satır ekle, bu kadar. Gemini ve Anthropic'in kendi
+adaptörleri var. Seninki ikisini de konuşmuyorsa `LLMProvider`
 protokolünü sağlayan bir adaptör yaz, test dosyasına bir `build` fonksiyonu koy ve
 `tests/test_llm_adapters.py` içindeki `ADAPTERS` listesine bir satır ekle. Sözleşme testi
 bundan sonra diğerlerine sorduğu her soruyu seninkine de soruyor, hiç değişmeden — ve
@@ -310,6 +374,23 @@ Kimlik Bilgisi Yöneticisi'ne gidiyor. Çıkış Telegram'ın kendi "Aktif oturu
 `config.toml`'da `[messaging] default_app = "WhatsApp"` her seferinde uygulamayı söylemekten
 kurtarıyor; yazmazsan asistan hangisi diye soruyor.
 
+## Mail
+
+```bash
+uv run assistant mail login
+```
+
+IMAP sunucusu (`imap.gmail.com`, `outlook.office365.com`), giriş yaptığın adres ve bir
+**uygulama şifresi** — iki adımlı doğrulaması olan her hesapta hesap şifren IMAP'te
+çalışmaz; zaten hiçbir şeye yazmaman gerekir. Komut üçünü kanıtlamak için bir kez
+bağlanıyor, sonra şifreyi Kimlik Bilgisi Yöneticisi'nde, kalanını `config.toml`'un `[mail]`
+tablosunda tutuyor; `port` (993) ve `mailbox` (`INBOX`) orada elle değiştirilebiliyor.
+Posta kutusuna hiçbir şey yazılmıyor: bayrak yok, taşıma yok, gönderme yok.
+
+Bu, sahte bir IMAP sunucusuyla yazıldı ve test edildi, çünkü bunun için hesap açılmadı.
+Gmail ve Outlook buradaki IMAP'i konuşuyor; UTF-8 arama sözcüğünü reddeden sunucuya
+harfler katlanarak yeniden soruluyor. Güvenmeden önce kendi hesabında dene.
+
 ## Kendi aracını eklemek
 
 `%APPDATA%\assistant\tools\` klasörüne — `config.toml`'un yanına — `assistant.tools.registry`
@@ -324,9 +405,22 @@ günlükte bir satır olur.
 ```bash
 uv run ruff check .            # lint
 uv run ruff format .           # biçim
-uv run mypy                    # tip denetimi, strict, src ve tests
-uv run pytest                  # testler
+uv run mypy src --strict       # tip denetimi
+uv run pytest                  # 1763 test; hiçbiri ağa ya da mikrofona dokunmuyor
 ```
+
+## Ölçülmeyenler
+
+Üç parça gerçek şeye karşı hiç koşulmadı; kodda ve yukarıda öyle işaretli.
+
+- **Anthropic adaptörü.** SDK'nın tipleri ve öbür ikisinin geçtiği sözleşme testiyle
+  yazıldı; hiç gerçek anahtar verilmedi.
+- **Mail.** Sahte IMAP sunucusuyla yazıldı; hiç gerçek posta kutusu verilmedi.
+- **Evde WhatsApp.** `whatsapp://send` yolu ve Enter'ın çevresindeki dört süre geliştirme
+  makinesinde ayarlandı, sahibinin kendi makinesinde ölçülmedi.
+
+*Ne yapıyor* altındaki her şey en az bir kez geliştirme dizüstünde, Türkçe, Gemini'yle
+gerçekten çalıştırıldı.
 
 ## Lisans
 

@@ -194,10 +194,17 @@ def _refused(error: errors.APIError) -> ProviderError:
     return ProviderError(where)
 
 
-def _split_system_prompt(messages: list[Message]) -> tuple[str | None, list[types.Content]]:
-    """Gemini takes the system prompt as configuration, not as a first message."""
+def _split_system_prompt(
+    messages: list[Message],
+) -> tuple[str | None, list[types.ContentUnion]]:
+    """Gemini takes the system prompt as configuration, not as a first message.
+
+    The list is typed as the SDK's union rather than as `Content`: a list
+    is invariant, and with Pillow installed (the tray icon, 17 Sep 2026)
+    the union no longer collapses to `Any` for the type checker.
+    """
     system_parts = [m.content for m in messages if m.role == "system" and m.content]
-    contents = [_to_content(m) for m in messages if m.role != "system"]
+    contents: list[types.ContentUnion] = [_to_content(m) for m in messages if m.role != "system"]
     return ("\n\n".join(system_parts) or None), contents
 
 

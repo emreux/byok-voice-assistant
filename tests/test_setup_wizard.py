@@ -303,11 +303,12 @@ async def test_one_buildable_provider_is_not_worth_a_question(
 async def test_only_providers_this_build_can_construct_are_offered(
     config_home: Path, vault: MemoryKeyring
 ) -> None:
-    """An entry naming a later phase's adapter is a dead end the user would
-    only discover after typing their key in."""
+    """An entry naming an adapter this build does not have - the `litellm`
+    escape hatch of section 5.11, say - is a dead end the user would only
+    discover after typing their key in."""
     catalog: Mapping[str, ProviderEntry] = {
         **fake_catalog("gemini", "openrouter"),
-        "claude": ProviderEntry(id="claude", adapter="anthropic", display_name="Claude"),
+        "proxy": ProviderEntry(id="proxy", adapter="litellm", display_name="Proxy"),
     }
     prompter = complete_run(provider="openrouter")
 

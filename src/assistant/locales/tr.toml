@@ -44,6 +44,10 @@ question = "İstanbul'da saat kaç?"
 # Tolga is the voice Windows itself ships for Turkish. It lives in the
 # Speech_OneCore registry hive, which `tts/sapi.py` reads on purpose.
 sapi = "Tolga"
+# Google's synthesiser (`[tts] provider = "gemini"`): the thirty voices read
+# every language, so this is a matter of timbre. Kore is a clear, even
+# female voice; Charon a calm male one.
+gemini = "Kore"
 
 [ui]
 welcome = "Asistan, senin API anahtarınla, seçtiğin yapay zekâ sağlayıcısına bağlanır."
@@ -163,3 +167,89 @@ cost_tokens = "girdi / çıktı / önbellek"
 cost_spent = "harcama"
 cost_total = "toplam"
 cost_unpriced = "{model} için {count} turun fiyatı pricing.toml'da yok; toplama girmedi."
+
+# Shown by `assistant purge --all`: what will go, what stays, and the one
+# word that is asked for before anything is deleted (`yes`, in every
+# language - the sentence names it).
+purge_will_delete = "Asistanın kaydettiği her şey silinecek:"
+purge_file = "  dosya: {path}"
+purge_secret = "  Kimlik Bilgisi Yöneticisi girdisi: {name}"
+purge_keeps = "config.toml ve contacts.toml kalıyor: onları sen yazdın."
+purge_confirm = "Hepsini silmek için yes yaz:"
+purge_cancelled = "Hiçbir şey silinmedi."
+purge_done = "{count} öğe silindi."
+purge_nothing = "Silinecek bir şey yok."
+
+# The tray icon (`run --tray`): its menu, and the tooltip of an idle
+# microphone that is off. The states themselves use the `state_*` labels.
+tray_not_listening = "dinlemiyor"
+tray_stop_listening = "Dinlemeyi durdur"
+tray_start_listening = "Dinlemeye başla"
+tray_open_settings = "Ayar klasörünü aç"
+tray_quit = "Çık"
+
+# `assistant autostart on | off | status`: the Run key of your own sign-in.
+autostart_on = "Asistan oturum açtığında başlayacak; komut: {command}"
+autostart_off = "Asistan artık oturum açtığında başlamayacak."
+autostart_status_on = "Oturum açınca başlıyor; komut: {command}"
+autostart_status_off = "Oturum açınca başlamıyor. 'assistant autostart on' bunu değiştirir."
+
+# Asked and said by `assistant mail login`: the IMAP server, the address,
+# an app password, and how it went.
+mail_host = "Posta hesabının IMAP sunucusu (imap.gmail.com, outlook.office365.com)"
+mail_user = "Giriş yaptığın e-posta adresi"
+mail_password = "IMAP için uygulama şifresi - hesap şifren değil (yazarken görünmez)"
+mail_logged_in = "{host} sunucusuna {user} olarak girildi: {mailbox} klasöründe {count} ileti var. Şifre Windows Kimlik Bilgisi Yöneticisi'nde."
+mail_login_failed = "Posta girişi başarısız: {reason}"
+
+# `assistant doctor`: one screen of labels. Values - paths, numbers,
+# names - are written by the code; a key is never one of them.
+doctor_pack = "dil paketi: {name} ({code})"
+doctor_who_answers = "Kim cevap veriyor"
+doctor_model = "  model: {model} ({provider})"
+doctor_key_stored = "  API anahtarı: Kimlik Bilgisi Yöneticisi'nde kayıtlı"
+doctor_key_missing = "  API anahtarı: kayıtlı değil - 'assistant setup' çalıştır"
+doctor_key_not_needed = "  API anahtarı: gerekmiyor"
+doctor_verdict_ok = "  araç çağırma: geçti, {days} gün önce denendi"
+doctor_verdict_failed = "  araç çağırma: KALDI, {days} gün önce denendi - araçların çoğu çalışmayacak"
+doctor_verdict_none = "  araç çağırma: henüz denenmedi (bir sonraki açılışta denenir)"
+doctor_stt_local = "  tanıyıcı: Whisper '{size}', bu makinede"
+doctor_stt_gemini = "  tanıyıcı: Google ({model}), arkasında Whisper '{size}'"
+doctor_tts_sapi = "  ses: Windows ({voice})"
+doctor_tts_gemini = "  ses: Google ({model}), arkasında Windows"
+doctor_leaves = "Bu makineden ne çıkıyor"
+doctor_voice_stays = "  sesin: burada kalıyor"
+doctor_voice_goes = "  sesin: Google'a gidiyor (tanıyıcı)"
+doctor_text_goes = "  söylediklerin, metin olarak: {provider} sağlayıcısına gidiyor"
+doctor_content_goes = "  sorduğun sayfalar, pano metni ve mailler: {provider} sağlayıcısına gidiyor"
+doctor_answer_stays = "  asistanın söyledikleri: burada kalıyor"
+doctor_answer_goes = "  asistanın söyledikleri: Google'a gidiyor (ses)"
+doctor_weather = "  havasını sorduğun yer: Open-Meteo'ya gidiyor"
+doctor_store = "  sende olmayan bir uygulamanın adı: Microsoft Store'a gidiyor"
+doctor_messages = "  bir mesaj: bu bilgisayardaki WhatsApp uygulaması ya da senin adına Telegram sunucuları"
+doctor_where = "Neler nerede"
+doctor_settings = "  ayarlar: {path}"
+doctor_contacts = "  kişiler: {path} ({count} kişi)"
+doctor_contacts_none = "  kişiler: {path} (henüz yazılmadı)"
+doctor_memory = "  hafıza: {path} ({count} bilgi)"
+doctor_tools_dir = "  kendi araçların: {path}"
+doctor_database = "  veritabanı: {path} ({size})"
+doctor_database_none = "  veritabanı: {path} (henüz oluşmadı)"
+doctor_log = "  günlük: {path}"
+doctor_tools = "Araçlar"
+doctor_builtin = "  yerleşik: {count}"
+doctor_local = "  kendi araçların: {count} ({names})"
+doctor_local_none = "  kendi araçların: yok"
+doctor_limits = "Sınırlar"
+doctor_per_turn = "  tur başına: {calls} araç çağrısı, {tokens} çıktı jetonu, {seconds} sn"
+doctor_spend_warn = "  harcama: günde ${daily}, ayda ${monthly} - aşılınca uyarı"
+doctor_spend_stop = "  harcama: günde ${daily}, ayda ${monthly} - aşılınca modele sorulmaz"
+doctor_retention = "  aracın verdiği cevap kayıtta {days} gün tutuluyor"
+doctor_retention_forever = "  aracın verdiği cevap kayıtta hep tutuluyor"
+doctor_set_up = "Kurulu olanlar"
+doctor_mail = "  posta: {host} sunucusunda {user} ({mailbox})"
+doctor_mail_none = "  posta: kurulu değil ('assistant mail login')"
+doctor_telegram = "  telegram: giriş yapılmış (api_id {api_id})"
+doctor_telegram_none = "  telegram: kurulu değil ('assistant telegram login')"
+doctor_autostart_on = "  oturum açınca başlıyor: evet ({command})"
+doctor_autostart_off = "  oturum açınca başlıyor: hayır ('assistant autostart on')"

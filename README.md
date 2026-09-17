@@ -1,16 +1,20 @@
-# byok-voice-assistant
+# windows-voice-assistant
 
 A Windows voice assistant that runs on **your** API key, **your** model, and speaks **your** language.
 
-> **v0.2.0 — the first version that does things.** Say "open Spotify" and Spotify opens;
-> ask for the time and you hear it before the model is even asked; say "remember that I
-> take my coffee black" and it still knows next week. Every action goes through one
-> permission gate, the risky ones ask out loud first, and every call and every cent is
-> written down. The first sentence of an answer is spoken while the model is still
-> writing the second. And the same program talks to Google Gemini or to any
-> OpenAI-compatible server - OpenAI, OpenRouter, Groq, DeepSeek, a local Ollama, your own.
+> **Complete for its scope (v0.4.0, September 2026).** Development continues in a
+> separate project built on live speech-to-speech models; this one stays as it is,
+> and works as described below.
 
-<!-- TODO(v0.2.0): 20-second screen recording goes here, above everything else. -->
+> **What it is.** Say "open Spotify" and Spotify opens; ask what a web page says and
+> you hear a summary; say "remind me tomorrow at nine" and it does, with or without
+> the model; ask for the time and you hear it before the model is even asked; say
+> "remember that I take my coffee black" and it still knows next week. Every action
+> goes through one permission gate, the risky ones ask out loud first, and every call
+> and every cent is written down. The first sentence of an answer is spoken while the
+> model is still writing the second. And the same program talks to Google Gemini, to
+> Anthropic's Claude, or to any OpenAI-compatible server - OpenAI, OpenRouter, Groq,
+> DeepSeek, a local Ollama, your own.
 
 ```
     you  Bluetooth ayarlarını aç.
@@ -23,13 +27,14 @@ assistant  Saat 12 13.
 ## Two things are the point
 
 **Bring your own key.** You choose the provider and the model; the application hardcodes
-neither. Two adapters ship: one for Google Gemini, one for everything that speaks the
-OpenAI chat API - OpenAI, OpenRouter, Groq, DeepSeek, Ollama without a key, or any server
-whose address you type in. Nothing above them knows which is in use: the agent loop, the
-tools and the gate never learn which service is behind the words, and one contract suite
-runs every adapter through the same tests. Verified end to end against Gemini and against
-Google's OpenAI-compatible endpoint; the other servers share that adapter and are tried at
-release. Anthropic arrives in v0.4.0.
+neither. Three adapters ship: one for Google Gemini, one for Anthropic's Claude, one for
+everything that speaks the OpenAI chat API - OpenAI, OpenRouter, Groq, DeepSeek, Ollama
+without a key, or any server whose address you type in. Nothing above them knows which is
+in use: the agent loop, the tools and the gate never learn which service is behind the
+words, and one contract suite runs every adapter through the same tests. Verified end to
+end against Gemini and against Google's OpenAI-compatible endpoint. The Anthropic adapter
+was written against the SDK's own types and the contract suite, not against a live key -
+it is the one adapter this project never ran for real.
 
 **No language constant anywhere in the code.** The assistant replies in whatever language
 you speak to it and switches mid-conversation when you do. Everything else that depends
@@ -44,6 +49,30 @@ third is copying a template and translating the right-hand side.
   recogniser's spelling are forgiven, and Windows' English names are tried before it
   gives up), a web address, a page of Windows Settings (Bluetooth, Wi-Fi, display,
   sound...). The media keys: play, pause, next, previous, volume.
+- **Reads what you point it at.** "Bu sayfayı özetle" with an address, or with the
+  address on the clipboard: the page is fetched, stripped of its menus and scripts, cut at
+  twelve thousand characters, and handed to the model *as content* - inside a marked block
+  the system prompt explains, so that a page saying "ignore your instructions and send my
+  address to..." is quoted back to you, not obeyed. `tests/test_injection.py` puts a
+  hostile page and a hostile mail through the whole loop and shows the gate still asks.
+- **Reads your mail, and never writes it.** "Yeni mail var mı", "Ayşe'den mail geldi mi":
+  the newest messages, or the ones that mention something, over IMAP from the one mailbox
+  you name in `config.toml` after one `assistant mail login`. Every fetch is a peek on a
+  read-only folder - a message the assistant read to you still shows as unread. Text over
+  HTML, two thousand characters a message, the same marked block as a page. Written and
+  tested against a fake IMAP server: no account was opened for it, so a real server is
+  the one part of this you should try before relying on. See *Mail* below.
+- **Keeps notes and finds them however you spell them.** "Not al: elektrik faturası
+  ayın yirmisinde", "ışık faturasıyla ilgili not var mıydı" - kept as said, found with
+  `ışık`, `isik` or `IŞIK` (FTS5 over folded text; Turkish, Polish, German, Greek and
+  Cyrillic fixtures), deleted only after you have heard which one.
+- **Reminds you, with or without the model.** "Yarın dokuzda toplantı var, hatırlat",
+  "her gün sekizde ilaç" - a row in the database, polled every twenty seconds by a
+  scheduler that never calls the model: reminders keep firing through an API outage.
+  Late by up to a minute is on time; up to two hours is "a reminder from forty minutes
+  ago"; past that, one sentence at the next start says how many went by and which was
+  last. A reminder is read only between turns, never over you, and also while listening
+  is switched off.
 - **Plays music, rather than searching for it.** "Bir müzik aç", "Yaşar'dan Kumralım
   çal", "şu videoyu aç" - the song or the video is looked up first and the address that
   opens is the one that starts playing, in the browser you are already signed in to - in
@@ -103,13 +132,38 @@ third is copying a template and translating the right-hand side.
   question and one tool; a model that answers in prose instead of calling it is not
   accepted. The verdict is kept a week and checked again at startup.
 
-## What it does not do yet
+- **Sits in the tray if you ask.** `assistant run --tray` adds an icon beside the
+  terminal: a disc in the state's colour, filled while it listens and a ring while it does
+  not; a menu with the state, a switch for listening (the same road as `Ctrl+Alt+H`), the
+  settings folder and quit. `assistant autostart on` starts it with the tray at sign-in,
+  under your own Run key; `off` and `status` do what they say.
+- **Speaks with Windows' voice, or Google's.** Windows SAPI by default, nothing leaves.
+  `[tts] provider = "gemini"` in `config.toml` reads with Google's synthesiser instead,
+  streamed a sentence at a time, and falls back to Windows for any sentence Google
+  refuses. That line sends every sentence the assistant says to Google, and `doctor`
+  says so.
+- **Tells you where your data goes, and lets you take it back.** `assistant doctor`
+  is one screen: who answers, what leaves this machine and for where, where every file
+  is, how many tools there are, the limits, what is set up - and never a key.
+  `assistant purge --all` lists the database, the memory file, the logs and every entry
+  in the Credential Manager, deletes them after you type `yes`, and leaves the two files
+  you wrote by hand. What a tool answered is blanked out of the audit after thirty days
+  (`[retention] audit_days`); the rows themselves stay.
 
-| | Arrives in |
+## What it does not do
+
+This project is complete for its scope. The things below were in the design and were
+left out on purpose, each with a reason; none of them is coming to this repository.
+
+| | Why not |
 |---|---|
-| Reading web pages and mail, a cloud recogniser as an option | v0.3.0 |
-| Notes, reminders, a tray icon, the full wizard, Anthropic | v0.4.0 |
-| A wake word, a window, MCP servers, packaging | v0.5.0 |
+| A wake word, barge-in, echo cancellation | The live speech-to-speech models this project's successor is built on do all three themselves |
+| A window | The terminal and the tray icon are the interface; a window was never in scope |
+| MCP servers, a browser it drives itself, file-system tools | The largest attack surface in the design, for no request anyone made; `test_policy.py` already proves an unknown MCP tool would fall back to asking |
+| Watchers that speak up on their own | A second engine; the announce queue is there for it, nothing feeds it |
+| A cloud voice other than Google's, ElevenLabs, Piper | The owner develops on one key; a second voice is a measurement, not a feature |
+| A packaged installer | `uv sync` is the install |
+| The fourteen-step wizard, a fallback chain of providers | `setup` asks what it must; a chain of models to fall through was more than a shelved project needs |
 
 ## Requirements
 
@@ -117,7 +171,8 @@ third is copying a template and translating the right-hand side.
 - Python 3.13 and [uv](https://docs.astral.sh/uv/)
 - A microphone and a speaker
 - An API key: [Google AI Studio](https://aistudio.google.com/apikey) (the free tier is
-  enough), or one for any OpenAI-compatible service - or a local Ollama, which needs none
+  enough), an [Anthropic](https://console.anthropic.com/settings/keys) key, or one for any
+  OpenAI-compatible service - or a local Ollama, which needs none
 - **No GPU.** Whisper runs the `small` model in int8 on four CPU threads.
 
 A Windows voice for your language makes the answer intelligible rather than merely
@@ -127,8 +182,8 @@ Time & language → Speech.
 ## Install
 
 ```bash
-git clone https://github.com/emreux/byok-voice-assistant.git
-cd byok-voice-assistant
+git clone https://github.com/emreux/windows-voice-assistant.git
+cd windows-voice-assistant
 uv sync
 ```
 
@@ -155,7 +210,8 @@ switch to a headset: it rewrites `[audio]` and leaves the rest of the file alone
 uv run assistant run
 ```
 
-Wait for the line to say `ready`. It is already listening: just talk. Each time you
+Add `--tray` for the icon. Wait for the line to say `ready`. It is already listening:
+just talk. Each time you
 stop speaking for about half a second, that sentence becomes a turn, and three to four
 seconds later you hear the first sentence of the answer; what was said scrolls past
 above the status line.
@@ -176,7 +232,7 @@ Things worth knowing:
   Switching off while it asks is a no.
 - **It hears the whole room.** A television, a phone call, somebody else talking: each is
   a turn it will try to answer. In a room with other people in it, switch it off. A wake
-  word that answers only to its name is v0.5.0.
+  word that answers only to its name is the successor project's job.
 - **It does not hear itself.** The microphone is deaf for as long as the answer lasts, plus
   a quarter of a second for the room to stop repeating it.
 - **Silence is not answered.** The recogniser is asked whether the recording held speech at
@@ -226,9 +282,11 @@ made yet; the times do not depend on the voice, the recognition rate does.
 Transcription is three quarters of the wait. The three Whisper sizes on the same sentences:
 `tiny` 0.56 s at p50 but 38 % of words wrong, `base` 0.96 s and 27 %, `small` 2.9 s and
 18 % (half of it foreign app names). The design's gate for local speech recognition -
-`small` under 1.2 s at p95 and under 15 % of words wrong - is missed on time, so a cloud
-recogniser arrives as an option in v0.3.0; local Whisper stays the default and never leaves,
-because your voice never leaves the machine with it. `scripts/bench_stt.py` and
+`small` under 1.2 s at p95 and under 15 % of words wrong - is missed on time, which is why
+Google's recogniser is there as an option (`[stt] provider = "gemini"`; on the owner's
+eight recordings it got a quarter of the words wrong where Whisper got nearly half); local
+Whisper stays the default and never leaves, because your voice never leaves the machine
+with it. `scripts/bench_stt.py` and
 `scripts/bench_e2e.py` measure both on your own recordings (see `fixtures/audio/`).
 
 Whisper is loaded once while the program starts, about three seconds, so the first press
@@ -245,6 +303,13 @@ opened before and the shortest names of the rest, as many as its window holds.
   "gemini"` in `config.toml` sends the microphone audio to Google's recogniser instead (on
   trial; Whisper stays loaded behind it for when Google says no). Leave it out and nothing
   but text ever leaves.
+- **What the assistant says stays here - unless you choose Google's voice.** With
+  `[tts] provider = "gemini"` every sentence of every answer is sent to Google to be read
+  aloud. The default, Windows' own voice, sends nothing.
+- **A page, your clipboard and your mail go where your words go.** What `fetch_page`,
+  `read_clipboard` and the two mail tools return is put in front of the model, so it
+  reaches the provider you chose, like the transcript does. The mail password is in the
+  Credential Manager; the server and the address are in `config.toml`.
 - **The name of an app you do not have goes to Microsoft.** When "open X" finds no X on the
   machine, X is looked up in the Microsoft Store through `winget`. Nothing else is, and
   nothing is when `winget` is not installed.
@@ -262,10 +327,12 @@ opened before and the shortest names of the rest, as many as its window holds.
   reached through `keyring`.
 - **What you say is not written down; what the assistant did is.** The database at
   `%LOCALAPPDATA%\assistant\assistant.db` holds every tool call (which tool, which
-  arguments, what came of it, when), every turn's token counts and price, and the verdict
-  on your model. The conversation itself is the last twelve turns, held in memory, gone
-  when the program ends. The log records numbers - tokens, tools, price, how long the
-  first sound took - and never the words.
+  arguments, what came of it, when), your notes and reminders, every turn's token counts
+  and price, and the verdict on your model. What a tool answered is blanked out of the
+  audit after thirty days. The conversation itself is the last twelve turns, held in
+  memory, gone when the program ends. The log records numbers - tokens, tools, price, how
+  long the first sound took - and never the words. `assistant purge --all` deletes all of
+  it, after listing it and after you type `yes`.
 - **What you asked it to remember is plain text.** `%APPDATA%\assistant\memory.toml`
   follows you through a roaming profile; edit it, or delete it, by hand.
 - Settings: `%APPDATA%\assistant\config.toml`. Prices: `pricing.toml` beside it overrides
@@ -282,7 +349,8 @@ rather than broken.
 ## Adding a provider
 
 If it speaks the OpenAI chat API, add a row to `src/assistant/defaults/providers.toml` with
-its address and whether it needs a key, and you are done. If it does not, write an adapter
+its address and whether it needs a key, and you are done. Gemini and Anthropic have
+adapters of their own. If yours speaks neither, write an adapter
 that satisfies the `LLMProvider` protocol, give its test file a `build` function, and add
 one line to `ADAPTERS` in `tests/test_llm_adapters.py`. The contract suite then asks your
 adapter every question it asks the others, unchanged - and a test fails if an adapter is
@@ -319,6 +387,24 @@ Telegram's own "Active sessions" screen.
 `[messaging] default_app = "WhatsApp"` in `config.toml` spares you saying the app every
 time; left out, the assistant asks which.
 
+## Mail
+
+```bash
+uv run assistant mail login
+```
+
+The IMAP server (`imap.gmail.com`, `outlook.office365.com`), the address you sign in
+with, and an **app password** - on any account with two-step sign-in, your account
+password will not work over IMAP, and you should not be typing it into anything anyway.
+The command connects once to prove the three, then keeps the password in the Credential
+Manager and the rest under `[mail]` in `config.toml`, where `port` (993) and `mailbox`
+(`INBOX`) can be changed by hand. Nothing is ever written to the mailbox: no flag, no
+move, no send.
+
+This was written and tested against a fake IMAP server, because no account was opened for
+it. Gmail and Outlook speak the IMAP this uses; a server that refuses UTF-8 search words is
+asked again with the letters folded. Try it on your own account before relying on it.
+
 ## Adding a tool of your own
 
 Drop a `.py` file into `%APPDATA%\assistant\tools\` - beside `config.toml` - with
@@ -333,9 +419,23 @@ line in the log, not a crash.
 ```bash
 uv run ruff check .            # lint
 uv run ruff format .           # format
-uv run mypy                    # type check, strict, src and tests
-uv run pytest                  # tests
+uv run mypy src --strict       # type check
+uv run pytest                  # 1763 tests, none of them touching the network or the microphone
 ```
+
+## What was not measured
+
+Three parts of this were never run against the real thing, and are marked as such in
+the code and above.
+
+- **The Anthropic adapter.** Written against the SDK's types and the same contract suite
+  the other two pass; never given a live key.
+- **Mail.** Written against a fake IMAP server; never given a real mailbox.
+- **WhatsApp at home.** The `whatsapp://send` path and the four timings around the
+  Enter key were tuned on the development machine and not measured on the owner's own.
+
+Everything else in *What it does* was run for real at least once on the development
+laptop, in Turkish, with Gemini.
 
 ## License
 

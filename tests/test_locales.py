@@ -29,13 +29,14 @@ from assistant.llm.probe import QUESTION
 from assistant.locales import FALLBACK_CODE, available, iso_code, load, system_code
 from assistant.messaging import telegram
 from assistant.scheduler import runner as scheduler
+from assistant.tools import mail as mail_tools
 from assistant.tools import memory as memory_tools
 from assistant.tools import messaging as messaging_tools
 from assistant.tools import notes as notes_tools
 from assistant.tools import reminders as reminder_tools
 from assistant.tools import store as store_tools
 from assistant.tools import system as system_tools
-from assistant.ui import status
+from assistant.ui import status, tray
 
 PACKAGED = Path(locales.__file__).parent
 
@@ -49,12 +50,15 @@ TABLES = {
     "setup_wizard": setup_wizard.TEXT,
     "app": app.TEXT,
     "ui.status": status.TEXT,
+    "ui.tray": tray.TEXT,
     "__main__": cli.TEXT,
+    "__main__.doctor": cli.DOCTOR_TEXT,
     "agent.policy": policy.TEXT,
     "tools.memory": memory_tools.TEXT,
     "tools.system": system_tools.TEXT,
     "tools.store": store_tools.TEXT,
     "tools.messaging": messaging_tools.TEXT,
+    "tools.mail": mail_tools.TEXT,
     "tools.notes": notes_tools.TEXT,
     "tools.reminders": reminder_tools.TEXT,
     "scheduler.runner": scheduler.TEXT,
